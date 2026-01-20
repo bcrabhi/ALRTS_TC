@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""
+Python port of the C86 Alerts Cards SAS program.
+Maintains the original control logic for Accuracy, Timeliness, and Completeness checks.
+"""
+
+from __future__ import annotations
+
+import configparser
+import logging
+import os
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+# Trino DBAPI
+import trino
+from trino.auth import BasicAuthentication
+
+
+# -----------------------------------------------------------------------------
+# Setup and Config
+# -----------------------------------------------------------------------------
+
+def setup_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] - %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+
+def load_config(config_path: Path = Path("config.ini")) -> dict:
+    """Load Trino connection config from INI file."""
+    if not config_path.exists():
+        raise FileNotFoundError(f"Missing config file: {config_path}")
+
+    cfg = configparser.ConfigParser()
+    cfg.read(config_path)
+
+    c = cfg["TRINO"]
+
+    return {
+        "host": c.get("host", fallback="strplvaexh0201.fg.rbc.com"),
+        "port": c.getint("port", fallback=8443),
+        "user": c.get("username"),
+        "password": c.get("password", fallback=None) or None,
+        "http_schema": c.get("http_schema", fallback="https"),
+        "catalog": c.get("catalog", fallback="ed10_im"),
+        "schema": c.get("schema", fallback="prod_brt0_ess"),
+        "source": c.get("source", fallback="c86_alerts_cards"),
+        "regpath": c.get("regpath", fallback="/sas/RSD/REG"),
+        "out_root": c.get("out_root", fallback="./C86/output/alert/cards"),
+        "log_root": c.get("log_root", fallback="./C86/log/alert/cards"),
+        "env": c.get("env", fallback="PROD"),
+    }
+
+
+def get_trino_conn(conf: dict):
+    """Connect to Trino using config parameters."""
+    auth = None
+    if conf.get("password"):
+        auth = BasicAuthentication(conf["user"], conf["password"])
+
+    return trino.dbapi.connect(
+        host=conf["host"],
+        port=conf["port"],
+        user=conf["user"],
+        http_scheme=conf["http_schema"],
+        auth=auth,
+        catalog=conf["catalog"],
+        schema=conf["schema"],
+        source=conf["source"],
+    )
+
+
+# -----------------------------------------------------------------------------
+# Date Utilities
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RunDates:
+    report_dt: date
+    start_dt: date
+    end_dt: date
+    week_start_dt: str     # quoted YYYY-MM-DD
+    week_end_dt: str       # quoted YYYY-MM-DD
+    week_end_dt_p1: str    # quoted YYYY-MM-DD
+    pardt: str             # quoted YYYY-MM-DD
+    label: str             # yyyymmdd (no dashes)
+
+
+def _quote_yyyy_mm_dd(d: date) -> str:
+    return f"'{d.strftime('%Y-%m-%d')}'"
+
+
+def _friday_of_week(d: date) -> date:
+    """Get the Friday of the given week (or next week's Friday if past Friday)."""
+    wd = d.weekday()
+    if wd <= 4:
+        return d + timedelta(days=(4 - wd))
+    return d + timedelta(days=(11 - wd))
+
+
+def compute_dates(today: Optional[date] = None) -> RunDates:
+    """Compute the reporting week and related date boundaries."""
+    if not today:
+        today = date.today()
+
+    report_dt = today
+    start_dt_ini = date(2022, 6, 30)
+    week_end_dt_ini = date(2022, 7, 25)
+
+    end_dt = _friday_of_week(report_dt) - timedelta(days=2)
+    start_dt = start_dt_ini if end_dt <= week_end_dt_ini else (end_dt - timedelta(days=6))
+
+    week_start_dt = _quote_yyyy_mm_dd(start_dt)
+    week_end_dt = _quote_yyyy_mm_dd(end_dt)
+    week_end_dt_p1 = _quote_yyyy_mm_dd(end_dt + timedelta(days=1))
+    pardt = _quote_yyyy_mm_dd(start_dt - timedelta(days=7))
+    label = report_dt.strftime("%Y%m%d")
+
+    return RunDates(
+        report_dt=report_dt,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        week_start_dt=week_start_dt,
+        week_end_dt=week_end_dt,
+        week_end_dt_p1=week_end_dt_p1,
+        pardt=pardt,
+        label=label,
+    )
+
+
+def snapdate_week_3_end(decision_date: date) -> date:
+    """Get the Monday end date of the Tuesday-based week (SAS WEEK.3)."""
+    d = decision_date
+    days_since_tuesday = (d.weekday() - 1) % 7
+    start = d - timedelta(days=days_since_tuesday)
+    end = start + timedelta(days=6)
+    return end
+
+
+# -----------------------------------------------------------------------------
+# Database Helpers
+# -----------------------------------------------------------------------------
+
+def fetch_df(conn, sql: str) -> pd.DataFrame:
+    logging.info("Executing SQL (first 160 chars): %s", sql.replace("\n", " ")[:160])
+    cur = conn.cursor()
+    cur.execute(sql)
+    rows = cur.fetchall()
+    cols = [c[0] for c in cur.description] if cur.description else []
+    return pd.DataFrame(rows, columns=cols)
+
+
+# -----------------------------------------------------------------------------
+# SQL Queries
+# -----------------------------------------------------------------------------
+
+def sql_xb80_cards(d: RunDates) -> str:
+    return f"""
+    select
+      event_activity_type,
+      source_event_id,
+      partition_date,
+
+      try_cast(event_timestamp as timestamp) as event_timestamp,
+
+      cast(regexp_replace(eventattributes['ess_process_timestamp'],'T|Z',' ') as timestamp) as ess_process_timestamp,
+      cast(regexp_replace(eventattributes['ess_src_event_timestamp'],'T|Z',' ') as timestamp) as ess_src_event_timestamp,
+
+      json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventId') as eventId,
+      cast(regexp_replace(json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp'),'T|Z',' ') as timestamp) as eventTimestamp,
+
+      json_extract_scalar(eventAttributes['eventPayload'], '$.accountId') as accountId,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.alertType')  as alertType,
+      cast(json_extract_scalar(eventAttributes['eventPayload'], '$.thresholdAmount') as decimal(10,2)) as thresholdAmount,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.customerId') as customerId,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.accountCurrency') as accountCurrency,
+      cast(json_extract_scalar(eventAttributes['eventPayload'], '$.creditLimit') as decimal(10,2)) as creditLimit,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.maskedAccount') as maskedAccount,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.decisionId') as decisionId,
+      cast(json_extract_scalar(eventAttributes['eventPayload'], '$.alertAmount') as decimal(10,2)) as alertAmount
+    from prod_brt0_ess.xb80_credit_card_system_interface
+    where
+          partition_date > {d.pardt}
+      and event_activity_type = 'Alert Decision Cards'
+      and json_extract_scalar(eventAttributes['eventPayload'], '$.alertType') = 'AVAIL_CREDIT_REMAINING'
+      and event_timestamp between {d.week_start_dt} and {d.week_end_dt_p1}
+    """
+
+
+def sql_cards_dec_pref(d: RunDates) -> str:
+    """Get alert preferences combining initial load and incremental updates."""
+    return f"""
+    select *
+    from
+    (
+      select
+        try_cast(event_timestamp as timestamp) as event_timestamp_p,
+        event_channel_type as event_channel_type_p,
+        event_activity_type as event_activity_type_p,
+        partition_date as partition_date_p,
+
+        cast(regexp_replace(eventattributes['ess_process_timestamp'],'T|Z',' ') as timestamp) as ess_process_timestamp_p,
+        cast(regexp_replace(eventattributes['ess_src_event_timestamp'],'T|Z',' ') as timestamp) as ess_src_event_timestamp_p,
+        cast(regexp_replace(json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp'),'T|Z',' ') as timestamp) as eventTimestamp_p,
+
+        json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventActivityName') as eventActivityName_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.preferenceType') as preferenceType_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.clientID') as clientId_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.isBusiness') as isBusiness_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.sendAlertEligible') as sendAlertEligible_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.active') as active_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.threshold') as threshold_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.custId') as custId_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.account') as account_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.maskedAccountNo') as maskedAccountNo_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.externalAccount') as externalAccount_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.productType') as productType_p
+      from prod_brt0_ess.ffs_client_alert_preferences_dep_initial_load
+      where
+            event_activity_type in ('Create Account Preference', 'Update Account Preference')
+        and json_extract_scalar(eventAttributes['eventPayload'], '$.preferenceType') = 'AVAIL_CREDIT_REMAINING'
+        and json_extract_scalar(eventAttributes['eventPayload'], '$.productType') = 'CREDIT_CARD'
+        and partition_date = '20220324'
+
+      union
+
+      select
+        try_cast(event_timestamp as timestamp) as event_timestamp_p,
+        event_channel_type as event_channel_type_p,
+        event_activity_type as event_activity_type_p,
+        partition_date as partition_date_p,
+
+        cast(regexp_replace(eventattributes['ess_process_timestamp'],'T|Z',' ') as timestamp) as ess_process_timestamp_p,
+        cast(regexp_replace(eventattributes['ess_src_event_timestamp'],'T|Z',' ') as timestamp) as ess_src_event_timestamp_p,
+        cast(regexp_replace(json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp'),'T|Z',' ') as timestamp) as eventTimestamp_p,
+
+        json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventActivityName') as eventActivityName_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.preferenceType') as preferenceType_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.clientId') as clientId_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.isBusiness') as isBusiness_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.sendAlertEligible') as sendAlertEligible_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.active') as active_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.threshold') as threshold_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.custId') as custId_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.account') as account_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.maskedAccountNo') as maskedAccountNo_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.externalAccount') as externalAccount_p,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.productType') as productType_p
+      from prod_brt0_ess.ffs_client_alert_preferences_dep
+      where
+            json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp') < {d.week_end_dt_p1}
+        and event_activity_type in ('Create Account Preference', 'Update Account Preference')
+        and json_extract_scalar(eventAttributes['eventPayload'], '$.preferenceType') = 'AVAIL_CREDIT_REMAINING'
+        and json_extract_scalar(eventAttributes['eventPayload'], '$.productType') = 'CREDIT_CARD'
+    ) p
+    """
+
+
+def sql_fft0_inbox(d: RunDates) -> str:
+    return f"""
+    select
+      cast(regexp_replace(eventattributes['ess_process_timestamp'],'T|Z',' ') as timestamp) as ess_process_timestamp_a,
+      cast(regexp_replace(eventattributes['ess_src_event_timestamp'],'T|Z',' ') as timestamp) as ess_src_event_timestamp_a,
+
+      event_activity_type as event_activity_type_a,
+      source_event_id as source_event_id_a,
+      partition_date as partition_date_a,
+
+      try_cast(event_timestamp as timestamp) as event_timestamp_a,
+
+      json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventId') as eventId_a,
+      cast(regexp_replace(json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp'),'T|Z',' ') as timestamp) as eventTimestamp_a,
+      json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventActivityName') as eventActivityName_a,
+
+      json_extract_scalar(eventAttributes['eventPayload'], '$.sendInbox') as sendInbox_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.alertType') as alertType_a,
+      cast(json_extract_scalar(eventAttributes['eventPayload'], '$.thresholdAmount') as decimal(12,2)) as thresholdAmount_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.sendSMS') as sendSMS_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.sendPush') as sendPush_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.maskedAccount') as maskedAccount_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.reasonCode') as reasonCode_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.decisionId') as decisionId_a,
+      cast(json_extract_scalar(eventAttributes['eventPayload'], '$.alertAmount') as decimal(12,2)) as alertAmount_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.accountId') as accountId_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.account') as account_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.accountProduct') as accountProduct_a,
+      json_extract_scalar(eventAttributes['eventPayload'], '$.sendEmail') as sendEmail_a
+    from prod_brt0_ess.fft0_alert_inbox_dep
+    where
+          event_activity_type = 'Alert Delivery Audit'
+      and json_extract_scalar(eventAttributes['eventPayload'], '$.alertType') = 'AVAIL_CREDIT_REMAINING'
+      and event_timestamp >= {d.week_start_dt}
+    """
+
+
+# -----------------------------------------------------------------------------
+# Data Processing and Transformations
+# -----------------------------------------------------------------------------
+
+def _ensure_dt(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    return df
+
+
+def build_cards_alert_final(xb80_cards: pd.DataFrame,
+                            cards_dec_pref: pd.DataFrame,
+                            fft0_inbox: pd.DataFrame) -> pd.DataFrame:
+    """Combine card decisions, preferences, and inbox data into one dataset."""
+    # Join decisions to preferences
+    df = xb80_cards.merge(
+        cards_dec_pref,
+        how="left",
+        left_on=["accountId", "customerId"],
+        right_on=["externalAccount_p", "custId_p"],
+        suffixes=("", "_pjoin"),
+    )
+
+    # Check if decision timestamp >= preference timestamp
+    df = _ensure_dt(df, ["eventTimestamp", "eventTimestamp_p"])
+    df["dec_tm_ge_pref_tm"] = np.where(
+        (df["eventTimestamp"].notna()) & (df["eventTimestamp_p"].notna()) & (df["eventTimestamp"] >= df["eventTimestamp_p"]),
+        "Y",
+        "N",
+    )
+
+    # Sort by decision ID and keep first occurrence (SAS nodupkey)
+    sort_cols = [
+        "decisionId",
+        "eventTimestamp",
+        "accountId",
+        "customerId",
+        "dec_tm_ge_pref_tm",
+        "eventTimestamp_p",
+        "externalAccount_p",
+    ]
+    ascending = [True, True, True, True, False, False, False]
+    df = df.sort_values(by=sort_cols, ascending=ascending, na_position="last")
+    df = df.drop_duplicates(subset=["decisionId"], keep="first").copy()
+
+    # Dedupe inbox by decision ID, keeping first record
+    fft0_inbox = _ensure_dt(fft0_inbox, ["eventTimestamp_a", "eventTimestamp_a", "ess_process_timestamp_a", "ess_src_event_timestamp_a"])
+    fft0_inbox = fft0_inbox.sort_values(by=["decisionId_a", "eventTimestamp_a"], ascending=[True, True], na_position="last")
+    fft0_inbox = fft0_inbox.drop_duplicates(subset=["decisionId_a"], keep="first").copy()
+
+    # Join to inbox on decision ID
+    out = df.merge(fft0_inbox, how="left", left_on="decisionId", right_on="decisionId_a")
+    out = out.drop_duplicates(subset=["decisionId"], keep="first").copy()
+
+    # Ensure datetime columns are typed correctly
+    out = _ensure_dt(out, ["ess_src_event_timestamp", "ess_process_timestamp", "event_timestamp", "eventTimestamp",
+                           "eventTimestamp_a"])
+
+    # Filter out business alerts already processed
+    out = out[~((out.get("isBusiness_p") == "true") & (out["dec_tm_ge_pref_tm"] == "Y"))].copy()
+
+    out["src_event_date"] = out["ess_src_event_timestamp"].dt.date
+    out["process_date"] = out["ess_process_timestamp"].dt.date
+    out["event_date"] = out["event_timestamp"].dt.date
+    out["decision_date"] = out["eventTimestamp"].dt.date
+
+    # Check if alert amount is within threshold
+    out["threshold_limit_check"] = np.where(
+        out["alertAmount"].notna()
+        & out["thresholdAmount"].notna()
+        & (out["alertAmount"].astype(float) <= out["thresholdAmount"].astype(float)),
+        "Y",
+        "N",
+    )
+
+    # Mark records where delivery timestamp is missing
+    out["Found_Missing"] = np.where(
+        out["eventTimestamp_a"].isna() | out["eventTimestamp"].isna(),
+        "Y",
+        "",
+    )
+
+    # Calculate delay in seconds
+    out["Time_Diff"] = (out["eventTimestamp_a"] - out["eventTimestamp"]).dt.total_seconds()
+
+    # SLA: delivered within 30 minutes (1800 seconds)
+    out["SLA_Ind"] = np.where(
+        out["Time_Diff"].notna() & (out["Time_Diff"] <= 1800),
+        "Y",
+        "N",
+    )
+
+    def alert_time_bucket(sec: float | None) -> str:
+        """Bucket delivery delay into time ranges."""
+        if sec is None or (isinstance(sec, float) and np.isnan(sec)):
+            return "99 - Timestamp is missing"
+        if sec < 0:
+            return "00 - Less than 0 seconds"
+        if sec <= 1800:
+            return "01 - Less than or equal to 30 minutes"
+        if sec <= 3600:
+            return "02 - Greater than 30 mins and less than or equal to 60 mins"
+        
+        hours = sec / 3600
+        if hours <= 2:
+            return "03 - Greater than 1 hour and less than or equal to 2 hours"
+        if hours <= 3:
+            return "04 - Greater than 2 hours and less than or equal to 3 hours"
+        if hours <= 4:
+            return "05 - Greater than 3 hours and less than or equal to 4 hours"
+        if hours <= 5:
+            return "06 - Greater than 4 hours and less than or equal to 5 hours"
+        if hours <= 6:
+            return "07 - Greater than 5 hours and less than or equal to 6 hours"
+        if hours <= 7:
+            return "08 - Greater than 6 hours and less than or equal to 7 hours"
+        if hours <= 8:
+            return "09 - Greater than 7 hours and less than or equal to 8 hours"
+        if hours <= 9:
+            return "10 - Greater than 8 hours and less than or equal to 9 hours"
+        if hours <= 10:
+            return "11 - Greater than 9 hours and less than or equal to 10 hours"
+        if hours <= 24:
+            return "12 - Greater than 10 hours and less than or equal to 24 hours"
+        if hours <= 48:
+            return "13 - Greater than 1 day and less than or equal to 2 days"
+        if hours <= 72:
+            return "14 - Greater than 2 days and less than or equal to 3 days"
+        return "15 - Greater than 3 days"
+
+    out["Alert_Time"] = out["Time_Diff"].apply(alert_time_bucket)
+
+    return out
+
+
+def stratified_srs(df: pd.DataFrame, strata_col: str, n_per_stratum: int, seed: int = 123) -> pd.DataFrame:
+    """Stratified random sample: n records per stratum."""
+    rng = np.random.default_rng(seed)
+
+    samples = []
+    for _, g in df.groupby(strata_col, dropna=False):
+        g = g.copy()
+        k = min(n_per_stratum, len(g))
+        if k <= 0:
+            continue
+        idx = rng.choice(g.index.to_numpy(), size=k, replace=False)
+        samples.append(g.loc[idx])
+
+    if not samples:
+        return df.iloc[0:0].copy()
+
+    return pd.concat(samples, ignore_index=True)
+
+
+def build_aggregations(cards_alert_final: pd.DataFrame, report_dt: date) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build Accuracy, Timeliness, and Completeness aggregations."""
+    df = cards_alert_final.copy()
+    df["decision_date"] = pd.to_datetime(df["decision_date"], errors="coerce").dt.date
+
+    def segment10(d: date) -> str:
+        return d.strftime("%Y%m")
+
+    def snapdate(d: date) -> date:
+        return snapdate_week_3_end(d)
+
+    # Stratified sample for accuracy test (18 per day)
+    base_samples = stratified_srs(df, "decision_date", 18, seed=123)
+
+    def agg_table(src: pd.DataFrame, controlrisk: str, testtype: str, rde: str, comment_logic_col: str) -> pd.DataFrame:
+        tmp = src.copy()
+
+        if comment_logic_col == "threshold_limit_check":
+            tmp["CommentCode"] = np.where(tmp["threshold_limit_check"] == "Y", "COM16", "COM19")
+        elif comment_logic_col == "SLA_Ind":
+            tmp["CommentCode"] = np.where(tmp["SLA_Ind"] == "Y", "COM16", "COM19")
+        elif comment_logic_col == "decisionId_a_blank":
+            tmp["CommentCode"] = np.where(tmp["decisionId_a"].isna() | (tmp["decisionId_a"] == ""), "COM16", "COM19")
+        else:
+            raise ValueError("Unsupported comment logic")
+
+        tmp["ControlRisk"] = controlrisk
+        tmp["TestType"] = testtype
+        tmp["RDE"] = rde
+        tmp["Segment10"] = tmp["decision_date"].apply(lambda x: segment10(x) if pd.notna(x) else "")
+        tmp["DateCompleted"] = report_dt
+        tmp["SnapDate"] = tmp["decision_date"].apply(lambda x: snapdate(x) if pd.notna(x) else pd.NaT)
+
+        grp = tmp.groupby(
+            ["ControlRisk", "TestType", "RDE", "CommentCode", "Segment10", "DateCompleted", "SnapDate"],
+            dropna=False,
+            as_index=False,
+        ).agg(
+            Volume=("decisionId", "size"),
+            bal=("alertAmount", "sum"),
+            Amount=("thresholdAmount", "sum"),
+        )
+        return grp
+
+    accuracy = agg_table(
+        base_samples,
+        controlrisk="Accuracy",
+        testtype="Sample",
+        rde="Alert@10_Accuracy_Available_Credit",
+        comment_logic_col="threshold_limit_check",
+    )
+
+    timeliness = agg_table(
+        df,
+        controlrisk="Timeliness",
+        testtype="Anomaly",
+        rde="Alert@11_Timeliness_SLA",
+        comment_logic_col="SLA_Ind",
+    )
+
+    completeness = agg_table(
+        df,
+        controlrisk="Completeness",
+        testtype="Reconciliation",
+        rde="Alert@12_Completeness_All_Clients",
+        comment_logic_col="decisionId_a_blank",
+    )
+
+    return accuracy, timeliness, completeness
+
+
+def build_ac_week(accuracy: pd.DataFrame, timeliness: pd.DataFrame, completeness: pd.DataFrame) -> pd.DataFrame:
+    ac_week = pd.concat([accuracy, timeliness, completeness], ignore_index=True)
+
+    # 1-to-1 column set (as SAS)
+    out = pd.DataFrame({
+        "RegulatoryName": "C86",
+        "LOB": "Credit Cards",
+        "ReportName": "C86 Alerts",
+        "ControlRisk": ac_week["ControlRisk"],
+        "TestType": ac_week["TestType"],
+        "TestPeriod": "Portfolio",
+        "ProductType": "Credit Cards",
+        "RDE": ac_week["RDE"],
+        "SubDE": "",
+        "Segment": "",
+        "Segment2": "",
+        "Segment3": "",
+        "Segment4": "",
+        "Segment5": "",
+        "Segment6": "",
+        "Segment7": "",
+        "Segment8": "",
+        "Segment9": "",
+        "Segment10": ac_week["Segment10"],
+        "HoldoutFlag": "N",
+        "CommentCode": ac_week["CommentCode"],
+        # SAS uses %comment_format to map codes => comments.
+        # If you have the mapping table, join it here. For now, keep blank.
+        "Comments": "",
+        "Volume": ac_week["Volume"],
+        "Bal": ac_week["bal"],
+        "Amount": ac_week["Amount"],
+        "DateCompleted": ac_week["DateCompleted"],
+        "SnapDate": ac_week["SnapDate"],
+    })
+    return out
+
+
+def build_fail_details(cards_alert_final: pd.DataFrame, report_dt: date) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Extract failing cases for each control (accuracy, timeliness, completeness)."""
+    df = cards_alert_final.copy()
+    df["decision_date"] = pd.to_datetime(df["decision_date"], errors="coerce").dt.date
+
+    def event_month(d: date) -> str:
+        return d.strftime("%Y%m")
+
+    def event_week_ending(d: date) -> date:
+        return snapdate_week_3_end(d)
+
+    def cust_mask(cid: str) -> str:
+        """Mask customer ID to last 3 digits."""
+        cid = "" if cid is None or (isinstance(cid, float) and np.isnan(cid)) else str(cid)
+        tail = cid[6:9] if len(cid) >= 9 else ""
+        return "*****" + tail
+
+    # Completeness failures: no delivery confirmation
+    completeness_fail = df[(df["decisionId_a"].isna()) | (df["decisionId_a"] == "")].copy()
+    completeness_fail["event_month"] = completeness_fail["decision_date"].apply(lambda x: event_month(x))
+    completeness_fail["reporting_date"] = report_dt
+    completeness_fail["event_week_ending"] = completeness_fail["decision_date"].apply(lambda x: event_week_ending(x))
+    completeness_fail["LOB"] = "Credit Cards"
+    completeness_fail["Product"] = "Credit Cards"
+    completeness_fail["account_number"] = completeness_fail["accountId"]
+    completeness_fail["available_credit"] = completeness_fail["alertAmount"]
+    completeness_fail["event_date"] = completeness_fail["decision_date"]
+    completeness_fail["custid_mask"] = completeness_fail["customerId"].apply(cust_mask)
+
+    completeness_fail = completeness_fail[
+        [
+            "event_month", "reporting_date", "event_week_ending",
+            "LOB", "Product",
+            "account_number", "thresholdAmount", "available_credit", "decisionId",
+            "event_date", "custid_mask",
+        ]
+    ]
+
+    # Timeliness failures: exceeded 30-minute SLA
+    timeliness_fail = df[df["SLA_Ind"] != "Y"].copy()
+    timeliness_fail["event_month"] = timeliness_fail["decision_date"].apply(lambda x: event_month(x))
+    timeliness_fail["reporting_date"] = report_dt
+    timeliness_fail["event_week_ending"] = timeliness_fail["decision_date"].apply(lambda x: event_week_ending(x))
+    timeliness_fail["LOB"] = "Credit Cards"
+    timeliness_fail["Product"] = "Credit Cards"
+    timeliness_fail["account_number"] = timeliness_fail["accountId"]
+    timeliness_fail["available_credit"] = timeliness_fail["alertAmount"]
+    timeliness_fail["event_date"] = timeliness_fail["decision_date"]
+    timeliness_fail["decision_timestamp"] = timeliness_fail["eventTimestamp"]
+    timeliness_fail["sent_timestamp"] = timeliness_fail["eventTimestamp_a"]
+    timeliness_fail["total_minutes"] = np.ceil(timeliness_fail["Time_Diff"] / 60.0)
+    timeliness_fail["custid_mask"] = timeliness_fail["customerId"].apply(cust_mask)
+
+    timeliness_fail = timeliness_fail[
+        [
+            "event_month", "reporting_date", "event_week_ending",
+            "LOB", "Product",
+            "account_number", "thresholdAmount", "available_credit", "decisionId",
+            "event_date", "decision_timestamp", "sent_timestamp", "total_minutes",
+            "custid_mask",
+        ]
+    ]
+
+    # Accuracy failures: amount checks failed in sample
+    base_samples = stratified_srs(df, "decision_date", 18, seed=123)
+    accuracy_fail = base_samples[base_samples["threshold_limit_check"] != "Y"].copy()
+    accuracy_fail["event_month"] = accuracy_fail["decision_date"].apply(lambda x: event_month(x))
+    accuracy_fail["reporting_date"] = report_dt
+    accuracy_fail["event_week_ending"] = accuracy_fail["decision_date"].apply(lambda x: event_week_ending(x))
+    accuracy_fail["LOB"] = "Credit Cards"
+    accuracy_fail["Product"] = "Credit Cards"
+    accuracy_fail["account_number"] = accuracy_fail["accountId"]
+    accuracy_fail["decision"] = "AlertDecision"
+    accuracy_fail["available_credit"] = accuracy_fail["alertAmount"]
+    accuracy_fail["event_date"] = accuracy_fail["decision_date"]
+    accuracy_fail["custid_mask"] = accuracy_fail["customerId"].apply(cust_mask)
+
+    accuracy_fail = accuracy_fail[
+        [
+            "event_month", "reporting_date", "event_week_ending",
+            "LOB", "Product",
+            "account_number", "decision", "thresholdAmount", "available_credit",
+            "event_date", "custid_mask",
+        ]
+    ]
+
+    return completeness_fail, timeliness_fail, accuracy_fail
+
+
+# -----------------------------------------------------------------------------
+# Export and Output Functions
+# -----------------------------------------------------------------------------
+
+def write_excel(df: pd.DataFrame, path: Path, sheet: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name=sheet, index=False)
+
+
+def update_history(ac_week: pd.DataFrame, history_path: Path) -> pd.DataFrame:
+    """
+    Append new week data to history, excluding any existing snapshot dates.
+    Maintains a running history of all past weeks.
+    """
+    if history_path.exists():
+        old = pd.read_csv(history_path, parse_dates=["DateCompleted", "SnapDate"])
+    else:
+        old = ac_week.iloc[0:0].copy()
+
+    ac_week2 = ac_week.copy()
+    ac_week2["SnapDate"] = pd.to_datetime(ac_week2["SnapDate"], errors="coerce")
+    old["SnapDate"] = pd.to_datetime(old["SnapDate"], errors="coerce")
+
+    new_snap = set(ac_week2["SnapDate"].dropna().unique())
+    old_keep = old[~old["SnapDate"].isin(new_snap)].copy()
+
+    merged = pd.concat([ac_week2, old_keep], ignore_index=True)
+    merged = merged.sort_values(by=["SnapDate"], na_position="last")
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(history_path, index=False)
+    return merged
+
+
+# -----------------------------------------------------------------------------
+# Entry Point
+# -----------------------------------------------------------------------------
+
+def main() -> int:
+    """Run the C86 alerts processing pipeline."""
+    conf = load_config(Path("config.ini"))
+
+    dts = compute_dates()
+    label_dir = Path(conf["out_root"]) / dts.label
+    log_path = Path(conf["log_root"]) / f"C86003_Alerts_Cards_{dts.label}.log"
+
+    setup_logging(log_path)
+
+    logging.info("Program: C86_Alerts_Cards (Python)")
+    logging.info("Env: %s", conf["env"])
+    logging.info("User: %s", os.getenv("USER", "unknown"))
+    logging.info("Report date: %s", dts.report_dt.isoformat())
+    logging.info("Week: %s to %s", dts.week_start_dt, dts.week_end_dt)
+    logging.info("Output: %s", label_dir)
+
+    # Connect to Trino and pull data
+    conn = get_trino_conn(conf)
+
+    xb80_cards = fetch_df(conn, sql_xb80_cards(dts))
+    cards_dec_pref = fetch_df(conn, sql_cards_dec_pref(dts))
+    fft0_inbox = fetch_df(conn, sql_fft0_inbox(dts))
+
+    logging.info("Rows: xb80_cards=%d cards_dec_pref=%d fft0_inbox=%d",
+                 len(xb80_cards), len(cards_dec_pref), len(fft0_inbox))
+
+    # Process and aggregate
+    cards_alert_final = build_cards_alert_final(xb80_cards, cards_dec_pref, fft0_inbox)
+    accuracy, timeliness, completeness = build_aggregations(cards_alert_final, dts.report_dt)
+    ac_week = build_ac_week(accuracy, timeliness, completeness)
+
+    # Generate fail detail reports
+    completeness_fail, timeliness_fail, accuracy_fail = build_fail_details(cards_alert_final, dts.report_dt)
+
+    # Export results
+    write_excel(
+        completeness_fail,
+        label_dir / "Alert_Cards_Completeness_Detail.xlsx",
+        "Alert_Cards_Completeness_Detail",
+    )
+    write_excel(
+        timeliness_fail,
+        label_dir / "Alert_Cards_Timeliness_Detail.xlsx",
+        "Alert_Cards_Timeliness_Detail",
+    )
+    write_excel(
+        accuracy_fail,
+        label_dir / "Alert_Cards_Accuracy_Detail.xlsx",
+        "Alert_Cards_Accuracy_Detail",
+    )
+
+    # Debug: save intermediate datasets
+    (label_dir / "_debug").mkdir(parents=True, exist_ok=True)
+    cards_alert_final.to_csv(label_dir / "_debug" / "cards_alert_final.csv", index=False)
+    ac_week.to_csv(label_dir / "_debug" / "Alert_Cards_AC_week.csv", index=False)
+
+    # Maintain historical records
+    history_path = Path(conf["out_root"]) / "alert_cards_ac_history.csv"
+    merged = update_history(ac_week, history_path)
+    logging.info("History: %d records written to %s", len(merged), history_path)
+
+    logging.info("Done")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
