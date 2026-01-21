@@ -1,0 +1,603 @@
+/**************************************************************************************************/
+/* set up macros                                                                                  */
+/**************************************************************************************************/
+
+%global env regpath logpath outpath sasfile logfile lstfile;
+
+%let env       = DEV; /*Change to PROD when running production*/
+%let regpath   = %sysfunc(ifc("&sysenv"="", %sysfunc(ifc(%upcase(%substr(&sysget(USER),1,1)) = U and &SYSHOSTNAME ~= uasast1, PROD, DEV)), &env));
+%let regpath   = %sysfunc(ifc("&sysparm"="", "&regpath/script/common/security/&reg_DEV", %sysfunc(ifc(&env=PROD, /sas/RSD/REG, /sas/RSD/REG_DEV))));
+%include "&regpath/script/common/security/pswd.sas";
+
+options sasautos = (sasautos, "&regpath/script/common/macros/volatile", "&regpath/script/common/macros/general");
+options pagesize = max;
+
+%let syscc     = 0; /*system macro variable.*/
+%let logpath   = &regpath/c86/log/product_appropriateness/client360;
+%let outpath   = &regpath/c86/out/product_appropriateness/client360;
+%let ymd       = %sysfunc(today(), yymmddn8.);
+%let logfile   = &logpath/c86_pa_client360_&ymd..log;
+%let lstfile   = &logpath/c86_pa_client360_&ymd..lst;
+
+%put &regpath-&logfile-&lstfile-&outpath;
+
+%createDirectory(&logpath);
+%createDirectory(&outpath);
+
+proc printto
+   log="&logfile" print="&lstfile" new;
+run;
+
+%GLOBAL SASPROGRAMFILE;
+%let sasfile = %sysfunc(ifc(&SASPROGRAMFILE="", %scan(&SYSPROCESSNAME, -1, %str( )), %scan(&SASPROGRAMFILE, -1, %str(/))));
+%put >>>>>> NAME of this Program - &sasfile <<<<<<<<<;
+%put >>>>>> Starting Running Time - %left(%sysfunc(datetime(), datetime20.)) <<<<<<<<<;
+%put >>>>>> User ID - &sysget(USER) <<<<<<<<<;
+%put >>>>>> Platform - &SYSHOSTNAME <<<<<<<<<;
+%put >>>>>> Prod/dev? - &env <<<<<<<<<;
+
+%let ini_run = 'Y';
+%macro ini_check;
+  %if %sysfunc(fileexist(&Outpath/pa_client360_autocomplete.sas7bdat)) %then %do;
+     %let ini_run = 'N';
+     x "cp &Outpath/pa_client360_autocomplete.sas7bdat ""&Outpath/pa_client360_autocomplete_backup.sas7bdat""";
+  %end;
+  %else
+     %let ini_run = 'Y';
+%mend;
+%ini_check;
+
+%put &=ini_run;
+
+data _null_;
+   today = today();
+   launch_dt='07MAY2023'd;
+   launch_dt_min14='23APR2023'd;
+   week_start      = intnx('week.4', today, 0, 'b') - 11;
+   week_end        = intnx('week.4', today, 0, 'b') - 5;
+
+   if &ini_run = 'Y' then do;
+      call symput('wk_start', "'"||put(launch_dt,YYMMDD10.)||"'");
+      call symput('wk_start_min14', "'"||put(launch_dt_min14,YYMMDD10.)||"'");
+      call symput('wk_end', "'"||put(week_end,YYMMDD10.)||"'");
+      call symput('runday',put(today(),yymmddn8.));
+      call symput('tday',put(tday,yymmddn8.));
+   end;
+   else do;
+      call symput('wk_start', "'"||put(week_start,YYMMDD10.)||"'");
+      call symput('wk_start_min14', "'"||put(week_start_14,YYMMDD10.)||"'");
+      call symput('wk_end', "'"||put(week_end,YYMMDD10.)||"'");
+      call symput('runday',put(today(),yymmddn8.));
+      call symput('tday',put(tday,yymmddn8.));
+   end;
+run;
+
+%put &=wk_start &=wk_end &=runday &=ini_run &=tday &=wk_start_min14;
+
+%createDirectory(&outpath/&runday);
+libname dataout "&outpath/&runday";
+libname ac "&outpath";
+
+/*pull data from tracking*/
+proc sql;
+  %connectsql;
+    create table tracking_all as
+    select * from connection to teradata
+    (
+        select *
+        from DDWV01.EVNT_PROD_TRACK_LOG
+        where ADVC_SALT_TYP = 'Advice Tool' and EVNT_DT > date &WK_START - 90
+    );
+  disconnect from teradata;
+quit;
+
+proc sql;
+  create table tracking_tool_use_distinct as
+  select distinct OPPOR_ID,
+         upcase(ADVC_TOOL_NM) as ADVC_TOOL_NM
+  from tracking_all where OPPOR_ID is not missing and ADVC_TOOL_NM is not missing
+  ;
+run;
+
+proc sql;
+  create table tracking_count_tool_use_pre2 as
+  select OPPOR_ID,
+         count(distinct upcase(ADVC_TOOL_NM)) as count_unique_tool_used
+  from tracking_all
+  where OPPOR_ID is not missing
+  group by 1
+  order by calculated count_unique_tool_used desc
+  ;
+run;
+
+proc sql;
+  create table tracking_tool_use as
+  select OPPOR_ID,
+         case when count_unique_tool_used > 0 then 'Tool Used' end as tool_used
+  from tracking_count_tool_use_pre2
+  ;
+run;
+
+proc sql;
+  %connectsql;
+
+  execute
+  (
+    create multiset volatile table c360_short as
+    (
+      select evnt_id,
+             cast(rbc_oppor_own_id as integer) as emp_id,
+             evnt_dt as snap_dt
+      from ddwv01.evnt_prod_oppor
+      where rbc_oppor_own_id is not null
+        and evnt_dt is not null
+        and evnt_id is not null
+        and evnt_dt between &wk_start and &wk_end
+    )
+    with data primary index (emp_id, snap_dt) on commit preserve rows
+  ) by teradata;
+  execute(collect statistics column (emp_id, snap_dt) on c360_short) by teradata;
+
+  create table C360_detail_pre as
+  select * from connection to teradata
+  (
+    select c360.*,
+           emp.org_unt_no, emp.hr_posn_titl_en, emp.posn_strt_dt, emp.posn_end_dt, emp.occpt_job_cd
+    from ddwv01.evnt_prod_oppor as c360
+    left join
+    (
+      select c3.evnt_id,
+             e1.org_unt_no, e1.hr_posn_titl_en, e2.posn_strt_dt, e2.posn_end_dt, e1.occpt_job_cd
+      from c360_short                           as c3
+      inner join
+           ddwv01.emp                           as e1
+           on   c3.emp_id = e1.emp_id
+           and c3.snap_dt >= e1.captr_dt
+           and c3.snap_dt < e1.chg_dt
+      inner join
+           ddwv01.empl_reltn                    as e2
+           on   c3.emp_id = e2.emp_id
+           and c3.snap_dt >= e2.captr_dt
+           and c3.snap_dt < e2.chg_dt
+    ) as emp
+    on emp.evnt_id = c360.evnt_id
+    where c360.evnt_id is not null and evnt_dt between &wk_start and &wk_end
+  );
+  disconnect from teradata;
+quit;
+
+/*join tool info*/
+proc sql;
+  create table c360_detail as
+  select a.*,
+         case when b.tool_used is missing then 'Tool Not Used' else 'Tool Used' End as TOOL_USED
+  from c360_detail_pre a
+  left join tracking_tool_use b
+  on a.oppor_id = b.oppor_id
+  ;
+run;
+
+proc freq data=c360_detail;
+  table lob;
+run;
+
+proc format;
+  value $tagefmt
+    "Demarche exploratoire/Comprendre le besoin" = "11.Demarche exploratoire/Comprendre le besoin"
+    "Discovery/Understand Needs"                 = "12.Discovery/Understand Needs"
+    "Review Options"                             = "21.Review Options"
+    "Present/Gain Commitment"                    = "31.Present/Gain Commitment"
+    "Intégration commencée"                      = "41.Intégration commencée"
+    "Onboarding Started"                         = "42.Onboarding Started"
+    "Opportunity Lost"                           = "51.Opportunity Lost"
+    "Opportunity Won"                            = "61.Opportunity Won"
+  ;
+run;
+
+/*pull data from AOT*/
+proc sql;
+  %connectsql;
+    create table aot_all_oppor as
+    select * from connection to teradata
+    (
+      select oppor_id,
+             count(*) as count_aot
+      from ddwv01.evnt_prod_aot
+      where ess_src_evnt_dt between &wk_start_min14 and &wk_end
+        and oppor_id is not null
+      group by 1
+    );
+  disconnect from teradata;
+quit;
+
+proc sql;
+  create table aot_all_oppor_unique as
+  select distinct oppor_id from
+  aot_all_oppor
+  ;
+run;
+
+proc sql;
+  create table c360_detail_link_aot as
+  select a.*,
+         b.oppor_id as aot_oppor_id,
+         case when PROD_CATG_NM = 'Personal Accounts' and b.oppor_id is not missing then 1 else 0 end as C360_PDA_link_AOT
+  from c360_detail a
+  left join aot_all_oppor_unique b
+  on a.oppor_id = b.oppor_id
+  ;
+run;
+
+/*---end aot---*/
+data c360_detail_more (drop=oppor_stage_nm_f) c360_detail_more_in_pre;
+  set c360_detail_link_aot;
+  oppor_stage_nm_f = put(oppor_stage_nm, $stagefmt.);
+
+  if (asct_prod_fmly_nm = 'Risk Protection')
+   & (lob = 'Retail')
+   & (C360_PDA_link_AOT = 0)
+   & (oppor_stage_nm in ('Opportunity Won', 'Opportunity Lost'))
+  then do;
+    output c360_detail_more_in_pre;
+  end;
+  output c360_detail_more;
+run;
+
+data C360_detail_more_io;
+  set c360_detail_more_in_pre;
+run;
+
+/******************************************************************************************/
+/* PA rationale                                                                         */
+   Criteria to define a 'valid' PA rationale text:
+      a 'valid' text have to meet with all the following four conditions:
+      (1) > 5 characters
+      (2) cannot be only repeated characters
+      (3) have at least 2 alphabet/num
+/******************************************************************************************/
+data work.pa_rationale;
+  set C360_detail_more_io(keep=evnt_id IS_PROD_APRP_FOR_CLNT CLNT_RTNL_TXT);
+  where IS_PROD_APRP_FOR_CLNT = 'Not Appropriate - Rationale';
+
+  length prod_not_aprp_rtnl_txt_cat $16;
+  _x = CLNT_RTNL_TXT;
+  _x_p = compress(CLNT_RTNL_TXT, ' ', 'ks'); /* get space characters */
+  _x = translate(CLNT_RTNL_TXT, repeat(' ', length(_x_p)-1), _x_p); /* uniform space characters to blank */
+  _x = upcase(strip(_x)); /* remove leading/trailing spaces and make it case insensitive */
+
+  xfail_chars_gt5 = ifn(length(_x) > 5, 0, 1); /* 0: more than 5 characters*/
+  
+  _x2 = compress(_x, substr(_x, 1, 1));
+  xfail_rep_char = ifn(not missing(_x2), 0, 1); /* 0: at least 2 different characters */
+
+  _x3 = compress(_x, ' ', 'kad');
+  xfail_ge_2_alnum = ifn(length(_x3) >= 2, 0, 1); /* 0: at least 2 al-nums */
+
+  prod_not_aprp_rtnl_txt_cat = ifc(sum(of xfail_*) = 0, 'Valid', 'Invalid');
+  
+  keep evnt_id IS_PROD_APRP_FOR_CLNT CLNT_RTNL_TXT prod_not_aprp_rtnl_txt_cat xfail_chars_gt5 xfail_rep_char xfail_ge_2_alnum ;
+run;
+
+proc sql nowarn noprec;
+  create table C360_detail_more_in as
+  select a.*,
+         case
+           when missing(a.IS_PROD_APRP_FOR_CLNT)                  then 'Not Available'
+           when a.IS_PROD_APRP_FOR_CLNT = 'Not Appropriate - Rationale' then 'Not Applicable'
+           else b.prod_not_aprp_rtnl_txt_cat
+         end as prod_not_aprp_rtnl_txt_cat length=16
+  from C360_detail_more_io as a left join
+       work.pa_rationale   as b
+  on   a.evnt_id = b.evnt_id
+  ;
+quit;
+
+proc format;
+  /*COMMENTS column in AC*/
+  value $cs_cmt (default=50)
+    'COM1' = 'Test population (less samples)'
+    'COM2' = 'Match population'
+    'COM3' = 'Mismatch population (less samples)'
+    'COM4' = 'Non Anomaly Population'
+    'COM5' = 'Anomaly Population'
+    'COM6' = 'Number of Deposit Sessions'
+    'COM7' = 'Number of Accounts'
+    'COM8' = 'Number of Transactions'
+    'COM9' = 'Non Blank Population'
+    'COM10' = 'Blank Population'
+    'COM11' = 'Unable to Assess'
+    'COM12' = 'Number of Failed Data Elements'
+    'COM13' = 'Population Distribution'
+    'COM14' = 'Reconciled Population'
+    'COM15' = 'Not Reconciled Population'
+    'COM16' = 'Pass'
+    'COM17' = 'Fail'
+    'COM18' = 'Not Applicable'
+    'COM19' = 'Potential Fail'
+  ;
+run;
+
+proc sort data=C360_detail_more_in out=work.tmp0;
+  by OPPOR_ID;
+run;
+
+/*remove dup*/
+data work.tmp0;
+  set work.tmp0;
+  by OPPOR_ID;
+  if first.OPPOR_ID then level_oppor = 0;
+  level_oppor + 1;
+run;
+
+data work.tmp_pa_c360_4ac;
+  set work.tmp0(rename=(LOB=LOB0));
+  where level_oppor = 1;
+  length segment3 $200 LOB $50 ProductType $50 segment2 $50 segment5 $50;
+  RegulatoryName = 'C86';
+  LOB            = 'Retail';
+  ReportName     = 'C86 Client360 Product Appropriateness';
+  ControlRisk    = 'Completeness';
+  TestType       = 'Anomaly';
+  TestPeriod     = 'Origination';
+  ProductType    = PROD_CATG_NM;           /* Product Category*/
+  segment        = 'Account Open';
+  segment2       = ASCT_PROD_FMLY_NM;      /* Product Name*/
+  segment3       = PROD_SRVC_NM;
+  segment6       = oppor_stage_nm;
+  segment7       = TOOL_USED;
+  segment10      = put(evnt_dt, yymmn6.);
+  CommentCode    = "COM13";
+  Comments       = put(CommentCode, $cs_cmt.);
+  HoldoutFlag    = 'N';
+  snapdate       = intnx('week.7', evnt_dt, 0, 'e');
+  datecompleted  = today();
+
+  format SnapDate DateCompleted yymmdd10.;
+run;
+
+proc freq data=tmp_pa_c360_4ac;
+  table PROD_CATG_NM;
+run;
+
+proc sql;
+  create table work.tmp_pa_c360_ac_assessment as
+  select
+      RegulatoryName
+    , LOB
+    , ReportName
+    , ControlRisk
+    , TestType
+    , TestPeriod
+    , ProductType
+    , 'PA003_Client360_Completeness_RDE' as RDE
+    , segment
+    , segment2
+    , segment3
+    , case when IS_PROD_APRP_FOR_CLNT = 'Product Appropriateness assessed outside Client 360' then "Product Appropriateness assessed outside of Client360"
+           when IS_PROD_APRP_FOR_CLNT = 'Not Appropriate - Rationale'                       then "Product Not Appropriate"
+           when IS_PROD_APRP_FOR_CLNT = 'Client declined product appropriateness assessment' then "Client declined product appropriateness assessment"
+           when IS_PROD_APRP_FOR_CLNT = 'Product Appropriate'                             then "Product Appropriate"
+           else 'Missing'
+      end as segment4 length = 60
+    , prod_not_aprp_rtnl_txt_cat as segment5
+    , segment6
+    , segment7
+    , segment10
+    , HoldoutFlag
+    , CommentCode
+    , Comments
+    , DateCompleted
+    , SnapDate
+    , sum(1) as Volume
+    , sum(.) as Amount
+  from work.tmp_pa_c360_4ac
+  group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21
+  ;
+quit;
+
+proc freq data=tmp_pa_c360_ac_assessment;
+  table segment4;
+run;
+
+data work.tmplat_ac;
+  length RegulatoryName $03
+         LOB $50
+         ReportName $50
+         ControlRisk $50
+         TestType $50
+         TestPeriod $50
+         ProductType $50
+         RDE $50
+         segment $50
+         segment2 $50
+         segment3 $200
+         segment4 $60
+         segment5 $50
+         segment6 $50
+         segment7 $50
+         segment8 $200
+         segment9 $50
+         segment10 $50
+         HoldoutFlag $01
+         CommentCode $05
+         Comments $50
+         DateCompleted 8
+         SnapDate 8
+         Volume 8
+         Amount 8
+         ;
+  format DateCompleted SnapDate yymmdd10.;
+  call missing(of _all_);
+  stop;
+run;
+
+data pa_c360_autocomplete_tool_use;
+  if 0 then set work.tmplat_ac;
+  set work.tmp_pa_c360_ac_assessment;
+  /* work.tmp_pa_aot_ac_attestation*/;
+run;
+
+/*--prepare data for tool used count--*/
+proc sql;
+  create table tmp_pa_c360_4ac_count_pre as
+  select
+    a.*,
+    upcase(b.ADVC_TOOL_NM) as ADVC_TOOL_NM format $200.
+  from
+    tmp_pa_c360_4ac a
+    left join tracking_tool_use_distinct b
+    on a.OPPOR_ID = b.OPPOR_ID
+  ;
+quit;
+
+
+data work.tmp_pa_c360_4ac_count;
+  set tmp_pa_c360_4ac_count_pre;
+  where level_oppor = 1;
+  length segment3 $200 LOB $50 ProductType $50 segment6 $50 segment8 $200;
+  RegulatoryName = 'C86';
+  LOB            = 'Retail';
+  ReportName     = 'C86 Client360 Product Appropriateness';
+  ControlRisk    = 'Completeness';
+  TestType       = 'Anomaly';
+  TestPeriod     = 'Origination';
+  ProductType    = PROD_CATG_NM;            /* Product Category*/
+  segment        = 'Account Open';
+  segment2       = ASCT_PROD_FMLY_NM;       /* Product Name*/
+  segment3       = PROD_SRVC_NM;
+  segment6       = oppor_stage_nm;
+  segment7       = TOOL_USED;
+  segment8       = ADVC_TOOL_NM;
+  segment10      = put(evnt_dt, yymmn6.);
+  CommentCode    = "COM13";
+  Comments       = put(CommentCode, $cs_cmt.);
+  HoldoutFlag    = 'N';
+  snapdate       = intnx('week.7', evnt_dt, 0, 'e');
+  datecompleted  = today();
+
+  format SnapDate DateCompleted yymmdd10.;
+run;
+
+proc sql;
+  create table work.tmp_pa_c360_ac_count_assessment as
+  select
+      RegulatoryName
+    , LOB
+    , ReportName
+    , ControlRisk
+    , TestType
+    , TestPeriod
+    , ProductType
+    , 'PA003_Client360_Completeness_Tool' as RDE
+    , segment
+    , segment2
+    , segment3
+    , case
+        when IS_PROD_APRP_FOR_CLNT = 'Not Appropriate - Rationale'                       then "Product Not Appropriate"
+        when IS_PROD_APRP_FOR_CLNT = 'Client declined product appropriateness assessment' then "Client declined product appropriateness assessment"
+        when IS_PROD_APRP_FOR_CLNT = 'Product Appropriate'                             then "Product Appropriate"
+        when IS_PROD_APRP_FOR_CLNT = 'Product Appropriateness assessed outside Client 360' then "Product Appropriateness assessed outside of Client360"
+        else 'Missing'
+      end as segment4 length = 60
+    , prod_not_aprp_rtnl_txt_cat as segment5
+    , segment6
+    , segment7
+    , segment8
+    , segment10
+    , HoldoutFlag
+    , CommentCode
+    , Comments
+    , DateCompleted
+    , SnapDate
+    , sum(1) as Volume
+    , sum(.) as Amount
+  from work.tmp_pa_c360_4ac_count
+  group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
+  ;
+quit;
+
+proc freq data=tmp_pa_c360_ac_count_assessment;
+  table segment4;
+run;
+
+data pa_c360_autocomplete_Count_Tool;
+  if 0 then set work.tmplat_ac;
+  set work.tmp_pa_c360_ac_count_assessment;
+run;
+
+data combine_pa_autocomplete;
+  set pa_c360_autocomplete_Count_Tool
+      pa_c360_autocomplete_tool_use
+  ;
+run;
+
+proc append base=ac.pa_client360_autocomplete
+            data=combine_pa_autocomplete(obs=0) force nowarn; /*in case base file doesn't exist*/
+run;
+
+data ac.pa_client360_autocomplete;
+  set ac.pa_client360_autocomplete(where=(DateCompleted=input("&runday", anydtdte8.)))
+      combine_pa_autocomplete;
+run;
+
+/* Generate autocomplete file*/
+proc export data=ac.pa_client360_autocomplete outfile="&outpath/pa_client360_autocomplete.xlsx" dbms=xlsx replace;
+  sheet="autocomplete";
+run;
+
+/*----auto complete finish----*/
+
+/*--detail file start---*/
+proc sql;
+  create table dataout.pa_client360_detail_&runday. as
+  select
+    segment10 as event_month,
+    DateCompleted as reporting_date format mmddyy10.,
+    intnx('week.7', EVNT_DT,0, 'e') format mmddyy10. as event_week_ending,
+    EVNT_DT as event_date format mmddyy10.,
+    EVNT_TMSTMP as event_timestamp format=MDYAMPM22.,
+    OPPOR_ID as opportunity_id,
+    OPPOR_REC_TYP as opportunity_type,
+    PROD_CD as product_code,
+    PROD_CATG_NM as product_category_name,
+    ASCT_PROD_FMLY_NM as product_family_name,
+    PROD_SRVC_NM as product_name,
+    oppor_stage_nm as oppor_stage_nm,
+    tool_used as tool_used,
+    advc_tool_nm as tool_nm,
+    case when IS_PROD_APRP_FOR_CLNT = 'Product Appropriateness assessed outside Client 360' then "Product Appropriateness assessed outside Client 360"
+         when IS_PROD_APRP_FOR_CLNT = 'Not Appropriate - Rationale'                       then "Product Not Appropriate"
+         when IS_PROD_APRP_FOR_CLNT = 'Client declined product appropriateness assessment' then "Client declined product appropriateness assessment"
+         when IS_PROD_APRP_FOR_CLNT = 'Product Appropriate'                             then "Product Appropriate"
+         else 'Missing'
+    end as PA_result,
+    CLNT_RTNL_TXT as PA_rationale,
+    prod_not_aprp_rtnl_txt_cat as PA_rationale_validity,
+    RBC_OPPOR_OWN_ID as employee_id,
+    OCCPT_JOB_CD as job_code,
+    HR_POSN_TITL_EN as position_title,
+    ORG_UNT_NO as employee_transit,
+    POSN_STRT_DT as position_start_date format mmddyy10.
+  from
+    tmp_pa_c360_4ac_count_pre
+  where calculated PA_result in ("Product Not Appropriate", "Missing", "Product Appropriateness assessed outside Client 360")
+  ;
+quit;
+
+proc export data=dataout.pa_client360_detail_&runday. outfile="&outpath/&runday/pa_client360_detail_&runday..xlsx" dbms=xlsx replace;
+  sheet="detail";
+run;
+
+/*update pivot table */
+proc Export data=ac.pa_client360_autocomplete
+            outfile="&outpath/PA_Client360_Pivot.xlsx"
+            Dbms=xlsx
+            Replace;
+            sheet='Autocomplete';
+run;
+
+
+x "find &regpath. -user $USER -mmin -720 -exec chmod 777 {} \;";
+
+proc printto; run;
+%ScanLog(&logfile);
