@@ -1,0 +1,299 @@
+SAS → Python Migration
+Developer Onboarding & Working Guide (Draft)
+1. Why This Document Exists
+
+This document explains how a developer gets started and actually delivers work on the SAS-to-Python migration.
+
+It exists to:
+
+Reduce back-and-forth questions
+
+Capture what we’ve already figured out the hard way
+
+Help new joiners and contractors ramp up faster
+
+Keep everyone working the same way
+
+This is a living document. It does not need to be perfect to be useful.
+
+2. Who Should Read This
+
+This guide is meant for:
+
+Developers new to the migration
+
+SAS developers moving into Python
+
+Contractors joining the team mid-stream
+
+If you’re writing or running Python jobs for this program, this applies to you.
+
+3. How the Work Flows (Big Picture)
+
+At a high level, everyone follows the same path:
+
+Get access and onboarded
+
+Set up your development environment
+
+Set up the GitHub repository
+
+Confirm data access
+
+Configure logging and outputs
+
+Develop and test your script
+
+Validate results
+
+Promote to higher environments
+
+The rest of this document breaks this down step by step.
+
+4. Access & Onboarding
+4.1 IDs and Permissions
+
+Before you can do any real work, you need the basics in place:
+
+Service ID / LAN ID
+
+Access to:
+
+NOA datasets
+
+S3
+
+Teradata (read)
+
+SQL Server (read/write as applicable)
+
+GitHub (CDN0)
+
+If something doesn’t work, log it.
+If it’s not in the issue tracker, it will be forgotten.
+
+4.2 NOA Access
+
+Once NOA access is approved:
+
+Log in and confirm you can see required datasets
+
+Run a simple query to confirm access
+
+Common problems:
+
+Dataset permissions missing
+
+Access approved but not yet propagated
+
+These are normal. Log them and move on.
+
+5. Development Environment Setup
+5.1 Python Setup
+
+Developers are expected to use a consistent Python setup.
+
+Minimum requirements:
+
+Standard Python version (to be finalized)
+
+Common libraries:
+
+pandas
+
+numpy
+
+pyarrow
+
+sqlalchemy
+
+Teradata / Trino client libraries
+
+How you create your environment (venv, conda, etc.) is less important than consistency.
+
+5.2 Credentials and Secrets
+
+Never hardcode credentials
+
+For local development:
+
+Use environment variables
+
+For higher environments:
+
+Use the approved vault / secret store
+
+If you’re unsure where a secret should live, ask before coding around it.
+
+6. GitHub Repository Setup (CDN0)
+6.1 Getting the Repo
+
+Fork the standard CDN0 template repository
+
+This ensures everyone starts with the same structure and defaults
+
+6.2 Repository Layout
+
+Each repo follows the same basic layout:
+
+/src        → Python scripts
+/config     → Configuration files
+/logs       → Log outputs
+/output     → Job outputs
+/sql        → SQL scripts
+/tests      → Validation or test code
+/docs       → Documentation
+
+
+Stick to this unless there’s a strong reason not to.
+
+6.3 Branching Rules
+
+Do all development in the dev branch
+
+No direct commits to prod
+
+Use pull requests for promotion
+
+This is about control and traceability, not bureaucracy.
+
+7. Data Access & Storage
+7.1 Source Systems
+
+Most scripts will read from:
+
+Teradata
+
+NOA datasets
+
+Other approved upstream sources
+
+Always confirm access before assuming a script is “broken.”
+
+7.2 S3 for Logs and Outputs
+
+S3 is the standard place for:
+
+Logs
+
+Job outputs
+
+Intermediate datasets
+
+Before starting development:
+
+Confirm read/write access
+
+Follow the agreed folder structure
+
+If S3 access blocks you, log the issue early.
+
+8. Logging and Audit
+8.1 Job-Level Logging
+
+Every job must write audit information to SQL Server.
+
+At minimum, capture:
+
+Job name
+
+Run ID
+
+Start and end time
+
+Status (success / failure)
+
+Record counts
+
+Error details (if any)
+
+This replaces what SAS scan logs used to give us.
+
+8.2 Log Files
+
+Each job run should produce:
+
+One log file per run
+
+Clear timestamps
+
+Script name and environment
+
+If something fails, logs should tell the story without guesswork.
+
+9. Day-to-Day Development Flow
+
+A typical development cycle looks like this:
+
+Pull the latest dev branch
+
+Configure your local environment
+
+Develop or update the Python script
+
+Write logs and outputs
+
+Store outputs in S3
+
+Update the batch tracking Excel
+
+This keeps work visible and predictable.
+
+10. Validation and Testing
+10.1 Data Validation
+
+Every Python output must match the SAS or Excel output.
+
+Validation usually includes:
+
+Row counts
+
+Key aggregates
+
+Spot checks on critical fields
+
+Do not assume parity. Prove it.
+
+10.2 Common Risk Areas
+
+Be especially careful with:
+
+Large Teradata pulls (spool space limits)
+
+Initial full loads
+
+Data type differences between SAS and Python
+
+When something breaks, document the workaround so the next person doesn’t repeat it.
+
+11. Moving to Higher Environments
+
+Promotion typically follows:
+
+dev → prod → reprod
+
+Before promoting:
+
+Code reviewed
+
+Validation completed
+
+Logs reviewed
+
+If any of these are missing, don’t promote.
+
+12. Issue Management
+
+All problems go into the central issue tracker.
+
+Each issue should clearly state:
+
+What failed
+
+Why it failed (if known)
+
+Workaround or fix
+
+Current status
+
+This is how we avoid solving the same problem five times.
