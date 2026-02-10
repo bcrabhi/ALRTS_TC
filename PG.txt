@@ -1,299 +1,226 @@
-SAS → Python Migration
-Developer Onboarding & Working Guide (Draft)
-1. Why This Document Exists
+0) Purpose
 
-This document explains how a developer gets started and actually delivers work on the SAS-to-Python migration.
+Move from SAS + ad-hoc scripts + manual runs to Python → GitHub → CI/CD → Airflow on OpenShift (containers) with:
 
-It exists to:
+Built-in security, monitoring, data quality, auditability
 
-Reduce back-and-forth questions
+Reproducible prod runs, fast rollback, and clear ownership
 
-Capture what we’ve already figured out the hard way
+1) Ground Rules (non-negotiables)
 
-Help new joiners and contractors ramp up faster
+Immutable runtime: Prod runs a pinned container image (tag@digest). No pip in prod.
 
-Keep everyone working the same way
+Per-job images: Each job has its own thin image; all inherit from a shared base image.
 
-This is a living document. It does not need to be perfect to be useful.
+Single approval gate: Promote image tag@digest Dev → UAT → Prod.
 
-2. Who Should Read This
+Secrets: Dev = personal ID; Prod = service ID + Vault (no secrets in code/images/logs).
 
-This guide is meant for:
+Naming convention: lower_snake_case, ASCII, no spaces/special chars. Use views to map legacy names.
 
-Developers new to the migration
+Data contract: Types, lengths, nullability, and keys are explicit. No silent truncation.
 
-SAS developers moving into Python
+Airflow-only execution in Prod: manual or scheduled = same approved image.
 
-Contractors joining the team mid-stream
+2) Roles & RACI
 
-If you’re writing or running Python jobs for this program, this applies to you.
+Platform (OpenShift/Airflow): namespaces, quotas/SCC, registry access, observability.
 
-3. How the Work Flows (Big Picture)
+Data Engineering (you): code, tests, DAGs, data contracts, runbooks, RCA.
 
-At a high level, everyone follows the same path:
+DBA: staging/final schemas, performance, permissions, maintenance.
 
-Get access and onboarded
+L1/L2 Support: monitor jobs, escalate with runbook.
 
-Set up your development environment
+Security/Compliance: approve image promotion, review SBOM/scan results.
 
-Set up the GitHub repository
+3) Environments & Access
 
-Confirm data access
+Dev / UAT / Prod namespaces in OpenShift.
 
-Configure logging and outputs
+GitHub: protected main branch; PR required.
 
-Develop and test your script
+Vault: prod secrets by service ID; short-lived tokens.
 
-Validate results
+SQL Server: separate schemas for stg_raw, stg_valid, and final.
 
-Promote to higher environments
+4) Developer Workflow (end-to-end)
 
-The rest of this document breaks this down step by step.
+Explore & prototype in Jupyter (Lumina).
 
-4. Access & Onboarding
-4.1 IDs and Permissions
+Convert notebook → repo using the template (NBConvert Tool).
 
-Before you can do any real work, you need the basics in place:
+Generates repo skeleton, DAG metadata, PR.
 
-Service ID / LAN ID
+CI (GitHub Actions/Helios)
 
-Access to:
+Build base (periodic) and per-job images.
 
-NOA datasets
+Tests (unit + parity), security & dependency scans, SBOM, sign image.
 
-S3
+Push to registry with tag and digest.
 
-Teradata (read)
+Approval (UCD / GitHub Environments / Ansible Tower)
 
-SQL Server (read/write as applicable)
+Single gate approves image tag@digest; records SBOM & scan results.
 
-GitHub (CDN0)
+Airflow deployment
 
-If something doesn’t work, log it.
-If it’s not in the issue tracker, it will be forgotten.
+DAG syncs. KubernetesPodOperator runs the approved digest.
 
-4.2 NOA Access
+Run & observe
 
-Once NOA access is approved:
+Logs in Airflow; alerts on failure/SLA breaches; audit row written.
 
-Log in and confirm you can see required datasets
+Rollback
 
-Run a simple query to confirm access
+Set the previous digest in Airflow var; rerun.
 
-Common problems:
+5) Image Strategy
 
-Dataset permissions missing
+Base image: OS, Python, ODBC/SSL, base libs, CA certs. Versioned on a cadence.
 
-Access approved but not yet propagated
+Per-job image: minimal job code + deps (requirements-jobX.txt).
 
-These are normal. Log them and move on.
+Policy: reject :latest, require signed images; store SBOM with the release.
 
-5. Development Environment Setup
-5.1 Python Setup
+6) Airflow Standards
 
-Developers are expected to use a consistent Python setup.
+Operator: KubernetesPodOperator with pinned image_digest.
 
-Minimum requirements:
+Pre-run guard task (template in every DAG):
 
-Standard Python version (to be finalized)
+Check credentials/secret lease, network reachability, schema/partition existence, free disk.
 
-Common libraries:
+Data promotion pattern:
 
-pandas
+Write to stg_raw → validate/clean into stg_valid → MERGE to final.
 
-numpy
+For S3 outputs: write to temp → manifest + READY marker → publish path.
 
-pyarrow
+Retry & SLA: set sensible retries/backoff; escalate after fixed time.
 
-sqlalchemy
+7) Data Modeling & Contracts
 
-Teradata / Trino client libraries
+Naming: lower_snake_case, ≤64 chars, stable.
 
-How you create your environment (venv, conda, etc.) is less important than consistency.
+Types (key rules):
 
-5.2 Credentials and Secrets
+Currency/amounts: DECIMAL(19,4) (or (19,6) for fees/FX).
 
-Never hardcode credentials
+Rates/percents: DECIMAL(9,6).
 
-For local development:
+IDs: VARCHAR/CHAR per source; avoid implicit casts.
 
-Use environment variables
+Dates: DATE; times: DATETIME2(3); time zones documented.
 
-For higher environments:
+Lengths (text):
 
-Use the approved vault / secret store
+Use observed p99 + headroom. Example: segments at 300; stg_raw may be wider (e.g., 400) to avoid landing truncation.
 
-If you’re unsure where a secret should live, ask before coding around it.
+Staging vs Final:
 
-6. GitHub Repository Setup (CDN0)
-6.1 Getting the Repo
+stg_raw: mirrors source; len wider; nullable; capture raw anomalies.
 
-Fork the standard CDN0 template repository
+stg_valid: conforms to final contract; enforced types/lengths.
 
-This ensures everyone starts with the same structure and defaults
+final: governed schema; writes only via controlled merges.
 
-6.2 Repository Layout
+Views for legacy names:
+Map "Segment 8" → segment8, etc., via a compatibility view. Point Tableau/exports to the view while deprecating direct table use.
 
-Each repo follows the same basic layout:
+8) Audit & Observability
 
-/src        → Python scripts
-/config     → Configuration files
-/logs       → Log outputs
-/output     → Job outputs
-/sql        → SQL scripts
-/tests      → Validation or test code
-/docs       → Documentation
+Audit table fields (per run):
 
+dag_id, task_id, run_id, batch_id
 
-Stick to this unless there’s a strong reason not to.
+image_tag, image_digest
 
-6.3 Branching Rules
+row counts in/out, checksum/hash, duration, status, error summary
 
-Do all development in the dev branch
+data window (e.g., snap_date), input partitions, output paths
 
-No direct commits to prod
+Logs & alerts:
 
-Use pull requests for promotion
+Stream pod logs to Airflow; alert on failure/SLA; daily summary optional.
 
-This is about control and traceability, not bureaucracy.
+9) Quality & Parity (SAS → Python)
 
-7. Data Access & Storage
-7.1 Source Systems
+Minimal DQ now (expand later):
 
-Most scripts will read from:
+Not-nulls on key cols; reference/lookup integrity; range checks; distinct counts.
 
-Teradata
+SAS parity harness per job:
 
-NOA datasets
+Row count match; key uniqueness; numeric diffs within tolerance; date/time equivalence; sorted output comparators; top-N sample diffs.
 
-Other approved upstream sources
+Store a parity report artifact per release.
 
-Always confirm access before assuming a script is “broken.”
+10) Security
 
-7.2 S3 for Logs and Outputs
+Secrets in Vault; rotate and lease-check in pre-run.
 
-S3 is the standard place for:
+ServiceAccounts with least privilege; NetworkPolicies to DB/S3 only.
 
-Logs
+Admission: signed images only, no :latest, pinned digest.
 
-Job outputs
+No PII in labs/scratch; purge policies.
 
-Intermediate datasets
+11) DBA Engagement (staging/final)
 
-Before starting development:
+Ask/confirm:
 
-Confirm read/write access
+Schemas: stg_raw, stg_valid, final (ownership, grants).
 
-Follow the agreed folder structure
+Retention: staging TTL (e.g., 30–90 days).
 
-If S3 access blocks you, log the issue early.
+Indexing/partitioning for final (PK/clustered indexes).
 
-8. Logging and Audit
-8.1 Job-Level Logging
+Load windows and locking expectations.
 
-Every job must write audit information to SQL Server.
+Error handling: exceptions table + retry guidance.
 
-At minimum, capture:
+12) Pivot/Validation Replacement (Autocomplete example)
 
-Job name
+Compute weekly aggregates in SQL/Python; persist to validation tables/views.
 
-Run ID
+Share via Tableau (pre-prod project) with threshold highlights.
 
-Start and end time
+Notify via subscriptions or data-driven alerts—no manual Excel pivots.
 
-Status (success / failure)
+If Excel is temporarily needed, generate from Python as a controlled artifact, not manual edits.
 
-Record counts
+13) Runbooks (must exist for each job)
 
-Error details (if any)
+Trigger & parameters (manual + scheduled).
 
-This replaces what SAS scan logs used to give us.
+Expected inputs/outputs; pre-run/data window checks.
 
-8.2 Log Files
+Common failures and exact remediation steps.
 
-Each job run should produce:
+Rollback: where to set previous image_digest, how to rerun.
 
-One log file per run
+Contacts & escalation.
 
-Clear timestamps
+14) Change Management
 
-Script name and environment
+PR with tests + parity report deltas.
 
-If something fails, logs should tell the story without guesswork.
+CI artifacts: SBOM, scan results, image digest.
 
-9. Day-to-Day Development Flow
+Approval ticket: attach artifacts, risk note, rollback tag.
 
-A typical development cycle looks like this:
+Post-deploy verification checklist (10 minutes).
 
-Pull the latest dev branch
+15) Risks & Mitigations
 
-Configure your local environment
+Env drift: pinned digest; immutable images; admission policy.
 
-Develop or update the Python script
+Upstream schema drift: pre-run schema checks; quarantine to exceptions.
 
-Write logs and outputs
+Cred/cert expiry: Vault rotation; expiry alarms.
 
-Store outputs in S3
+Small-files / performance: target Parquet size 128–512 MB; coalesce.
 
-Update the batch tracking Excel
-
-This keeps work visible and predictable.
-
-10. Validation and Testing
-10.1 Data Validation
-
-Every Python output must match the SAS or Excel output.
-
-Validation usually includes:
-
-Row counts
-
-Key aggregates
-
-Spot checks on critical fields
-
-Do not assume parity. Prove it.
-
-10.2 Common Risk Areas
-
-Be especially careful with:
-
-Large Teradata pulls (spool space limits)
-
-Initial full loads
-
-Data type differences between SAS and Python
-
-When something breaks, document the workaround so the next person doesn’t repeat it.
-
-11. Moving to Higher Environments
-
-Promotion typically follows:
-
-dev → prod → reprod
-
-Before promoting:
-
-Code reviewed
-
-Validation completed
-
-Logs reviewed
-
-If any of these are missing, don’t promote.
-
-12. Issue Management
-
-All problems go into the central issue tracker.
-
-Each issue should clearly state:
-
-What failed
-
-Why it failed (if known)
-
-Workaround or fix
-
-Current status
-
-This is how we avoid solving the same problem five times.
+Runtime downloads (if forced): versioned S3 paths + checksum verify; log URI + SHA.
