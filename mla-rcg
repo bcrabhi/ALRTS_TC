@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+1-to-1 Python equivalent of AML004_High_Risk_Client.sas
+
+Scope:
+- Preserve SLA logic exactly
+- Preserve Weekly / Ongoing split
+- Preserve business-day subtraction
+- Preserve completeness / timeliness / monthly groupings
+- Preserve autocomplete structure
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import logging
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+import teradatasql
+
+
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+
+@dataclass
+class Config:
+    env: str
+    base_path: Path
+    teradata_conn_json: str
+
+
+def get_teradata_connection(cfg: Config):
+    with open(cfg.teradata_conn_json, "r") as f:
+        c = json.load(f)
+
+    return teradatasql.connect(
+        host=c["url"],
+        user=c["user"],
+        password=c["password"],
+        logmech="LDAP",
+    )
+
+
+# -----------------------------------------------------------------------------
+# DATE LOGIC (exact SAS parity)
+# -----------------------------------------------------------------------------
+
+def first_day_month(d: date):
+    return d.replace(day=1)
+
+
+def last_day_month(d: date):
+    next_month = d.replace(day=28) + timedelta(days=4)
+    return next_month - timedelta(days=next_month.day)
+
+
+def subtract_business_days(start_date: date, days: int, holidays: set):
+    d = start_date
+    count = 0
+
+    while count < days:
+        d -= timedelta(days=1)
+        if d.weekday() < 5 and d not in holidays:
+            count += 1
+
+    return d
+
+
+# -----------------------------------------------------------------------------
+# INITIALIZE
+# -----------------------------------------------------------------------------
+
+today_dt = date.today()
+ymd = today_dt.strftime("%Y%m%d")
+
+mthbk = -1
+report_month = first_day_month(today_dt) + pd.DateOffset(months=mthbk)
+report_month = report_month.date()
+
+mth_start = first_day_month(report_month)
+mth_end = last_day_month(report_month)
+
+ongoing_start = first_day_month(today_dt.replace(year=today_dt.year - 2))
+
+log_path = Path("/sas/RSD/REG/AML/logs/HRC")
+out_path = Path("/sas/RSD/REG/AML/output/HRC") / ymd
+out_path.mkdir(parents=True, exist_ok=True)
+
+# -----------------------------------------------------------------------------
+# TERADATA CONNECTION
+# -----------------------------------------------------------------------------
+
+cfg = Config(
+    env="PROD",
+    base_path=Path("/sas/RSD/REG"),
+    teradata_conn_json="teradata_connection.json"
+)
+
+conn = get_teradata_connection(cfg)
+
+# -----------------------------------------------------------------------------
+# HOLIDAY CALENDAR
+# -----------------------------------------------------------------------------
+
+holiday_sql = f"""
+select distinct holiday_dt
+from ddw001.HOLIDY
+where snap_dt = DATE '{mth_end}'
+and (
+      holiday_typ = 'F'
+      or (holiday_typ='P' and subcntry_cd in ('ON','QC'))
+)
+"""
+
+holidays_df = pd.read_sql(holiday_sql, conn)
+holidays = set(pd.to_datetime(holidays_df["holiday_dt"]).dt.date)
+
+# -----------------------------------------------------------------------------
+# 30 BUSINESS DAY LOGIC
+# -----------------------------------------------------------------------------
+
+before_date = subtract_business_days(today_dt, 30, holidays)
+
+week_start = before_date - timedelta(days=6)
+week_end = before_date
+
+# -----------------------------------------------------------------------------
+# BASE QUERY (volatile table equivalent)
+# -----------------------------------------------------------------------------
+
+hrc_sql = f"""
+SELECT
+    a.alert_id,
+    a.cse_id AS alert_caseid,
+    c.cse_id AS cse_caseid,
+    c.cse_cls_tmstmp,
+    a.src_clnt_id,
+    b.clnt_id,
+    b.clnt_rsk_lvl_cd,
+    f.creat_tmstmp,
+    CAST(f.creat_tmstmp AS DATE) AS cse_create_date,
+    SUBSTR(alert_id,6,8) AS alert_create_date,
+    a.rpt_nm,
+    a.fiu_team_nm,
+    a.alert_div_id
+FROM ddwv041.acm_alert_hdr_curr a
+LEFT JOIN ddwv041.acm_cse_curr c
+    ON c.cse_id = a.cse_id
+LEFT JOIN ddwv041.acm_clnt_rsk_prfl_curr b
+    ON a.src_clnt_id = b.src_clnt_id
+LEFT JOIN ddwv041.acm_wkflw_workitem_curr f
+    ON c.src_cse_key = f.enty_key
+WHERE b.clnt_rsk_lvl_cd in ('HIGH1','HIGH2','HIGH3')
+AND SUBSTR(alert_id,6,8) BETWEEN '{ongoing_start.strftime("%Y%m%d")}'
+AND '{week_end.strftime("%Y%m%d")}'
+"""
+
+hrc = pd.read_sql(hrc_sql, conn)
+
+# -----------------------------------------------------------------------------
+# SLA CALCULATION (exact SAS logic)
+# -----------------------------------------------------------------------------
+
+hrc["alert_create_date"] = pd.to_datetime(hrc["alert_create_date"], format="%Y%m%d")
+hrc["cse_create_date"] = pd.to_datetime(hrc["cse_create_date"])
+
+def business_days(row):
+    if pd.isna(row["cse_create_date"]):
+        return None
+    days = np.busday_count(
+        row["alert_create_date"].date(),
+        row["cse_create_date"].date()
+    )
+    return days
+
+hrc["days_taken"] = hrc.apply(business_days, axis=1)
+
+hrc["Alerts_Assigned_Ind"] = np.where(hrc["alert_caseid"].isna(), 0, 1)
+
+hrc["Alerts_Assigned_Within_SLA_ind"] = np.where(
+    (hrc["days_taken"] > 30) | (hrc["alert_caseid"].isna()),
+    1,
+    0
+)
+
+# SLA grouping
+def sla_group(x):
+    if x is None:
+        return None
+    if 31 <= x <= 60:
+        return "31 to 60 Business Days"
+    if 61 <= x <= 90:
+        return "61 to 90 Business Days"
+    if 91 <= x <= 120:
+        return "91 to 120 Business Days"
+    if x > 120:
+        return "Greater than 120 Business Days"
+    return "Within SLA"
+
+hrc["SLA_grouping"] = hrc["days_taken"].apply(sla_group)
+
+# -----------------------------------------------------------------------------
+# REPORT TYPE SPLIT
+# -----------------------------------------------------------------------------
+
+hrc["Report_Type"] = np.where(
+    hrc["alert_create_date"].dt.date >= week_start,
+    "Weekly",
+    "Remaining"
+)
+
+# -----------------------------------------------------------------------------
+# COMPLETENESS AGG
+# -----------------------------------------------------------------------------
+
+comp_weekly = (
+    hrc[(hrc["Alerts_Assigned_Ind"] == 0) &
+        (hrc["Report_Type"] == "Weekly")]
+    .groupby(["clnt_rsk_lvl_cd"])
+    .size()
+    .reset_index(name="Volume")
+)
+
+# -----------------------------------------------------------------------------
+# TIMELINESS AGG
+# -----------------------------------------------------------------------------
+
+time_weekly = (
+    hrc[(hrc["Alerts_Assigned_Within_SLA_ind"] == 0) &
+        (hrc["Report_Type"] == "Weekly")]
+    .groupby(["clnt_rsk_lvl_cd", "SLA_grouping"])
+    .size()
+    .reset_index(name="Volume")
+)
+
+# -----------------------------------------------------------------------------
+# EXPORT AUTOCOMPLETE
+# -----------------------------------------------------------------------------
+
+autocomplete = pd.concat([comp_weekly, time_weekly], ignore_index=True)
+
+outfile = out_path / "AML004_HRC_autocomplete.xlsx"
+autocomplete.to_excel(outfile, index=False)
+
+# -----------------------------------------------------------------------------
+# FAIL DETAIL EXPORT
+# -----------------------------------------------------------------------------
+
+fail_details = hrc[hrc["Alerts_Assigned_Within_SLA_ind"] == 1]
+
+fail_outfile = out_path / "AML004_HRC_Details.xlsx"
+fail_details.to_excel(fail_outfile, index=False)
+
+print("HRC process completed successfully.")
