@@ -1,0 +1,1146 @@
+/******************************************************************************
+* PROGRAM      : COB_Repository_LINX_243.sas
+* PROJECT NAME : COB Repository Monitoring
+* CREATED BY   : Esther Au-Yeung
+* PURPOSE      : COB Repository Monitoring control on Accuracy - 243 Homeline Agreement
+*
+* CHANGE LOG
+* ---------------------------------------------------------------------------
+* Date         BY            DESCRIPTIONS
+* ---------------------------------------------------------------------------
+* 2024-12-09   Esther Au-Yeung   New script created
+* 2025-06-02   DeSheng Su        Added Mortgage Type, Prepayment Type, and
+*                               Payment Frequency RDEs
+******************************************************************************/
+
+/*=============================================================================
+  ENV / MACROS
+=============================================================================*/
+%macro not_run_in_master;
+    %global env regpath logpath outpath sasfile logfile lstfile;
+
+    %let env = DEV;
+
+    %let env = %sysfunc(
+                 ifc("&env"="",
+                     %sysfunc(ifc(%upcase(%substr(%sysget(USER),1,1)) = U and &SYSHOSTNAME ^= uasast11,
+                                  PROD, DEV)),
+                     &env)
+              );
+
+    %let regpath = %sysfunc(
+                    ifc("&sysparm" ^= "",
+                        &sysparm,
+                        %sysfunc(ifc(&env=PROD,/sas/RSD/REG,/sas/RSD/REG_DEV)))
+                   );
+
+    %include "&regpath/script/common/security/pswd.sas";
+
+    options sasautos=(sasautos,
+                      "&regpath/script/common/macros/volatile",
+                      "&regpath/script/common/macros/general");
+    options pagesize=max mprint;
+%mend not_run_in_master;
+
+%not_run_in_master;
+
+%let syscc = 0;
+
+%let logpath = &regpath/COB/log/REP/FORM_ORIG/243;
+%let outpath = &regpath/COB/output/REP/FORM_ORIG/243;
+
+%let logfile = &logpath/COB_LINX243_%sysdate9..log;
+%let lstfile = &logpath/COB_LINX243_%sysdate9..lst;
+
+%put &=regpath &=logfile &=lstfile;
+
+%CreateDirectory(&logpath);
+%CreateDirectory(&outpath);
+
+proc printto log="&logfile" print="&lstfile" new;
+run;
+
+%GLOBAL _SASPROGRAMFILE;
+%let sasfile = %sysfunc(ifc("&_SASPROGRAMFILE"="",
+                            %scan(&SYSPROCESSNAME,-1,%str( )),
+                            %scan(&_SASPROGRAMFILE,-1,%str(%/))));
+
+%put >>>>>>>>>> Name of This Program - &sasfile <<<<<<<<<;
+%put >>>>>>>>>> Starting Running Time - %left(%sysfunc(datetime(),datetime20.)) <<<<<<<<<;
+%put >>>>>>>>>> User ID - %sysget(USER) <<<<<<<<<;
+%put >>>>>>>>>> Platform - &SYSHOSTNAME <<<<<<<<<;
+%put >>>>>>>>>> Prod/Dev - &env <<<<<<<<<;
+
+libname ac "&outpath";
+
+%let runday   = %sysfunc(today());
+%let last_snap = 0;
+%let ini_run  = ' ';
+
+%macro get_init_and_buff;
+    %if %sysfunc(fileexist(&outpath/autocomplete_243.sas7bdat)) %then %do;
+        %let ini_run = 'N';
+
+        x cp "&outpath/autocomplete_243.sas7bdat" "&outpath/autocomplete_243_backup.sas7bdat";
+        x cp "&outpath/faildetail_linx_243.sas7bdat" "&outpath/faildetail_linx_243_backup.sas7bdat";
+
+        proc sql noprint;
+            select max(a0, max(snapdate)) into :last_snap
+            from ac.autocomplete_243
+            where DateCompleted < &runday;
+        quit;
+    %end;
+    %else %do;
+        %let ini_run = 'Y';
+    %end;
+
+    %put &=ini_run;
+    %put &=last_snap;
+%mend;
+
+%get_init_and_buff;
+
+/*=============================================================================
+  DATE WINDOWS
+=============================================================================*/
+data _null_;
+    Linx_start = intnx('week.4', &runday, 0) - 11;
+    Quad_valid = '20SEP2024'd;
+
+    last_snap = symgetn('last_snap');
+    if last_snap = 0 then last_snap = Linx_start - 1;
+
+    activation_start = ifn(&ini_run = 'Y', Linx_start, last_snap + 1);
+
+    quad_start = max(activation_start - 365, Quad_valid);
+    week_end   = intnx('week.4', &runday, 0) - 5;
+
+    call symputx('week_end',   cats("'", put(week_end,   yymmdd10.), "'"));
+    call symputx('quad_start', cats("'", put(quad_start, yymmdd10.), "'"));
+    call symputx('actv_start', cats("'", put(activation_start, yymmdd10.), "'"));
+    call symputx('rundt',      put(&runday, yymmddn8.));
+run;
+
+%put &=ini_run;
+%put &=actv_start;
+%put &=quad_start;
+%put &=week_end;
+%put &=rundt;
+
+%CreateDirectory(&outpath/&rundt);
+libname dataout "&outpath/&rundt";
+
+/*=============================================================================
+  FORMATS
+=============================================================================*/
+proc format;
+    value flag
+        1     = 'Potential Fail'
+        0     = 'Pass'
+        .N    = 'Unable to assess'
+        other = 'Not Applicable'
+    ;
+
+    value $cmt
+        'COM1'  = 'Test population (less samples)'
+        'COM2'  = 'Match population'
+        'COM3'  = 'Mismatch population (less samples)'
+        'COM4'  = 'Non Anomaly Population'
+        'COM5'  = 'Anomaly Population'
+        'COM6'  = 'Number of Deposit Sessions'
+        'COM7'  = 'Number of Accounts'
+        'COM8'  = 'Number of Transactions'
+        'COM9'  = 'Non Blank Population'
+        'COM10' = 'Blank Population'
+        'COM11' = 'Unable to Assess'
+        'COM12' = 'Number of Failed Data Elements'
+        'COM13' = 'Population Distribution'
+        'COM14' = 'Reconciled Population'
+        'COM15' = 'Not Reconciled Population'
+        'COM16' = 'Pass'
+        'COM17' = 'Fail'
+        'COM18' = 'Not Applicable'
+        'COM19' = 'Potential Fail'
+    ;
+
+    /* Accuracy Comments */
+    value qa
+        0     = 'COM16'
+        1     = 'COM19'
+        .N    = 'COM11'
+        other = 'COM18'
+    ;
+
+    value $ctrk
+        'Comp'  = 'Completeness'
+        'AccuM' = 'Accuracy'
+        'AccuC' = 'Accuracy'
+        'Accu'  = 'Accuracy'
+        'Time'  = 'Timeliness'
+    ;
+
+    value $DE_I
+        'PrcplBal'    = 'PrincipalBalance'
+        'IntRate'     = 'InterestRate'
+        'Term'        = 'Term'
+        'IntAdjDate'  = 'InterestAdjustmentDate'
+        'TtlPymtAmt'  = 'TotalPaymentAmount'
+        'FstPymtDDt'  = 'FirstPaymentDueDate'
+        'PIPayment'   = 'PIPayment'
+        'HPPrem'      = 'HomeProtectorInsurancePremium'
+        'AmortPeriod' = 'AmortizationPeriod'
+        'DeftInsPrem' = 'DefaultInsurancePremium'
+        'DeftInsTax'  = 'DefaultInsuranceTax'
+        'TtlDeftIns'  = 'TotalDefaultInsurance'
+        'ProcessFee'  = 'ProcessingFee'
+        'AvalAmt'     = 'AvailableAmount'
+        'MatDate'     = 'MaturityDate'
+        'BalAtMat'    = 'BalanceAtMaturity'
+        'TtlCOB'      = 'TotalInterestEndofTerm'
+        'PIEOT'       = 'PrincipalInterestEndofTerm'
+        'TtlPymtMth'  = 'TotalPaymentAmountMonthly'
+        'APR'         = 'AnnualPercentageRate'
+        'TriggerRT'   = 'TriggeringAnnualInterestRate'
+        'IniCLLimit'  = 'InitialCreditLimit'
+        'Mortgagetype'= 'MortgageType'
+        'PrePYMTOpt'  = 'PrePaymentType'
+        'PymtFreq'    = 'PaymentFrequency'
+    ;
+run;
+
+/*=============================================================================
+  EXTRACT FROM COB REPOSITORY
+=============================================================================*/
+%let cob_str_prod =
+    "Driver=noprompt_sql;
+     HostName=YKE0-P16SP1812.fg.rbc.com\IN12;
+     database=DCB10_COB_REPOSITORY;
+     EnableScrollableCursors=3;
+     UID=&cob_user;
+     PWD=&cob_pswd";
+
+proc sql;
+    connect to odbc as coblinx (noprompt=&cob_str_prod);
+
+    create table quad_linx as
+    select *
+    from connection to coblinx
+    (
+        select m.*
+        from
+        (
+            select z.*,
+                   case
+                       when applicationID = '00000000000000' then 'Native Open'
+                       else 'Origination'
+                   end as Application_Type,
+
+                   case
+                       when upstreamEventIds = 'Initial_Cob_Quad' then
+                           rank() over
+                           (
+                               partition by z.applicationid, z.transactionid, z.productID, z.upstreamEventIds
+                               order by z.docGeneratedDateTimeStamp desc
+                           )
+                   end as quad_rank,
+
+                   case
+                       when upstreamEventIds = 'Activation' then
+                           rank() over
+                           (
+                               partition by z.applicationid, z.transactionid, z.productID, z.upstreamEventIds
+                               order by z.eventTimestamp desc
+                           )
+                   end as actv_rank,
+
+                   row_number() over
+                   (
+                       partition by z.applicationid, z.transactionid, z.productID, z.upstreamEventIds, z.eventID
+                       order by z.srfnumber
+                   ) as clnt_rank
+
+            from
+            (
+                select
+                    formNumber,
+                    app.[applicationID],
+                    app.[appraisalFee],
+                    app.[srcSysCd],
+
+                    a.[transactionID],
+                    a.[initialCreditLimit] ,
+                    a.[availableCredit] ,
+                    a.[outstandingBalance] ,
+                    a.[planLimit] ,
+                    a.[totalOutstandingBalancePL] ,
+                    a.[homelinePlanRCL] ,
+                    a.[maximumCreditLineLimit] ,
+                    a.[applicationStatus] ,
+                    a.[commitmentExpiryDate] ,
+                    a.[eventID] ,
+
+                    b.[administrationFee] ,
+                    b.[cashBack] ,
+                    c.[mortgageType] ,
+                    b.[principalAmount] ,
+                    b.[annualInterestRate] ,
+                    b.[annualPercentageRate] ,
+                    c.[term] ,
+                    c.[prepaymentOptions] ,
+                    a.[dateOfAdvance] ,
+                    a.[interestAdjustmentDate] ,
+                    b.[totalPaymentAmount] ,
+                    c.[paymentFrequency] ,
+                    c.[firstPaymentDueDate] ,
+                    b.[principalInterestPayment] ,
+                    b.[PIPayment] ,
+                    b.[homeProtectorInsurancePremium] ,
+                    c.[amortizationPeriod] ,
+                    b.[defaultInsurancePremium] ,
+                    b.[defaultInsuranceTax] ,
+                    b.[totalDefaultInsurance] ,
+                    b.[processingFee] ,
+                    a.[availableAmount] ,
+                    b.[maturityDate] ,
+                    b.[balanceOwingMaturity] ,
+                    b.[triggeringInterestRate] ,
+                    b.[interestCostOverTerm] ,
+                    b.[totalCOBTerm] ,
+                    b.[totalPIPaymentsTerm] ,
+                    b.[totalPaymentAmountMonthly] ,
+                    c.productID ,
+                    b.[dischargeFee] ,
+                    b.[interestRate] ,
+                    b.[primeRate] ,
+                    b.[acceleratedPaymentIndicator] ,
+                    b.[termDuration] ,
+                    c.[amortizationPeriodDuration] ,
+
+                    d.[upstreamEventIds] ,
+                    e.srfnumber ,
+                    convert(date, coalesce([docGeneratedDateTimeStamp], [eventTimestamp])) as event_date,
+                    d.[eventTimestamp] ,
+                    d.[docGeneratedDateTimeStamp] ,
+                    coalesce([docGeneratedDateTimeStamp], [eventTimestamp]) as creationTimestamp,
+
+                    a.transitNumber,
+                    a.accountNumber,
+                    a.segmentNumber,
+
+                    c.paymentFrequencyEnumKey,
+                    c.mortgageTypeEnumKey,
+                    c.prepaymentOptionsEnumKey
+
+                from [DCB10_COB_REPOSITORY].[dbo].[Application] as app
+                inner join [DCB10_COB_REPOSITORY].[dbo].[Transaction] as a
+                    on app.eventID = a.eventID
+                inner join [DCB10_COB_REPOSITORY].[dbo].[Payment_Details] as c
+                    on app.eventID = c.eventID
+                inner join [DCB10_COB_REPOSITORY].[dbo].[Event_Log] as d
+                    on app.eventID = d.eventID
+                inner join [DCB10_COB_REPOSITORY].[dbo].[Application_Applicant_Rel] as e
+                    on app.eventID = e.eventID
+                left join [DCB10_COB_REPOSITORY].[dbo].[Pricing] as b
+                    on app.eventID = b.eventID
+
+                where (
+                        (upstreamEventIds = 'Initial_Cob_Quad' and
+                         (convert(date, docGeneratedDateTimeStamp) between &quad_start and &week_end))
+                     or (upstreamEventIds = 'Activation' and
+                         (convert(date, eventTimestamp) between &actv_start and &week_end))
+                      )
+            ) as z
+        ) as m
+        order by [applicationID], upstreamEventIds desc, docGeneratedDateTimeStamp desc, eventTimestamp desc
+    );
+quit;
+
+proc freq data=quad_linx;
+    table upstreamEventIds*product / list missing;
+    table formnumber*product / missing;
+run;
+
+data quad_linx_final;
+    set quad_linx;
+
+    length segmenttype $10.;
+    length producttype $10.;
+
+    if product in ('R_HLP_PRCL_SEG','R_HLP_RCL_SEG','R_HLP_MTG_SEG','R_HLP');
+
+    /* add segment type to linx 243 */
+    if product in ('R_HLP_PRCL_SEG') then SegmentType='PRCL';
+    else if product in ('R_HLP_RCL_SEG') then SegmentType='RCL';
+    else if product in ('R_HLP_MTG_SEG') then SegmentType='MTG';
+    else SegmentType='HLP';
+
+    if product in ('R_HLP_PRCL_SEG','R_HLP_RCL_SEG') then ProductType='Loans';
+    else if product in ('R_HLP') then ProductType='Homeline';
+    else ProductType='Mortgages';
+
+    where quad_rank = 1 or actv_rank = 1;
+run;
+
+/* separate Linx and Quad data */
+data quad linx;
+    set quad_linx_final;
+
+    XID = catx('+', applicationid, transactionid, productID);
+
+    keep
+        XID
+        transitNumber
+        Application_Type
+        clnt_rank
+        actv_rank
+        formNumber
+        applicationID
+        applicationStatus
+        transactionID
+        productID
+        eventID
+        accountnumber
+        segmentnumber
+        eventTimestamp
+        srcSysCd
+        SegmentType
+        ProductType
+        product
+        mortgagetype
+        principalAmount
+        annualInterestRate
+        annualPercentageRate
+        term
+        prepaymentOptions
+        dateOfAdvance
+        interestAdjustmentDate
+        totalPaymentAmount
+        paymentFrequency
+        firstPaymentDueDate
+        principalInterestPayment
+        PIPayment
+        homeProtectorInsurancePremium
+        amortizationPeriod
+        defaultInsurancePremium
+        defaultInsuranceTax
+        totalDefaultInsurance
+        processingFee
+        availableAmount
+        maturityDate
+        balanceOwingMaturity
+        triggeringInterestRate
+        interestCostOverTerm
+        totalCOBTerm
+        totalPIPaymentsTerm
+        totalPaymentAmountMonthly
+        upstreamEventIds
+        srfnumber
+        docGeneratedDateTimeStamp
+        paymentFrequencyEnumKey
+        mortgageTypeEnumKey
+        prepaymentOptionsEnumKey
+    ;
+
+    if upstreamEventIds = 'Initial_Cob_Quad' and formNumber in ('243','50243') then output quad;
+    else if upstreamEventIds = 'Activation' and applicationStatus in ('Completed','Activated') then output linx;
+run;
+
+proc freq data=linx;
+    table ProductType*product*segmenttype / list missing;
+run;
+
+proc freq data=quad;
+    table formNumber*product*segmenttype / list missing;
+run;
+
+/*=============================================================================
+  JOIN LINX + QUAD AND COMPARE
+=============================================================================*/
+proc sql;
+    create table linx_quad_compare as
+    select
+        l.XID,
+        q.formNumber,
+        l.applicationStatus,
+        l.eventTimestamp,
+        l.upstreamEventIds as upstreamEventIds_Linx,
+        q.upstreamEventIds as upstreamEventIds_Quad,
+        q.Application_Type,
+        q.docGeneratedDateTimeStamp,
+        l.eventID,
+        l.srfnumber,
+        datepart(l.eventTimestamp) as activation_DT format=mmddyy10.,
+        l.clnt_rank,
+        l.actv_rank,
+        q.eventTimestamp as eventTimestamp_quad,
+        datepart(q.eventTimestamp) as Quad_DT format=mmddyy10.,
+        l.transitNumber,
+        l.applicationID,
+        l.transactionID,
+        l.productID,
+        q.productID as productID_quad,
+        l.accountNumber,
+        l.segmentNumber,
+        l.srcSysCd,
+        q.srcSysCd as srcSysCd_quad,
+        q.SegmentType,
+        q.ProductType,
+        q.Product,
+
+        /* No.2 principalAmount */
+        l.principalAmount,
+        q.principalAmount as principalAmount_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.principalAmount is missing or q.principalAmount is missing then .N
+            when l.principalAmount = q.principalAmount then 0 else 1
+        end as AccuM_PrcplBal,
+
+        /* No.3 annualInterestRate */
+        l.annualInterestRate,
+        q.annualInterestRate as annualInterestRate_quad,
+        case
+            when q.SegmentType = ('HLP') then .
+            when l.annualInterestRate is missing or q.annualInterestRate is missing then .N
+            when int(l.annualInterestRate*1e6)/1e6 = int(q.annualInterestRate*1e6)/1e6 then 0 else 1
+        end as AccuM_IntRate,
+
+        /* No.4 term */
+        l.term,
+        q.term as term_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.term is missing or q.term is missing then .N
+            when l.term = q.term then 0 else 1
+        end as AccuM_Term,
+
+        /* No.5 prepaymentOptions */
+        l.prepaymentOptions,
+        q.prepaymentOptions as prepaymentOptions_quad,
+        case
+            when l.SegmentType = 'PRCL' then .
+            when l.prepaymentOptions is missing or q.prepaymentOptions is missing then .N
+            when upcase(l.prepaymentOptions) = upcase(q.prepaymentOptions) then 0 else 1
+        end as AccuM_prepaymentOptions,
+
+        /* No.6 interestAdjustmentDate */
+        l.interestAdjustmentDate,
+        q.interestAdjustmentDate as intrstadjdate_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.interestAdjustmentDate in (., '31dec9999'D)
+              or q.interestAdjustmentDate in (., '31dec9999'D) then .N
+            when l.interestAdjustmentDate = q.interestAdjustmentDate then 0 else 1
+        end as AccuM_IntAdjDate,
+
+        /* No.7 totalPaymentAmount */
+        l.totalpaymentamount,
+        q.totalpaymentamount as totalpaymentamount_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.totalpaymentamount is missing or q.totalpaymentamount is missing then .N
+            when l.totalpaymentamount = q.totalpaymentamount then 0 else 1
+        end as AccuM_TtlPymtAmt,
+
+        /* No.9 firstPaymentDueDate */
+        l.firstPaymentDueDate,
+        q.firstPaymentDueDate as firstPymtDueDate_quad,
+        case
+            when q.SegmentType = ('HLP') then .
+            when l.firstPaymentDueDate in (., '31dec9999'D)
+              or q.firstPaymentDueDate in (., '31dec9999'D) then .N
+            when l.firstPaymentDueDate = q.firstPaymentDueDate then 0 else 1
+        end as AccuM_FstPymtDDt,
+
+        /* No.10 principalInterestPayment (mapped to PIPayment) */
+        l.principalInterestPayment as PIPayment,
+        q.principalInterestPayment as PIPayment_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.principalInterestPayment is missing or q.principalInterestPayment is missing then .N
+            when l.principalInterestPayment = q.principalInterestPayment then 0 else 1
+        end as AccuM_PIPayment,
+
+        /* No.10 PIPayment - removed due to all blank */
+        /* l.PIPayment, */
+        /* q.PIPayment as PIPayment_quad, */
+        /* case ... end as AccuM_PIPayment, */
+
+        /* No.11 homeProtectorInsurancePremium */
+        l.homeProtectorInsurancePremium,
+        q.homeProtectorInsurancePremium as homeProtectorPremium_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.homeProtectorInsurancePremium is missing or q.homeProtectorInsurancePremium is missing then .N
+            when l.homeProtectorInsurancePremium = q.homeProtectorInsurancePremium then 0 else 1
+        end as AccuM_HPPrem,
+
+        /* No.12 amortizationPeriod */
+        l.amortizationPeriod,
+        q.amortizationPeriod as amortizationPeriod_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.amortizationPeriod is missing or q.amortizationPeriod is missing then .N
+            when l.amortizationPeriod = q.amortizationPeriod then 0 else 1
+        end as AccuM_AmortPeriod,
+
+        /* No.13 defaultInsurancePremium */
+        l.defaultInsurancePremium,
+        q.defaultInsurancePremium as deftInsPremium_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when q.defaultInsurancePremium is missing then .N
+            when l.defaultInsurancePremium is missing and q.defaultInsurancePremium ^= 0 then .N
+            when l.defaultInsurancePremium is missing and q.defaultInsurancePremium = 0 then 0
+            when l.defaultInsurancePremium = q.defaultInsurancePremium then 0 else 1
+        end as AccuM_DeftInsPrem,
+
+        /* No.14 defaultInsuranceTax */
+        l.defaultInsuranceTax,
+        q.defaultInsuranceTax as defaultInsuranceTax_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when q.defaultInsuranceTax is missing then .N
+            when l.defaultInsuranceTax is missing and q.defaultInsuranceTax ^= 0 then .N
+            when l.defaultInsuranceTax is missing and q.defaultInsuranceTax = 0 then 0
+            when l.defaultInsuranceTax = q.defaultInsuranceTax then 0 else 1
+        end as AccuM_DeftInsTax,
+
+        /* No.15 totalDefaultInsurance */
+        l.totalDefaultInsurance,
+        q.totalDefaultInsurance as totalDefaultInsurance_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when q.totalDefaultInsurance is missing then .N
+            when l.totalDefaultInsurance is missing and q.totalDefaultInsurance ^= 0 then .N
+            when l.totalDefaultInsurance is missing and q.totalDefaultInsurance = 0 then 0
+            when l.totalDefaultInsurance = q.totalDefaultInsurance then 0 else 1
+        end as AccuM_TtlDeftIns,
+
+        /* No.16 processingFee */
+        l.processingFee,
+        q.processingFee as processingFee_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.processingFee is missing or q.processingFee is missing then .N
+            when l.processingFee = q.processingFee then 0 else 1
+        end as AccuM_ProcessFee,
+
+        /* No.17 availableAmount */
+        l.availableAmount,
+        q.availableAmount as availableAmount_quad,
+        case
+            when q.SegmentType ^= ('HLP') then .
+            when l.availableAmount is missing or q.availableAmount is missing then .N
+            when l.availableAmount = q.availableAmount then 0 else 1
+        end as AccuM_AvalAmt,
+
+        /* No.18 maturityDate */
+        l.maturityDate,
+        q.maturityDate as maturityDate_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.maturityDate in (., '31dec9999'D)
+              or q.maturityDate in (., '31dec9999'D) then .N
+            when l.maturityDate = q.maturityDate then 0 else 1
+        end as AccuM_MatDate,
+
+        /* No.19 balanceOwingMaturity */
+        l.balanceOwingMaturity as balanceAtMaturity,
+        q.balanceOwingMaturity as balanceAtMaturity_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.balanceOwingMaturity is missing or q.balanceOwingMaturity is missing then .N
+            when l.balanceOwingMaturity = q.balanceOwingMaturity then 0 else 1
+        end as AccuM_BalAtMat,
+
+        /* No.20 interestCostOverTerm (excluding processing fee) */
+        l.interestCostOverTerm,
+        q.interestCostOverTerm as interestCostOverTerm_quad,
+        case
+            when l.SegmentType = 'PRCL' then .
+            when l.interestCostOverTerm is missing or q.interestCostOverTerm is missing then .N
+            when l.interestCostOverTerm = q.interestCostOverTerm then 0 else 1
+        end as AccuM_TtlIntendterm,
+
+        /* No.20 totalCOBTerm */
+        l.totalCOBTerm,
+        q.totalCOBTerm as totalCOBTerm_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.totalCOBTerm is missing or q.totalCOBTerm is missing then .N
+            when l.totalCOBTerm = q.totalCOBTerm then 0 else 1
+        end as AccuM_TtlCOB,
+
+        /* No.21 totalPIPaymentsTerm */
+        l.totalPIPaymentsTerm,
+        q.totalPIPaymentsTerm as totalPlPaymentsTerm_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.totalPIPaymentsTerm is missing or q.totalPIPaymentsTerm is missing then .N
+            when l.totalPIPaymentsTerm = q.totalPIPaymentsTerm then 0 else 1
+        end as AccuM_PIEOT,
+
+        /* No.22 totalPaymentAmountMonthly */
+        l.totalPaymentAmountMonthly,
+        q.totalPaymentAmountMonthly as totlPymntAmtMonthly_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.totalPaymentAmountMonthly is missing or q.totalPaymentAmountMonthly is missing then .N
+            when l.totalPaymentAmountMonthly = q.totalPaymentAmountMonthly then 0 else 1
+        end as AccuM_TtlPymtMth,
+
+        /* No.23 APR */
+        l.annualPercentageRate,
+        q.annualPercentageRate as annualPercentageRate_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.annualPercentageRate is missing or q.annualPercentageRate is missing then .N
+            when int(l.annualPercentageRate*1e6)/1e6 = int(q.annualPercentageRate*1e6)/1e6 then 0 else 1
+        end as AccuM_APR,
+
+        /* No.24 triggeringInterestRate */
+        l.triggeringInterestRate,
+        q.triggeringInterestRate as triggeringInterestRate_quad,
+        case
+            when q.SegmentType ^= ('MTG') then .
+            when l.triggeringInterestRate is missing or q.triggeringInterestRate is missing then .N
+            when int(l.triggeringInterestRate*1e6)/1e6 = int(q.triggeringInterestRate*1e6)/1e6 then 0 else 1
+        end as AccuM_TriggerRT,
+
+        /* No.25 initialCreditLimit */
+        l.initialCreditLimit,
+        q.initialCreditLimit as initialCreditLimit_quad,
+        case
+            when q.SegmentType ^= ('HLP') then .
+            when l.initialCreditLimit is missing or q.initialCreditLimit is missing then .N
+            when l.initialCreditLimit = q.initialCreditLimit then 0 else 1
+        end as AccuM_IniCLLimit,
+
+        /* MortgageType (EnumKey) */
+        l.mortgagetypeEnumKey,
+        q.mortgagetypeEnumKey as mortgagetypeEnumKey_quad,
+        case
+            when (l.segmentType = 'HLP') then .
+            when (l.mortgagetypeEnumKey is missing or q.mortgagetypeEnumKey is missing) then .N
+            when (l.mortgagetypeEnumKey = q.mortgagetypeEnumKey) then 0 else 1
+        end as AccuM_Mortgagetype,
+
+        /* PrepaymentOptions (EnumKey) */
+        l.prepaymentOptionsEnumKey,
+        q.prepaymentOptionsEnumKey as prepaymentOptionsEnumKey_quad,
+        case
+            when (l.segmentType not in (' ', 'MTG')) then .
+            when (l.prepaymentOptionsEnumKey is missing or q.prepaymentOptionsEnumKey is missing) then .N
+            when (l.prepaymentOptionsEnumKey = q.prepaymentOptionsEnumKey) then 0 else 1
+        end as AccuM_PrePYMTOpt,
+
+        /* PaymentFrequency (EnumKey) */
+        l.paymentFrequencyEnumKey,
+        q.paymentFrequencyEnumKey as paymentFrequencyEnumKey_quad,
+        case
+            when (l.segmentType not in (' ', 'MTG')) then .
+            when (l.paymentFrequencyEnumKey is missing or q.paymentFrequencyEnumKey is missing) then .N
+            when (l.paymentFrequencyEnumKey = q.paymentFrequencyEnumKey) then 0 else 1
+        end as AccuM_PymtFreq
+
+    from linx as l
+    inner join quad as q
+        on l.applicationid = q.applicationid
+       and l.transactionid = q.transactionid
+       and l.productID     = q.productID
+    where q.formNumber in ('243','50243')
+    ;
+quit;
+
+/*************** Test population distribution ***************/
+proc freq data=linx_quad_compare;
+    table producttype;
+    table segmentType * mortgageTypeEnumKey * mortgageTypeEnumKey_quad / list missing;
+    table segmentType * prepaymentOptionsEnumKey * prepaymentOptionsEnumKey_quad / list missing;
+    table segmentType * paymentFrequencyEnumKey * paymentFrequencyEnumKey_quad / list missing;
+run;
+
+proc freq data=linx_quad_compare;
+    table upstreamEventIds_Quad*formNumber*producttype / list;
+    table upstreamEventIds_Linx*applicationStatus*producttype / list;
+run;
+
+/*************** RDE distribution (rollup mismatch to overall) ***************/
+data linx_quad_all_&rundt.
+    (rename=(
+        xAccuM_Num_Of_Fail   = AccuM_Num_Of_Fail
+        xAccuM_Accuracy_RDE  = AccuM_Accuracy_RDE
+        xAccu_Num_Of_Fail    = Accu_Num_Of_Fail
+        xAccu_Accuracy_RDE   = Accu_Accuracy_RDE
+    ));
+    set linx_quad_compare;
+
+    if clnt_rank = 1 then rpt_bal = principalAmount;
+    else rpt_bal = 0; /* To avoid double counting on multiple applicants */
+
+    xAccuM_Num_Of_Fail = sum(of AccuM_:);
+    if xAccuM_Num_Of_Fail = 0 then xAccuM_Accuracy_RDE = 00;
+    else if 1 then xAccuM_Accuracy_RDE = 01;
+
+    xAccu_Num_Of_Fail  = xAccuM_Num_Of_Fail;
+    xAccu_Accuracy_RDE = xAccuM_Accuracy_RDE;
+run;
+
+proc freq data=linx_quad_all_&rundt.;
+    table AccuM_:/missing;
+    table Accu_:/missing;
+    table Accu_Accuracy_RDE*AccuM_Accuracy_RDE / list missing;
+    format AccuM_: Accu_: flag. AccuM_Num_Of_Fail Accu_Num_Of_Fail best.;
+run;
+
+/***** UAT sample *****/
+%macro skip;
+    proc surveyselect data=linx_quad_all_&rundt.(where=(AccuM_Accuracy_RDE=1))
+        method=srs n=5 out=Linx_243_Mismatch_sample;
+    run;
+
+    proc surveyselect data=linx_quad_all_&rundt.(where=(AccuM_Accuracy_RDE=0))
+        method=srs n=5 out=Linx_243_match_sample;
+    run;
+%mend;
+/* %skip; */
+
+data linx_quad_all_&rundt.;
+    set linx_quad_all_&rundt.;
+    SnapDate = intnx('week.7', activation_DT, 0, 'e');
+    format SnapDate yymmdd10.;
+run;
+
+/*=============================================================================
+  AUTOCOMPLETE OUTPUT
+=============================================================================*/
+%macro autosum_linx(cntl_flag, Cob_num, datain);
+    proc sql;
+        create table Auto_&Cob_num._&cntl_flag as
+        select
+            'COB' as RegulatoryName
+          , 'HEF' as LOB
+          , 'COB LINX Report' as ReportName
+          , put(scan("&cntl_flag",1,'_'), $ctrk.) as ControlRisk length=50
+          , case
+                when scan("&cntl_flag",2,'_') = 'Num'  then 'Distribution'
+                when scan("&cntl_flag",1,'_') = 'Time' then 'Reconciliation'
+                else 'Anomaly'
+            end as TestType length=50
+          , Application_Type as TestPeriod length=50
+          , ProductType length=50
+          , catx('_', "&Cob_num",
+                 put(substr("&cntl_flag", index("&cntl_flag",'_')+1), $DE_I.)) as RDE length=50
+          , case
+                when scan("&cntl_flag",2,'_') = 'Num' then ifc(missing(&cntl_flag), 'NA', cats(&cntl_flag))
+            end as segment length=50
+          , 'Initial_Cob_Quad,Activation' as segment2 length=50
+          , '' as segment3 length=50
+          , '' as segment4 length=50
+          , case when clnt_rank = 1 then 'P' else 'A' end as segment5 length=50 /* Unique client events */
+          , case when clnt_rank = 1 then 'M' else 'S' end as segment6 length=50 /* distinct COB Statement level count */
+          , '243,50243' as segment7 length=50 /* Add Form info */
+          , SegmentType as segment8 length=50
+          , 'N' as HoldoutFlag
+          , case
+                when scan("&cntl_flag",2,'_') = 'Num' then 'COM12'
+                else put(&cntl_flag, qa.)
+            end as CommentCode length=10
+          , case
+                when scan("&cntl_flag",2,'_') = 'Num' then put('COM12', $cmt.)
+                else put(put(&cntl_flag, qa.), $cmt.)
+            end as Comments length=50
+          , &runday as DateCompleted format=yymmdd10.  /* Activation weekending */
+          , SnapDate                                  /* Initial COB weekending */
+          , count(*) as Volume
+          , sum(rpt_bal) as bal
+        from &datain
+        group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21;
+    quit;
+%mend;
+
+proc datasets; delete auto_:; run; quit;
+
+/* Linx 243, 50243 */
+%autosum_linx(AccuM_PrcplBal,     COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_IntRate,      COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_Term,         COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_IntAdjDate,   COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_TtlPymtAmt,   COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_FstPymtDDt,   COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_PIPayment,    COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_HPPrem,       COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_AmortPeriod,  COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_DeftInsPrem,  COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_DeftInsTax,   COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_TtlDeftIns,   COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_ProcessFee,   COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_AvalAmt,      COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_MatDate,      COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_BalAtMat,     COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_TtlIntendterm,COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_TtlCOB,       COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_PIEOT,        COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_TtlPymtMth,   COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_APR,          COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_TriggerRT,    COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_IniCLLimit,   COB123, linx_quad_all_&rundt.);
+
+%autosum_linx(AccuM_Mortgagetype, COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_PrePYMTOpt,   COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_PymtFreq,     COB123, linx_quad_all_&rundt.);
+
+%autosum_linx(AccuM_Num_Of_Fail,  COB123, linx_quad_all_&rundt.);
+%autosum_linx(AccuM_Accuracy_RDE, COB123, linx_quad_all_&rundt.);
+
+%autosum_linx(Accu_Num_Of_Fail,   COB122, linx_quad_all_&rundt.);
+%autosum_linx(Accu_Accuracy_RDE,  COB122, linx_quad_all_&rundt.);
+
+data dataout.autocomplete_all_new;
+    set Auto_:;
+run;
+
+proc sort data=dataout.autocomplete_all_new;
+    by RegulatoryName LOB ReportName ControlRisk TestType TestPeriod ProductType RDE segment CommentCode Comments;
+run;
+
+%macro Completeness;
+    %if &ini_run = 'Y' %then %do;
+        data ac.autocomplete_243;
+            set dataout.autocomplete_all_new;
+        run;
+    %end;
+    %else %do;
+        data ac.autocomplete_243;
+            set ac.autocomplete_243 dataout.autocomplete_all_new;
+        run;
+    %end;
+%mend;
+
+%Completeness;
+
+/*=============================================================================
+  RDE LEVEL DETAIL FILE
+=============================================================================*/
+%macro detail_RDE(datain=, RDEcheck=, RDE_QUAD=, RDE_CAL=);
+    proc sql;
+        create table Detail_sub_&RDEcheck as
+        select
+            'COB' as RegulatoryName
+          , 'HEF' as LOB
+          , 'COB LINX Report' as ReportName
+          , put(scan("&RDEcheck",1,'_'), $ctrk.) as ControlRisk length=50
+          , Application_Type as TestPeriod length=50
+          , ProductType length=50
+          , case
+                when scan("&RDEcheck",1,'_') = 'Comp'  then catx('_', "COB121", put(substr("&RDEcheck", index("&RDEcheck",'_')+1), $DE_I.))
+                when scan("&RDEcheck",1,'_') = 'AccuM' then catx('_', "COB123", put(substr("&RDEcheck", index("&RDEcheck",'_')+1), $DE_I.))
+                when scan("&RDEcheck",1,'_') = 'AccuC' then catx('_', "COB124", put(substr("&RDEcheck", index("&RDEcheck",'_')+1), $DE_I.))
+                else ''
+            end as RDE length=50
+          , 'Initial_Cob_Quad,Activation' as upstreamEventIds length=50
+          , &runday as DateCompleted format=yymmdd10.
+          , Quad_DT as Quad_Date
+          , activation_DT as Activation_Date
+          , eventID
+          , transitNumber
+          , accountNumber
+          , segmentNumber
+          , applicationid
+          , transactionid
+          , productID
+          , SegmentType
+          , case when clnt_rank = 1 then 'M' else 'S' end as Statement_Level length=50
+          , substr(srfnumber, length(srfnumber)-2) as clientNumber_mask length=9
+          , Application_Type
+          , case when clnt_rank = 1 then 'P' else 'A' end as Event_Level
+          , put(put(&RDEcheck, qa.), $cmt.) as Category
+          , &RDE_QUAD as Quad_Value length=100
+          , &RDE_CAL  as Comparison_Value length=100
+        from &datain
+        where &RDEcheck in (1, .N)   /* Add Unable to Assess(.N) in fail details */
+        ;
+    quit;
+%mend;
+
+proc datasets; delete detail_:; run; quit;
+
+/*************** Application ***************/
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_PrcplBal,
+            RDE_QUAD=(put(principalAmount_quad, 17.2-L)),
+            RDE_CAL =(put(principalAmount,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_IntRate,
+            RDE_QUAD=(put(annualInterestRate_quad, 22.7-L)),
+            RDE_CAL =(put(annualInterestRate,      22.7-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_Term,
+            RDE_QUAD=(put(term_quad, 6.-L)),
+            RDE_CAL =(put(term,      6.-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_IntAdjDate,
+            RDE_QUAD=(put(intrstadjdate_quad, datetime20.-L)),
+            RDE_CAL =(put(interestAdjustmentDate, datetime20.-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_TtlPymtAmt,
+            RDE_QUAD=(put(totalpaymentamount_quad, 17.2-L)),
+            RDE_CAL =(put(totalpaymentamount,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_FstPymtDDt,
+            RDE_QUAD=(put(firstPymtDueDate_quad, yymmdd10.-L)),
+            RDE_CAL =(put(firstPaymentDueDate,   yymmdd10.-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_PIPayment,
+            RDE_QUAD=(put(PIPayment_quad, 17.2-L)),
+            RDE_CAL =(put(PIPayment,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_HPPrem,
+            RDE_QUAD=(put(homeProtectorPremium_quad, 17.2-L)),
+            RDE_CAL =(put(homeProtectorInsurancePremium, 17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_AmortPeriod,
+            RDE_QUAD=(put(amortizationPeriod_quad, 6.-L)),
+            RDE_CAL =(put(amortizationPeriod,      6.-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_DeftInsPrem,
+            RDE_QUAD=(put(deftInsPremium_quad, 17.2-L)),
+            RDE_CAL =(put(defaultInsurancePremium, 17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_DeftInsTax,
+            RDE_QUAD=(put(defaultInsuranceTax_quad, 17.2-L)),
+            RDE_CAL =(put(defaultInsuranceTax,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_TtlDeftIns,
+            RDE_QUAD=(put(totalDefaultInsurance_quad, 17.2-L)),
+            RDE_CAL =(put(totalDefaultInsurance,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_ProcessFee,
+            RDE_QUAD=(put(processingFee_quad, 17.2-L)),
+            RDE_CAL =(put(processingFee,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_AvalAmt,
+            RDE_QUAD=(put(availableAmount_quad, 17.2-L)),
+            RDE_CAL =(put(availableAmount,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_MatDate,
+            RDE_QUAD=(put(maturityDate_quad, yymmdd10.-L)),
+            RDE_CAL =(put(maturityDate,      yymmdd10.-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_BalAtMat,
+            RDE_QUAD=(put(balanceAtMaturity_quad, 17.2-L)),
+            RDE_CAL =(put(balanceAtMaturity,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_TtlCOB,
+            RDE_QUAD=(put(totalCOBTerm_quad, 17.2-L)),
+            RDE_CAL =(put(totalCOBTerm,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_PIEOT,
+            RDE_QUAD=(put(totalPIPaymentsTerm_quad, 17.2-L)),
+            RDE_CAL =(put(totalPIPaymentsTerm,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_TtlPymtMth,
+            RDE_QUAD=(put(totlPymntAmtMonthly_quad, 17.2-L)),
+            RDE_CAL =(put(totalPaymentAmountMonthly, 17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_APR,
+            RDE_QUAD=(put(annualPercentageRate_quad, 22.7-L)),
+            RDE_CAL =(put(annualPercentageRate,      22.7-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_TriggerRT,
+            RDE_QUAD=(put(triggeringInterestRate_quad, 22.7-L)),
+            RDE_CAL =(put(triggeringInterestRate,      22.7-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_IniCLLimit,
+            RDE_QUAD=(put(initialCreditLimit_quad, 17.2-L)),
+            RDE_CAL =(put(initialCreditLimit,      17.2-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_Mortgagetype,
+            RDE_QUAD=(put(mortgageType_quad, $64.-L)),
+            RDE_CAL =(put(mortgageType,      $64.-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_PrePYMTOpt,
+            RDE_QUAD=(put(prepaymentOptions_quad, $64.-L)),
+            RDE_CAL =(put(prepaymentOptions,      $64.-L)));
+
+%detail_RDE(datain=linx_quad_all_&rundt., RDEcheck=AccuM_PymtFreq,
+            RDE_QUAD=(put(paymentFrequency_quad, $64.-L)),
+            RDE_CAL =(put(paymentFrequency,      $64.-L)));
+
+data dataout.Fail_Det_all;
+    set detail_:;
+run;
+
+proc sql;
+    create table FailDetail(drop=srfnumber) as
+    select
+        RegulatoryName,
+        LOB,
+        ReportName,
+        ControlRisk,
+        TestPeriod,
+        ProductType,
+        DateCompleted,
+        Quad_Date as COB_Date,
+        transitNumber,
+        accountNumber,
+        segmentNumber as loanNumber,
+        eventID,
+        upstreamEventIds,
+        clientNumber_mask,
+        Statement_Level,
+        Application_Type,
+        Event_Level,
+        Category,
+        "243,50243" as FormNumber,
+        Activation_Date,
+        applicationID,
+        transactionID,
+        productID,
+        SegmentType,
+        count(*) as Failed_RDE,
+        RDE,
+        Quad_Value as COB_Value,
+        Comparison_Value
+    from dataout.Fail_Det_all
+    group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25
+    order by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25;
+quit;
+
+%macro Faildet;
+    %if &ini_run = 'Y' %then %do;
+        data ac.FailDetail_Linx_243;
+            set FailDetail;
+        run;
+    %end;
+    %else %do;
+        data ac.FailDetail_Linx_243;
+            set ac.FailDetail_Linx_243(where=(DateCompleted ^= &runday)) FailDetail;
+        run;
+    %end;
+%mend;
+
+%Faildet;
+
+/* macro run in master */
+/* Load Autocomplete table to higher level */
+/* Load fail detail table to higher level (dataset name in Master folder always starts with Fail_Detail_orig_) */
+%macro run_in_master;
+    data gautoc.autocomplete_243;
+        set ac.autocomplete_243;
+    run;
+
+    data gfaild.fail_detail_orig_243;
+        set ac.FailDetail_Linx_243;
+    run;
+%mend run_in_master;
+
+/* when not run in master, please comment out the following run */
+/* %run_in_master; */
+
+x "find &regpath. -user $USER -mmin -720 -exec chmod 777 {} \;";
+
+proc printto;
+run;
+
+%ScanLog(&logfile);
