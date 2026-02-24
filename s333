@@ -1,0 +1,37 @@
+from pyspark.sql import SparkSession
+
+S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"
+S3_BUCKET = "ryu0-s3-sas-migration"
+
+spark = SparkSession.builder.getOrCreate()
+sc = spark.sparkContext
+hconf = sc._jsc.hadoopConfiguration()
+
+# S3A configs (no credentials needed)
+hconf.set("fs.s3a.endpoint", S3_ENDPOINT)
+hconf.set("fs.s3a.connection.ssl.enabled", "true")
+hconf.set("fs.s3a.path.style.access", "true")
+hconf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+
+# Write intermediate files
+df.write.mode("overwrite").parquet(f"s3a://{S3_BUCKET}/path/to/intermediate/output.parquet")
+
+# Write log files
+log_content = "Job completed at 2026-02-24 ..."
+log_path = f"s3a://{S3_BUCKET}/logs/job_log.txt"
+
+# For text logs, use RDD or write a small dataframe
+spark.sparkContext.parallelize([log_content]).saveAsTextFile(log_path)
+
+# Or for structured logs
+log_df = spark.createDataFrame([("job1", "success", "2026-02-24")], ["job", "status", "date"])
+log_df.write.mode("append").csv(f"s3a://{S3_BUCKET}/logs/")
+
+
+def configure_s3a(spark):
+    hconf = spark.sparkContext._jsc.hadoopConfiguration()
+    hconf.set("fs.s3a.endpoint", "https://s3-sg-p1-scc.fg.rbc.com:443")
+    hconf.set("fs.s3a.connection.ssl.enabled", "true")
+    hconf.set("fs.s3a.path.style.access", "true")
+    hconf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    return spark
