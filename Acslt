@@ -1,0 +1,355 @@
+def deterministic_sample_18_per_day(df: pd.DataFrame, day_col: str, seed: int = 123) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    parts: list[pd.DataFrame] = []
+    for _, g in df.groupby(day_col, dropna=False):
+        g = g.copy()
+        k = min(18, len(g))
+        if k == 0:
+            continue
+        idx = rng.choice(g.index.to_numpy(), size=k, replace=False)
+        parts.append(g.loc[idx])
+    return pd.concat(parts, ignore_index=True) if parts else df.iloc[0:0].copy()
+
+
+def custid_mask(cid: Any) -> str:
+    s = "" if cid is None or (isinstance(cid, float) and np.isnan(cid)) else str(cid)
+    tail = s[6:9] if len(s) >= 9 else ""
+    return "*****" + tail
+
+
+def snapdate_week_3_end(decision_date: date) -> date:
+    # SAS intnx('week.3', date, 0, 'e') parity (Tuesday-based week end => Monday)
+    d = decision_date
+    days_since_tuesday = (d.weekday() - 1) % 7  # Tuesday = 1
+    start = d - timedelta(days=days_since_tuesday)
+    end = start + timedelta(days=6)
+    return end
+
+
+def build_ac_week_table(ac_week_raw: pd.DataFrame) -> pd.DataFrame:
+    # SAS-parity column frame
+    return pd.DataFrame({
+        "RegulatoryName": "C86",
+        "LOB": "Credit Cards",
+        "ReportName": "C86 Alerts",
+        "ControlRisk": ac_week_raw["ControlRisk"],
+        "TestType": ac_week_raw["TestType"],
+        "TestPeriod": "Portfolio",
+        "ProductType": "Credit Cards",
+        "RDE": ac_week_raw["RDE"],
+        "SubDE": "",
+        "Segment": "",
+        "Segment2": "",
+        "Segment3": "",
+        "Segment4": "",
+        "Segment5": "",
+        "Segment6": "",
+        "Segment7": "",
+        "Segment8": "",
+        "Segment9": "",
+        "Segment10": ac_week_raw["Segment10"],
+        "HoldoutFlag": "N",
+        "CommentCode": ac_week_raw["CommentCode"],
+        "Comments": "",  # join mapping if available
+        "Volume": ac_week_raw["Volume"],
+        "Bal": ac_week_raw["bal"],
+        "Amount": ac_week_raw["Amount"],
+        "DateCompleted": ac_week_raw["DateCompleted"],
+        "SnapDate": ac_week_raw["SnapDate"],
+    })
+
+
+def build_pandas_outputs(ctx: Context) -> dict[str, pd.DataFrame]:
+    df = fetch_df(ctx, f"SELECT * FROM {mem_fqtn(ctx, 'cards_alert_final_m')}")
+
+    # normalize column names (Trino returns lower unless quoted)
+    df.columns = [c.lower() for c in df.columns]
+
+    # timestamps
+    df["decision_ts"] = pd.to_datetime(df["eventtimestamp"], errors="coerce")
+    df["sent_ts"] = pd.to_datetime(df["eventtimestamp_a"], errors="coerce")
+
+    # SLA + bucket parity
+    df["time_diff"] = (df["sent_ts"] - df["decision_ts"]).dt.total_seconds()
+    df["sla_ind"] = np.where(df["time_diff"].notna() & (df["time_diff"] <= 1800), "Y", "N")
+    df["alert_time"] = df["time_diff"].apply(sla_bucket_parity)
+
+    # decision_date
+    df["decision_date"] = df["decision_ts"].dt.date
+
+    # SAS: threshold_limit_check (alertAmount <= thresholdAmount)
+    df["threshold_limit_check"] = np.where(
+        df["alertamount"].notna()
+        & df["thresholdamount"].notna()
+        & (df["alertamount"].astype(float) <= df["thresholdamount"].astype(float)),
+        "Y",
+        "N",
+    )
+
+    # completeness flag
+    df["found_missing"] = np.where(df["eventtimestamp_a"].isna() | df["eventtimestamp"].isna(), "Y", "")
+
+    # SAS delete condition: if isBusiness_p="true" and dec_tm_ge_pref_tm="Y" then delete;
+    # keep parity by applying it here
+    if "isbusiness_p" in df.columns:
+        df = df[~((df["isbusiness_p"] == "true") & (df["dec_tm_ge_pref_tm"] == "Y"))].copy()
+
+    # base samples (18 per decision_date deterministic)
+    base_samples = deterministic_sample_18_per_day(df, "decision_date", seed=123)
+
+    # -------------------------
+    # Aggregations (SAS-parity shape)
+    # -------------------------
+    def segment10(d: date) -> str:
+        return d.strftime("%Y%m") if pd.notna(d) else ""
+
+    def snapdate(d: date) -> date:
+        return snapdate_week_3_end(d)
+
+    def agg_table(src: pd.DataFrame, controlrisk: str, testtype: str, rde: str, comment_logic: str) -> pd.DataFrame:
+        tmp = src.copy()
+
+        if comment_logic == "threshold_limit_check":
+            tmp["commentcode"] = np.where(tmp["threshold_limit_check"] == "Y", "COM16", "COM19")
+        elif comment_logic == "sla_ind":
+            tmp["commentcode"] = np.where(tmp["sla_ind"] == "Y", "COM16", "COM19")
+        elif comment_logic == "decisionid_a_blank":
+            tmp["commentcode"] = np.where(tmp["decisionid_a"].isna() | (tmp["decisionid_a"] == ""), "COM16", "COM19")
+        else:
+            raise ValueError("Unsupported comment logic")
+
+        tmp["controlrisk"] = controlrisk
+        tmp["testtype"] = testtype
+        tmp["rde"] = rde
+        tmp["segment10"] = tmp["decision_date"].apply(segment10)
+        tmp["datecompleted"] = ctx.d.report_dt
+        tmp["snapdate"] = tmp["decision_date"].apply(snapdate)
+
+        grp = tmp.groupby(
+            ["controlrisk", "testtype", "rde", "commentcode", "segment10", "datecompleted", "snapdate"],
+            dropna=False,
+            as_index=False,
+        ).agg(
+            Volume=("decisionid", "size"),
+            bal=("alertamount", "sum"),
+            Amount=("thresholdamount", "sum"),
+        )
+        return grp
+
+    accuracy_grp = agg_table(
+        base_samples,
+        controlrisk="Accuracy",
+        testtype="Sample",
+        rde="Alert@10_Accuracy_Available_Credit",
+        comment_logic="threshold_limit_check",
+    )
+    timeliness_grp = agg_table(
+        df,
+        controlrisk="Timeliness",
+        testtype="Anomaly",
+        rde="Alert@11_Timeliness_SLA",
+        comment_logic="sla_ind",
+    )
+    completeness_grp = agg_table(
+        df,
+        controlrisk="Completeness",
+        testtype="Reconciliation",
+        rde="Alert@12_Completeness_All_Clients",
+        comment_logic="decisionid_a_blank",
+    )
+
+    ac_week_raw = pd.concat([accuracy_grp, timeliness_grp, completeness_grp], ignore_index=True)
+
+    # Build final AC-week table with SAS columns
+    ac_week_final = build_ac_week_table(pd.DataFrame({
+        "ControlRisk": ac_week_raw["controlrisk"],
+        "TestType": ac_week_raw["testtype"],
+        "RDE": ac_week_raw["rde"],
+        "CommentCode": ac_week_raw["commentcode"],
+        "Segment10": ac_week_raw["segment10"],
+        "DateCompleted": ac_week_raw["datecompleted"],
+        "SnapDate": ac_week_raw["snapdate"],
+        "Volume": ac_week_raw["Volume"],
+        "bal": ac_week_raw["bal"],
+        "Amount": ac_week_raw["Amount"],
+    }))
+
+    # -------------------------
+    # Fail detail tables (parity fields)
+    # -------------------------
+    def event_month(d: date) -> str:
+        return d.strftime("%Y%m") if pd.notna(d) else ""
+
+    def event_week_ending(d: date) -> date:
+        return snapdate_week_3_end(d)
+
+    # Completeness_Fail: decisionid_a missing
+    completeness_fail = df[df["decisionid_a"].isna() | (df["decisionid_a"] == "")].copy()
+    completeness_fail["event_month"] = completeness_fail["decision_date"].apply(event_month)
+    completeness_fail["reporting_date"] = ctx.d.report_dt
+    completeness_fail["event_week_ending"] = completeness_fail["decision_date"].apply(event_week_ending)
+    completeness_fail["lob"] = "Credit Cards"
+    completeness_fail["product"] = "Credit Cards"
+    completeness_fail["account_number"] = completeness_fail["accountid"]
+    completeness_fail["available_credit"] = completeness_fail["alertamount"]
+    completeness_fail["event_date"] = completeness_fail["decision_date"]
+    completeness_fail["custid_mask"] = completeness_fail["customerid"].apply(custid_mask)
+    completeness_fail = completeness_fail[
+        ["event_month", "reporting_date", "event_week_ending", "lob", "product",
+         "account_number", "thresholdamount", "available_credit", "decisionid", "event_date", "custid_mask"]
+    ]
+
+    # Timeliness_Fail: SLA_Ind != Y
+    timeliness_fail = df[df["sla_ind"] != "Y"].copy()
+    timeliness_fail["event_month"] = timeliness_fail["decision_date"].apply(event_month)
+    timeliness_fail["reporting_date"] = ctx.d.report_dt
+    timeliness_fail["event_week_ending"] = timeliness_fail["decision_date"].apply(event_week_ending)
+    timeliness_fail["lob"] = "Credit Cards"
+    timeliness_fail["product"] = "Credit Cards"
+    timeliness_fail["account_number"] = timeliness_fail["accountid"]
+    timeliness_fail["available_credit"] = timeliness_fail["alertamount"]
+    timeliness_fail["event_date"] = timeliness_fail["decision_date"]
+    timeliness_fail["decision_timestamp"] = timeliness_fail["decision_ts"]
+    timeliness_fail["sent_timestamp"] = timeliness_fail["sent_ts"]
+    timeliness_fail["total_minutes"] = np.where(
+        timeliness_fail["time_diff"].notna(),
+        timeliness_fail["time_diff"].apply(lambda x: ceil(x / 60.0)),
+        np.nan,
+    )
+    timeliness_fail["custid_mask"] = timeliness_fail["customerid"].apply(custid_mask)
+    timeliness_fail = timeliness_fail[
+        ["event_month", "reporting_date", "event_week_ending", "lob", "product",
+         "account_number", "thresholdamount", "available_credit", "decisionid",
+         "event_date", "decision_timestamp", "sent_timestamp", "total_minutes", "custid_mask"]
+    ]
+
+    # Accuracy_Fail: base_samples where threshold_limit_check != Y
+    accuracy_fail = base_samples[base_samples["threshold_limit_check"] != "Y"].copy()
+    accuracy_fail["event_month"] = accuracy_fail["decision_date"].apply(event_month)
+    accuracy_fail["reporting_date"] = ctx.d.report_dt
+    accuracy_fail["event_week_ending"] = accuracy_fail["decision_date"].apply(event_week_ending)
+    accuracy_fail["lob"] = "Credit Cards"
+    accuracy_fail["product"] = "Credit Cards"
+    accuracy_fail["account_number"] = accuracy_fail["accountid"]
+    accuracy_fail["decision"] = "AlertDecision"
+    accuracy_fail["available_credit"] = accuracy_fail["alertamount"]
+    accuracy_fail["event_date"] = accuracy_fail["decision_date"]
+    accuracy_fail["custid_mask"] = accuracy_fail["customerid"].apply(custid_mask)
+    accuracy_fail = accuracy_fail[
+        ["event_month", "reporting_date", "event_week_ending", "lob", "product",
+         "account_number", "decision", "thresholdamount", "available_credit", "event_date", "custid_mask"]
+    ]
+
+    # -------------------------
+    # Autocomplete dataset (for SQL insert / downstream)
+    # This is the “database-ready” table replacing Excel consumption.
+    # Keep it aligned to your org’s autocomplete insert schema.
+    # -------------------------
+    autocomplete = ac_week_final.copy()
+
+    return {
+        "alert_cards_ac_week": ac_week_final,
+        "alert_cards_completeness_detail": completeness_fail,
+        "alert_cards_timeliness_detail": timeliness_fail,
+        "alert_cards_accuracy_detail": accuracy_fail,
+        "autocomplete_alert_cards": autocomplete,
+    }
+
+
+def write_outputs(ctx: Context, dfs: dict[str, pd.DataFrame]) -> None:
+    out_root = Path(ctx.conf["out_root"]) / ctx.d.label
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    dfs["alert_cards_ac_week"].to_excel(out_root / "Alert_Cards_AC_week.xlsx", index=False)
+    dfs["alert_cards_completeness_detail"].to_excel(out_root / "Alert_Cards_Completeness_Detail.xlsx", index=False)
+    dfs["alert_cards_timeliness_detail"].to_excel(out_root / "Alert_Cards_Timeliness_Detail.xlsx", index=False)
+    dfs["alert_cards_accuracy_detail"].to_excel(out_root / "Alert_Cards_Accuracy_Detail.xlsx", index=False)
+    dfs["autocomplete_alert_cards"].to_excel(out_root / "Autocomplete_Alert_Cards.xlsx", index=False)
+
+    ctx.log.info("Wrote outputs to: %s", out_root)
+
+
+# =============================================================================
+# Optional: SQL Server insert for autocomplete (controlled by config)
+# =============================================================================
+
+def insert_autocomplete_sqlserver(ctx: Context, df: pd.DataFrame) -> None:
+    cfg = ctx.conf.get("sqlserver")
+    if not cfg or not cfg.get("enabled"):
+        ctx.log.info("SQL Server insert disabled.")
+        return
+
+    try:
+        import pyodbc  # type: ignore
+    except Exception as e:
+        raise RuntimeError("pyodbc not available in this runtime.") from e
+
+    if not cfg["server"] or not cfg["database"] or not cfg["table"]:
+        raise ValueError("SQLSERVER config missing server/database/table.")
+
+    if cfg.get("trusted_connection"):
+        conn_str = (
+            f"DRIVER={{{cfg['driver']}}};"
+            f"SERVER={cfg['server']};"
+            f"DATABASE={cfg['database']};"
+            "Trusted_Connection=yes;"
+            "Encrypt=yes;TrustServerCertificate=yes;"
+        )
+    else:
+        conn_str = (
+            f"DRIVER={{{cfg['driver']}}};"
+            f"SERVER={cfg['server']};"
+            f"DATABASE={cfg['database']};"
+            f"UID={cfg['username']};PWD={cfg['password']};"
+            "Encrypt=yes;TrustServerCertificate=yes;"
+        )
+
+    cols = list(df.columns)
+    placeholders = ",".join(["?"] * len(cols))
+    col_list = ",".join([f"[{c}]" for c in cols])
+    sql = f"INSERT INTO {cfg['table']} ({col_list}) VALUES ({placeholders})"
+
+    ctx.log.info("Inserting %d rows into %s", len(df), cfg["table"])
+    with pyodbc.connect(conn_str) as cn:
+        cur = cn.cursor()
+        cur.fast_executemany = True
+        cur.executemany(sql, df.where(pd.notna(df), None).values.tolist())
+        cn.commit()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def build_context() -> Context:
+    conf = load_config(Path("config.ini"))
+    d = compute_dates()
+
+    log_path = Path(conf["log_root"]) / f"C86_Alerts_Cards_{d.label}.log"
+    logger = setup_logger(log_path)
+
+    logger.info("Program: C86_Alerts_Cards (Memory Connector + Autocomplete)")
+    logger.info("User: %s", os.getenv("USER", "unknown"))
+    logger.info("Catalog: %s | Schema: %s", conf["catalog"], conf["schema"])
+    logger.info("Report date: %s", d.report_dt)
+
+    conn = get_conn(conf)
+    return Context(conf=conf, d=d, conn=conn, log=logger)
+
+
+def main() -> int:
+    ctx = build_context()
+
+    build_memory_tables(ctx)
+    dfs = build_pandas_outputs(ctx)
+    write_outputs(ctx, dfs)
+
+    # Optional DB insert for autocomplete
+    insert_autocomplete_sqlserver(ctx, dfs["autocomplete_alert_cards"])
+
+    ctx.log.info("DONE")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
