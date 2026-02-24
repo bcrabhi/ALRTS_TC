@@ -1,0 +1,235 @@
+"""
+S3 Connection Template for PySpark on YARN
+===========================================
+
+Hey team! This is your go-to template for reading/writing data to S3
+from PySpark on our YARN cluster.
+
+The good news? You don't need any access keys or secrets.
+Our cluster nodes already have IAM roles that handle authentication
+behind the scenes. Just configure the endpoint and you're good to go.
+
+How to use this:
+    1. Drop this file into your project folder
+    2. Import what you need (see examples at the bottom)
+    3. Start reading/writing to S3 — it's that simple
+
+Questions? Reach out to the Data Engineering team.
+Last updated: Feb 24, 2026
+"""
+
+import os
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession
+
+
+# ---------------------------------------------------------------------------
+# S3 Settings — update these if your bucket or endpoint changes
+# ---------------------------------------------------------------------------
+
+S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"
+S3_BUCKET = "ryu0-s3-sas-migration"
+
+# Handy shortcuts to common folders in our bucket.
+# Feel free to add more as your project needs grow.
+FOLDERS = {
+    "raw":          f"s3a://{S3_BUCKET}/raw",
+    "intermediate": f"s3a://{S3_BUCKET}/intermediate",
+    "output":       f"s3a://{S3_BUCKET}/output",
+    "logs":         f"s3a://{S3_BUCKET}/logs",
+    "smoke_tests":  f"s3a://{S3_BUCKET}/SAS_Dataset_Conversions/_smoke_tests",
+}
+
+
+# ---------------------------------------------------------------------------
+# Core setup — this is the important bit
+# ---------------------------------------------------------------------------
+
+def configure_s3a(spark):
+    """
+    Plugs S3 connectivity into your Spark session.
+
+    You don't need to pass any credentials. Here's why:
+    The cluster tries four ways to authenticate, in order —
+        1. Temporary AWS session tokens
+        2. Access key / secret key from Hadoop config
+        3. AWS environment variables
+        4. IAM role on the cluster node  ← this is what kicks in for us
+
+    Since we don't set any keys, it falls through to #4 and just works.
+
+    Usage:
+        spark = SparkSession.builder.getOrCreate()
+        configure_s3a(spark)
+        # done — now you can read/write s3a:// paths
+    """
+    hconf = spark.sparkContext._jsc.hadoopConfiguration()
+
+    hconf.set("fs.s3a.endpoint",                S3_ENDPOINT)
+    hconf.set("fs.s3a.connection.ssl.enabled",  "true")
+    hconf.set("fs.s3a.path.style.access",       "true")
+    hconf.set("fs.s3a.impl",                    "org.apache.hadoop.fs.s3a.S3AFileSystem")
+
+    # --- Performance knobs (uncomment if you're dealing with large files) ---
+    # hconf.set("fs.s3a.connection.maximum", "100")
+    # hconf.set("fs.s3a.threads.max", "20")
+    # hconf.set("fs.s3a.multipart.size", "104857600")      # 100 MB chunks
+    # hconf.set("fs.s3a.fast.upload", "true")
+    # hconf.set("fs.s3a.fast.upload.buffer", "bytebuffer")
+
+    return spark
+
+
+def get_spark_session(app_name="S3_App"):
+    """
+    One-liner to get a Spark session that's already wired up for S3.
+
+    Usage:
+        spark = get_spark_session("My_Cool_Job")
+        df = spark.read.parquet("s3a://ryu0-s3-sas-migration/output/data.parquet")
+    """
+    spark = SparkSession.builder \
+        .appName(app_name) \
+        .getOrCreate()
+
+    configure_s3a(spark)
+    return spark
+
+
+# ---------------------------------------------------------------------------
+# Handy helpers — use these to keep your code clean
+# ---------------------------------------------------------------------------
+
+def s3_path(folder, *parts):
+    """
+    Builds a full S3 path so you don't have to glue strings together.
+
+    Examples:
+        s3_path("output", "2026", "02", "results.parquet")
+        # → s3a://ryu0-s3-sas-migration/output/2026/02/results.parquet
+
+        s3_path("logs", "daily_run.txt")
+        # → s3a://ryu0-s3-sas-migration/logs/daily_run.txt
+    """
+    base = FOLDERS.get(folder, folder)
+    return "/".join([base.rstrip("/")] + list(parts))
+
+
+def write_log(spark, message, job_name="unnamed_job"):
+    """
+    Drops a quick log file into S3. Useful for tracking job runs.
+    Each log gets a timestamp in the filename so nothing gets overwritten.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = s3_path("logs", f"{job_name}_{timestamp}.txt")
+
+    spark.sparkContext \
+        .parallelize([message]) \
+        .coalesce(1) \
+        .saveAsTextFile(path)
+
+    print(f"Log saved → {path}")
+
+
+def list_files(spark, s3_uri):
+    """
+    Lists everything in an S3 folder. Returns a plain list of file paths.
+
+    Usage:
+        files = list_files(spark, "s3a://ryu0-s3-sas-migration/output/")
+        for f in files:
+            print(f)
+    """
+    sc = spark.sparkContext
+    jvm = sc._jvm
+    path = jvm.org.apache.hadoop.fs.Path(s3_uri)
+    fs = path.getFileSystem(sc._jsc.hadoopConfiguration())
+
+    return [st.getPath().toString() for st in fs.listStatus(path)]
+
+
+def file_exists(spark, s3_uri):
+    """
+    Quick check — does this file or folder exist in S3?
+
+    Usage:
+        if file_exists(spark, s3_path("output", "results.parquet")):
+            print("Already there, skipping.")
+    """
+    sc = spark.sparkContext
+    jvm = sc._jvm
+    path = jvm.org.apache.hadoop.fs.Path(s3_uri)
+    fs = path.getFileSystem(sc._jsc.hadoopConfiguration())
+    return fs.exists(path)
+
+
+def delete_path(spark, s3_uri, recursive=True):
+    """
+    Deletes a file or folder from S3. Be careful with this one!
+
+    Usage:
+        delete_path(spark, s3_path("smoke_tests", "old_test.parquet"))
+    """
+    sc = spark.sparkContext
+    jvm = sc._jvm
+    path = jvm.org.apache.hadoop.fs.Path(s3_uri)
+    fs = path.getFileSystem(sc._jsc.hadoopConfiguration())
+    deleted = fs.delete(path, recursive)
+    print(f"{'Deleted' if deleted else 'Not found'} → {s3_uri}")
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test — run this file directly to verify everything works
+#
+#   spark-submit s3_connection_template.py
+#
+# If you see "ALL GOOD" at the end, your S3 connection is working.
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    print("=" * 50)
+    print("S3 Connection Smoke Test")
+    print("=" * 50)
+
+    # Step 1: Fire up Spark with S3 configured
+    spark = get_spark_session("S3_Smoke_Test")
+    print(f"Spark master : {spark.sparkContext.master}")
+    print(f"S3 endpoint  : {S3_ENDPOINT}")
+    print(f"S3 bucket    : {S3_BUCKET}")
+    print("-" * 50)
+
+    # Step 2: Write a tiny parquet file
+    test_id = uuid.uuid4().hex[:8]
+    test_path = s3_path("smoke_tests", f"test_{test_id}.parquet")
+
+    print(f"Writing to → {test_path}")
+    df = spark.range(0, 10).withColumnRenamed("id", "value")
+    df.write.mode("overwrite").parquet(test_path)
+    print("Write ✓")
+
+    # Step 3: Read it back and sanity check
+    df2 = spark.read.parquet(test_path)
+    count = df2.count()
+    print(f"Read back → {count} rows")
+    df2.show(5, truncate=False)
+    assert count == 10, f"Expected 10 rows, got {count}"
+    print("Read  ✓")
+
+    # Step 4: List the smoke tests folder
+    print(f"\nFiles in {s3_path('smoke_tests')}:")
+    for f in list_files(spark, s3_path("smoke_tests")):
+        print(f"  {f}")
+    print("List  ✓")
+
+    # Step 5: Clean up the test file
+    delete_path(spark, test_path)
+    print("Cleanup ✓")
+
+    print("-" * 50)
+    print("ALL GOOD — S3 connection is working!")
+    print("=" * 50)
+
+    spark.stop()
