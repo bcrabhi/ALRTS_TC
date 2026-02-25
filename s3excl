@@ -24,6 +24,16 @@ def upload_file_to_s3(spark, local_path, s3_dest):
 s3_ac_excel = s3_path("output", cfg.s3_parquet_base, runday, cfg.excel_autocomplete_file)
 upload_file_to_s3(spark, str(excel_path), s3_ac_excel)
 
+
+local_log_file = cfg.logpath / log_file_name
+    s3_log_dest = s3_path("logs", cfg.s3_parquet_base, log_file_name)
+    logging.info(f"Uploading log file to S3: {local_log_file} → {s3_log_dest}")
+    try:
+        upload_file_to_s3(spark, str(local_log_file), s3_log_dest)
+        logging.info(f"Log file uploaded to S3: {s3_log_dest}")
+    except Exception as log_err:
+        logging.warning(f"Failed to upload log file to S3: {log_err}")
+
 s3_detail_excel = s3_path("output", cfg.s3_parquet_base, runday, f"pa_client360_detail_{runday}.xlsx")
 upload_file_to_s3(spark, str(detail_excel_path), s3_detail_excel)
 
