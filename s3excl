@@ -1,0 +1,33 @@
+def upload_file_to_s3(spark: SparkSession, local_path: str, s3_dest: str) -> None:
+    """
+    Copies a local file (Excel, log, etc.) to S3 using Hadoop FileSystem API.
+    Works on YARN because the driver node has local file access.
+    """
+    sc = spark.sparkContext
+    jvm = sc._jvm
+    hadoop_conf = sc._jsc.hadoopConfiguration()
+
+    local_fs_path = jvm.org.apache.hadoop.fs.Path(f"file://{os.path.abspath(local_path)}")
+    s3_fs_path = jvm.org.apache.hadoop.fs.Path(s3_dest)
+
+    s3_fs = s3_fs_path.getFileSystem(hadoop_conf)
+
+    logging.info(f"Uploading local file to S3: {local_path} → {s3_dest}")
+    s3_fs.copyFromLocalFile(False, True, local_fs_path, s3_fs_path)
+    logging.info(f"Upload complete: {s3_dest}")
+
+
+def upload_file_to_s3(spark, local_path, s3_dest):
+    ...
+    s3_fs.copyFromLocalFile(False, True, local_fs_path, s3_fs_path)
+
+s3_ac_excel = s3_path("output", cfg.s3_parquet_base, runday, cfg.excel_autocomplete_file)
+upload_file_to_s3(spark, str(excel_path), s3_ac_excel)
+
+s3_detail_excel = s3_path("output", cfg.s3_parquet_base, runday, f"pa_client360_detail_{runday}.xlsx")
+upload_file_to_s3(spark, str(detail_excel_path), s3_detail_excel)
+
+s3_pivot_excel = s3_path("output", cfg.s3_parquet_base, runday, cfg.excel_pivot_file)
+upload_file_to_s3(spark, str(pivot_excel_path), s3_pivot_excel)
+
+upload_file_to_s3(spark, str(local_log_file), s3_log_dest)
