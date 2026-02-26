@@ -41,3 +41,40 @@ s3_pivot_excel = s3_path("output", cfg.s3_parquet_base, runday, cfg.excel_pivot_
 upload_file_to_s3(spark, str(pivot_excel_path), s3_pivot_excel)
 
 upload_file_to_s3(spark, str(local_log_file), s3_log_dest)
+
+
+# completeness flag
+df["found_missing"] = np.where(
+    df.get("eventtimestamp_a").isna() | df.get("eventtimestamp").isna(),
+    "Y",
+    ""
+)
+
+# -----------------------------------------------------------------------------
+# SAS delete condition:
+# if isBusiness_p="true" and dec_tm_ge_pref_tm="Y" then delete;
+# -----------------------------------------------------------------------------
+
+required_cols = {"isbusiness_p", "dec_tm_ge_pref_tm"}
+
+if required_cols.issubset(set(df.columns)):
+
+    df = df[
+        ~(
+            (df["isbusiness_p"].astype(str).str.lower() == "true") &
+            (df["dec_tm_ge_pref_tm"].astype(str).str.upper() == "Y")
+        )
+    ].copy()
+
+# -----------------------------------------------------------------------------
+# Base samples (18 per decision_date deterministic)
+# -----------------------------------------------------------------------------
+
+if "decision_date" not in df.columns:
+    raise RuntimeError("decision_date column missing before sampling")
+
+base_samples = deterministic_sample_18_per_day(
+    df,
+    "decision_date",
+    seed=123
+)
