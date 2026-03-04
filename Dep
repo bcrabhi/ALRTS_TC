@@ -1,0 +1,345 @@
+Tyr Python ETL Framework
+Deployment Guide: Dev → Pre-Prod → Prod
+RBC CDA / Helios 2.0 | Airflow + GitHub Actions
+
+ 
+Overview
+This guide walks you through every file, parameter, and action required to deploy your converted Python ETL script through all three environments using the Tyr Python ETL Framework on Helios 2.0 (GitHub Actions).
+ 
+Stage
+Git Branch
+Helios Env
+Trigger
+Approval
+DEV
+Any dev branch
+Dev Environment
+Auto on push
+None
+PRE-PROD
+staging
+Prod-Pilot
+Auto on push (via PR from dev)
+PR Approval
+PROD
+master
+Prod
+Auto on push (via PR from staging)
+PR Approval
+ 
+ 
+Phase 0: One-Time Setup (Do This First)
+Before deploying to any environment, complete these one-time setup steps on your forked repository.
+ 
+0.1 — Rename Your Forked Repository
+Your repo name must follow the naming convention: python-etl-{business-context-or-purpose}
+• Go to: Helios Developer Portal → GitHub Automation → Rename Your Repo
+• Enter App Code: cdn0 (or your app code)
+• Search for your forked repo: e.g., cdn0-python-etl-ga-template
+• Enter new repo name: e.g., python-etl-credit-card-alerts
+⚠️ Note: Name must be all lowercase, hyphen-separated, prefixed with python-etl-
+ 
+0.2 — Modify setup.py
+Located at the root of your repo.
+File / Location
+Parameter / Line
+What to Change
+setup.py
+Line 14 — name field
+Change to: cdn0-python-etl-{your-repo-name} Example: 'cdn0-python-etl-credit-card-alerts'
+setup.py
+Line 16 — description
+Optional: Enter a meaningful description of your pipeline
+ 
+0.3 — Modify src/__init__.py
+This file controls the version number. Every time you push to master you MUST update this.
+File / Location
+Parameter / Line
+What to Change
+src/__init__.py
+Line 1 — __version__
+Set initial version: __version__ = "1.0.0" Follow semantic versioning (MAJOR.MINOR.PATCH)
+⚠️ Note: You MUST increment this version every time you merge to master, otherwise Helios will not redeploy.
+ 
+0.4 — Add Your Python Script to src/data_pipeline/
+• Copy your converted Python ETL script into: src/data_pipeline/
+• Rename it meaningfully: e.g., credit_card_alerts_processing.py
+• Keep the template file: pipeline_template_job_one.py as reference
+• Your ETL logic should contain an importable function that main.py will call
+ 
+0.5 — Update requirements.txt
+Add any additional Python packages your script needs.
+File / Location
+Parameter / Line
+What to Change
+requirements.txt
+Append new lines
+Add packages beyond defaults (PyYAML, pydeequ, pytest, pytest-cov, coverage) Example: pandas, boto3, pyarrow
+ 
+0.6 — Configure Your YAML File in config/
+Create a YAML config file for each environment. This is the only place to hardcode source/destination paths.
+• Create: config/{your-repo-name}-dev.yaml
+• Create: config/{your-repo-name}-staging.yaml
+• Create: config/{your-repo-name}-prod.yaml
+○ Each file should contain: job_name, input/output Hadoop/S3 paths, and any other key-value parameters
+⚠️ Note: Your Python code must reference this yaml file for all paths. Do NOT hardcode paths in .py files.
+ 
+0.7 — Update main.py
+Located at src/main.py. This is the entry point called by Airflow via spark_submit.sh.
+File / Location
+Parameter / Line
+What to Change
+src/main.py
+Line 1 — import
+Change pipeline_template_job_one to your actual file/function name Example: from src.data_pipeline.credit_card_alerts_processing import process_alerts
+src/main.py
+Line 17 — if job_name == "job-one":
+Rename "job-one" to match your job name (must match bash_command in DAG file) Example: if job_name == "credit-card-alerts":
+src/main.py
+Line 18 — function call
+Replace process_template_pipeline_one(ss, job_conf) with your function Example: process_alerts(ss, job_conf)
+ 
+0.8 — Add GitHub Actions Workflow File
+If not already present from the fork:
+• Check: .github/workflows/ci.yml exists in your repo
+• If missing: Copy ci.yml from the python-etl-template repo (.github/workflows/) into your repo
+⚠️ Note: In Helios 1.0 repos, rename helios-config.yml to helios-config.yml.bak to stop old deployment and use GitHub Actions instead.
+ 
+Phase 1: Configure the Airflow DAG File
+Located at: scripts/scheduler/{your-repo-name}-dag.py
+First, rename the file itself from python-etl-ga-template-dag.py to match your repo name.
+ 
+DAG File Parameters to Change
+File / Location
+Parameter / Line
+What to Change
+dag file — filename
+File rename
+Rename to: {your-repo-name}-dag.py Example: python-etl-credit-card-alerts-dag.py
+dag file — Line 10
+email_list
+Replace <replace_this_with_your_email> with your actual RBC email address
+dag file — Line 33
+dag_id
+Rename dag id string inside DAG() Example: dag = DAG('python-etl-credit-card-alerts', ...)
+dag file — Line 36
+schedule_interval
+Set your cron schedule Example: '00 17 20 * *' (5PM on 20th of each month) Use '*/5 * * * *' for every 5 mins in dev testing
+dag file — Line 45
+bash_command
+Update path and params: """/app/cdn0/{your-repo-name}/spark_submit.sh {your-params} {{ ds_nodash }}""" Example: """/app/cdn0/python-etl-credit-card-alerts/spark_submit.sh all {{ ds_nodash }}"""
+⚠️ Note: The {{ ds_nodash }} token passes the Airflow execution date in YYYYMMDD format to your script. Make sure your Python code can parse this date format.
+ 
+Phase 2: Configure spark_submit.sh
+Located at: scripts/spark_submit.sh
+ 
+File / Location
+Parameter / Line
+What to Change
+spark_submit.sh
+REPO_NAME variable
+Change to your repo name: REPO_NAME="python-etl-credit-card-alerts"
+spark_submit.sh
+CONFIG_FILE_NAME variable
+For PROD deployment point to prod yaml: CONFIG_FILE_NAME="python-etl-credit-card-alerts-prod.yaml" (For staging testing, point to staging yaml)
+spark_submit.sh
+DEPLOY_MODE_PYTHON
+Keep as: DEPLOY_MODE_PYTHON=cluster Only change to =client when testing locally on OPUS/Brain VM
+ 
+Phase 3: Deploy to DEV
+ 
+Step 3.1 — Test Locally First (Optional but Recommended)
+Before pushing to dev, validate your code runs in a dev VM environment:
+1. git clone your repo to a Brain/OPUS VM
+2. cd into the repo and checkout your dev branch
+3. In dev_env.sh, add your credentials on line 129:
+--extra-index-url https://username:password@artifactory.fg.rbc.com/artifactory/api/pypi/pypi-cdn0/simple
+4. Run: source dev_env.sh  (you should see 'Deployment Completed!')
+5. Test run: ./spark_submit.sh all 20220601
+⚠️ Note: If testing on OPUS, change DEPLOY_MODE_PYTHON=cluster to =client in spark_submit.sh before running.
+ 
+Step 3.2 — Push to Dev Branch
+• Create a dev branch: e.g., dev/credit-card-alerts-initial
+• Commit all your changes (main.py, DAG file, spark_submit.sh, config yamls, src files)
+• Push to GitHub: git push origin dev/credit-card-alerts-initial
+• GitHub Actions (ci.yml) auto-triggers on push to any dev branch
+• Helios automatically deploys to the Dev environment
+ 
+Step 3.3 — Verify in Airflow DEV
+• Access Airflow DEV at: The URL corresponding to your dev server in helios-config.yml
+• Navigate to the DAGs list and search for your dag_id
+• Trigger the DAG manually to test
+• Check task logs for any errors
+⚠️ Note: You must be added to AD Group: APP_CDN0_PROD_AIRFLOW_RW to access Airflow.
+ 
+Phase 4: Deploy to Pre-Prod (Prod-Pilot / Staging)
+Pre-Prod uses the staging branch. Direct pushes to staging are NOT allowed. You must raise a Pull Request from your dev branch.
+ 
+Step 4.1 — Update spark_submit.sh for Staging
+File / Location
+Parameter / Line
+What to Change
+spark_submit.sh
+CONFIG_FILE_NAME
+Switch to staging yaml: CONFIG_FILE_NAME="python-etl-credit-card-alerts-staging.yaml"
+ 
+Step 4.2 — Increment Version
+File / Location
+Parameter / Line
+What to Change
+src/__init__.py
+__version__
+Increment before raising PR: Example: "1.0.0" → "1.1.0"
+ 
+Step 4.3 — Raise Pull Request: dev → staging
+• In GitHub, open a PR from: your dev branch → staging branch
+• Add meaningful title and description of changes
+• Assign reviewers for approval
+• Once approved and merged, GitHub Actions auto-deploys to Prod-Pilot environment
+ 
+Step 4.4 — Verify in Airflow PRE-PROD
+• Access Airflow Prod-Pilot and verify your DAG appears
+• Trigger manually or let the schedule run
+• Validate output data in staging destination paths
+⚠️ Note: Contact @Ma, Lei (She/Her/Hers) before proceeding to production deployment.
+ 
+Phase 5: Deploy to PROD
+Prod uses the master branch. Direct pushes to master are NOT allowed. You must raise a PR from staging.
+ 
+Step 5.1 — Update spark_submit.sh for Prod
+File / Location
+Parameter / Line
+What to Change
+spark_submit.sh
+CONFIG_FILE_NAME
+Switch to prod yaml: CONFIG_FILE_NAME="python-etl-credit-card-alerts-prod.yaml"
+spark_submit.sh
+DEPLOY_MODE_PYTHON
+Confirm it is set to: DEPLOY_MODE_PYTHON=cluster
+ 
+Step 5.2 — Increment Version Again
+File / Location
+Parameter / Line
+What to Change
+src/__init__.py
+__version__
+Increment before raising PR to master: Example: "1.1.0" → "1.2.0"
+ 
+Step 5.3 — Raise Pull Request: staging → master
+• In GitHub, open a PR from: staging → master
+• This is a production change — ensure thorough review
+• Once approved and merged, GitHub Actions auto-deploys to Prod environment
+ 
+Step 5.4 — Verify in Airflow PROD
+• Access Airflow PROD at: https://strplvacdn0002.fg.rbc.com:8080/home (or your server's Airflow link)
+• Confirm the DAG is visible and active
+• Monitor the first scheduled/manual run carefully
+• Validate data written to production output paths
+⚠️ Note: For OCP Airflow, access at: https://airflow-ocp-cdn0-private-prod.apps.ocp-scc-g1.fg.rbc.com/home
+ 
+Phase 6: Making Code Changes After Initial Deployment
+For every subsequent code change, follow this checklist:
+ 
+#
+Action
+Detail
+1
+Edit your code
+Change files in src/, config/, or scripts/ as needed
+2
+Increment __version__ in src/__init__.py
+Required for every PR to master. Helios won't redeploy without a version bump
+3
+Update CONFIG_FILE_NAME in spark_submit.sh
+Match to the correct environment yaml before raising each PR
+4
+Test locally
+Run source dev_env.sh, then ./spark_submit.sh to confirm before pushing
+5
+Push to dev branch
+Triggers automatic dev deployment via GitHub Actions
+6
+PR dev → staging
+After dev validation passes
+7
+PR staging → master
+After staging validation passes and team approval obtained
+ 
+Quick Reference: All Files You Need to Touch
+ 
+File / Location
+Parameter / Line
+What to Change
+Repo — filename
+Rename dag file
+scripts/scheduler/python-etl-ga-template-dag.py → {your-repo-name}-dag.py
+setup.py
+name (Line 14)
+cdn0-python-etl-{your-repo-name}
+src/__init__.py
+__version__ (Line 1)
+Set initial version. Increment on EVERY master PR
+src/main.py
+import + job_name + function call
+Point to your ETL file, function, and job name string
+src/data_pipeline/
+Your ETL script
+Place your converted Python ETL script here
+config/
+yaml files
+Create -dev.yaml, -staging.yaml, -prod.yaml with your paths
+requirements.txt
+Add packages
+Add any extra Python dependencies
+dag file — Line 10
+email_list
+Your RBC email address
+dag file — Line 33
+dag_id
+Unique, meaningful dag ID matching your repo name
+dag file — Line 36
+schedule_interval
+Cron expression for your run schedule
+dag file — Line 45
+bash_command
+Full path to spark_submit.sh with your params
+spark_submit.sh
+REPO_NAME
+Your repo name (exact match)
+spark_submit.sh
+CONFIG_FILE_NAME
+Switch between -dev / -staging / -prod yaml per environment
+spark_submit.sh
+DEPLOY_MODE_PYTHON
+cluster for production, client for local OPUS testing only
+.github/workflows/ci.yml
+Presence check
+Must exist for GitHub Actions to trigger Helios deployment
+ 
+Important: Data Quality Check (Mandatory)
+Using pydeequ to check your data quality before writing to output is a mandatory requirement per the framework guidelines.
+Add to your ETL processing file:
+from src.utils import dq
+df_final.cache()
+dq.checkDataQuality(spark_session, df_final)   # Line in your ETL file
+df_final.unpersist()
+Then customize the checks in src/utils/dq.py to match your dataset's requirements (nulls, row counts, data types, etc.).
+⚠️ Note: If you don't have a data quality rule that applies, you must document the reason and notify your team lead.
+ 
+Key Contacts & Access Requirements
+ 
+Item
+Detail
+Pre-PROD/PROD Contact
+@Ma, Lei (She/Her/Hers) — contact before any production deployment
+Airflow Access AD Group
+APP_CDN0_PROD_AIRFLOW_RW — add yourself to gain Airflow access
+Template Source Repo
+https://rbcgithub.fg.rbc.com/rbc-pcb/cdn0-python-etl-ga-template
+Developer Portal
+https://developers.fg.rbc.com/helios
+PROD Airflow (VM)
+https://strplvacdn0002.fg.rbc.com:8080/home
+PROD Airflow (OCP)
+https://airflow-ocp-cdn0-private-prod.apps.ocp-scc-g1.fg.rbc.com/home
+ 
