@@ -1,0 +1,1393 @@
+#!/usr/bin/env python3
+"""
+Cleaned 1-to-1 Python replication of the COB Repository Form 4946 flow.
+
+Migrated from local-drive notebook to production-ready script with:
+- S3 storage (PySpark + Hadoop FileSystem API)
+- Teradata for source pulls (teradatasql)
+- Standard logging (replaces SASAutoLogger)
+- JSON-based credential management (no hardcoded passwords)
+- Airflow-compatible entry point (process_cob_4946)
+
+Key principles:
+- Preserve SAS intent / dataset semantics (no redesign).
+- Keep step ordering and outputs: autocomplete (AC), fail-detail, expanded borrower file.
+- Reporting week: Saturday–Friday (7-day period).
+- Program runs Thursday usually; Wednesday–Tuesday yields the same data window.
+
+IMPORTANT
+- SQL object names and table references are kept inside SQL strings only.
+- Python variable names use safe identifiers.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+# PySpark + S3 connectivity
+from pyspark.sql import SparkSession
+
+# Teradata driver
+import teradatasql
+
+# Excel formatting
+import openpyxl
+
+# SQLAlchemy for SQL Server upload
+try:
+    from sqlalchemy import create_engine, types
+    from urllib.parse import quote_plus
+except ImportError:
+    create_engine = None  # type: ignore
+
+# Optional pyodbc fallback
+try:
+    import pyodbc  # type: ignore
+except ImportError:
+    pyodbc = None
+
+
+# =============================================================================
+# 0. Configuration
+# =============================================================================
+@dataclass(frozen=True)
+class Config:
+    """Central configuration — mirrors the Client360 Config pattern."""
+
+    # S3 paths (relative keys under the bucket)
+    outpath: Path = Path("sas/RSD/REG_DEV/COB/output/cob_repository/4946")
+    logpath: Path = Path("sas/RSD/REG_DEV/COB/log/cob_repository/4946")
+
+    # Credential files (JSON)
+    cob_conn_json: Path = Path("COBConnection.json")
+    sql_secrets_json: Path = Path("sql_cob.json")
+
+    # Output filenames
+    autocomplete_file: str = "FORM_ORIG_4946_Autocomplete_Prod.xlsx"
+    fail_detail_file: str = "Fail_Detail_orig_4946.xlsx"
+    expanded_file_template: str = "form_4946_{rundt}.xlsx"  # rundt substituted at runtime
+
+    # Persistent parquet (append-mode across runs)
+    persistent_ac_file: str = "cob_4946_autocomplete.parquet"
+
+    # SQL Server target table
+    sql_table: str = "STG_REG_AUTOCOMPLETE_COB"
+
+
+# =============================================================================
+# 1. S3 Settings
+# =============================================================================
+S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"
+S3_BUCKET = "ryu0-s3-sas-migration"
+
+S3_FOLDERS = {
+    "raw":          f"s3a://{S3_BUCKET}/raw",
+    "intermediate": f"s3a://{S3_BUCKET}/intermediate",
+    "output":       f"s3a://{S3_BUCKET}/output",
+    "logs":         f"s3a://{S3_BUCKET}/logs",
+    "smoke_tests":  f"s3a://{S3_BUCKET}/SAS_Dataset_Conversions/_smoke_tests",
+}
+
+
+def configure_s3a(spark: SparkSession) -> SparkSession:
+    """Plugs S3 connectivity into the Spark session (IAM-role auth)."""
+    hconf = spark.sparkContext._jsc.hadoopConfiguration()
+    hconf.set("fs.s3a.endpoint",              S3_ENDPOINT)
+    hconf.set("fs.s3a.connection.ssl.enabled", "true")
+    hconf.set("fs.s3a.path.style.access",     "true")
+    hconf.set("fs.s3a.impl",                  "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    return spark
+
+
+def get_spark_session(app_name: str = "COB_4946") -> SparkSession:
+    """Returns a Spark session wired up for S3."""
+    spark = SparkSession.builder.appName(app_name).getOrCreate()
+    configure_s3a(spark)
+    return spark
+
+
+def s3_path(folder: str, *parts: str) -> str:
+    """Builds a full S3 path from a folder key and sub-parts."""
+    base = S3_FOLDERS.get(folder, folder)
+    return "/".join([base.rstrip("/")] + list(parts))
+
+
+def upload_file_to_s3(spark: SparkSession, local_path: str, s3_uri: str) -> None:
+    """Uploads a local file to S3 using Hadoop FileSystem API."""
+    sc = spark.sparkContext
+    jvm = sc._jvm
+    conf = sc._jsc.hadoopConfiguration()
+    local_fs_path = jvm.org.apache.hadoop.fs.Path(f"file://{os.path.abspath(local_path)}")
+    s3_fs_path = jvm.org.apache.hadoop.fs.Path(s3_uri)
+    fs = s3_fs_path.getFileSystem(conf)
+    fs.copyFromLocalFile(False, True, local_fs_path, s3_fs_path)
+    logging.info(f"Uploaded to S3 → {s3_uri}")
+
+
+def write_parquet_to_s3(spark: SparkSession, df: pd.DataFrame, s3_uri: str) -> None:
+    """Writes a pandas DataFrame as a parquet file to S3 via PySpark."""
+    sdf = spark.createDataFrame(df)
+    sdf.write.mode("overwrite").parquet(s3_uri)
+    logging.info(f"Wrote parquet to S3 → {s3_uri}")
+
+
+def s3_file_exists(spark: SparkSession, s3_uri: str) -> bool:
+    """Quick check — does this file or folder exist in S3?"""
+    sc = spark.sparkContext
+    jvm = sc._jvm
+    path = jvm.org.apache.hadoop.fs.Path(s3_uri)
+    fs = path.getFileSystem(sc._jsc.hadoopConfiguration())
+    return fs.exists(path)
+
+
+# =============================================================================
+# 2. Logging
+# =============================================================================
+def setup_logging(log_path: Path, log_file_name: str) -> Path:
+    """Configures logging to file and console."""
+    log_path.mkdir(parents=True, exist_ok=True)
+    log_file = log_path / log_file_name
+
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+    )
+    logging.info(f"Logging configured. Log file: {log_file}")
+    return log_file
+
+
+# =============================================================================
+# 3. Connection helpers
+# =============================================================================
+def get_cob_connection(conn_file: Path):
+    """
+    Reads COB database connection details from JSON and returns a
+    teradatasql or pyodbc connection depending on driver availability.
+    JSON keys: server, database, user, password
+    """
+    if not conn_file.exists():
+        logging.error(f"Connection file not found: {conn_file.resolve()}")
+        raise FileNotFoundError(f"Connection file not found: {conn_file.resolve()}")
+
+    with open(conn_file, "r", encoding="utf-8") as f:
+        details = json.load(f)
+
+    server = details["server"]
+    database = details["database"]
+    user = details["user"]
+    password = details["password"]
+
+    logging.info(f"Connecting to COB database: {server} / {database} as {user}...")
+
+    conn_str = (
+        "Driver={ODBC Driver 17 for SQL Server};"
+        f"Server={server};"
+        f"Database={database};"
+        f"UID={user};PWD={password};"
+    )
+
+    if create_engine is not None:
+        engine = create_engine(
+            f"mssql+pyodbc:///?odbc_connect={quote_plus(conn_str)}",
+            fast_executemany=True,
+        )
+        logging.info("COB connection created via SQLAlchemy engine.")
+        return engine
+    elif pyodbc is not None:
+        conn = pyodbc.connect(conn_str)
+        logging.info("COB connection created via pyodbc.")
+        return conn
+    else:
+        raise RuntimeError("Neither SQLAlchemy+pyodbc nor pyodbc available.")
+
+
+def get_sqlserver_engine(secrets_file: Path):
+    """
+    Creates a SQLAlchemy engine for the reporting SQL Server.
+    JSON keys: server, database, user, password, table
+    """
+    if create_engine is None:
+        raise RuntimeError("SQLAlchemy is required for SQL Server upload.")
+
+    if not secrets_file.exists():
+        logging.error(f"SQL secrets file not found: {secrets_file.resolve()}")
+        raise FileNotFoundError(f"SQL secrets file not found: {secrets_file.resolve()}")
+
+    with open(secrets_file, "r", encoding="utf-8") as f:
+        secrets = json.load(f)
+
+    server = secrets["server"]
+    database = secrets["database"]
+    uid = secrets["user"]
+    pwd = secrets["password"]
+
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        f"UID={uid};"
+        f"PWD={pwd};"
+        f"TrustServiceCertificate=Yes;"
+    )
+
+    engine = create_engine(
+        f"mssql+pyodbc:///?odbc_connect={quote_plus(conn_str)}",
+        fast_executemany=True,
+    )
+    logging.info(f"SQL Server engine created: {server} / {database}")
+    return engine
+
+
+# =============================================================================
+# 4. Date helpers
+# =============================================================================
+def get_prev_weekday(ref_date, weekday_name: str) -> date:
+    """
+    Returns the most recent occurrence of `weekday_name` on or before `ref_date`.
+    Replicates c_m.get_prev_weekday from the common module.
+    """
+    day_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    target = day_map[weekday_name.lower()[:3]]
+    if isinstance(ref_date, datetime):
+        ref_date = ref_date.date()
+    days_back = (ref_date.weekday() - target) % 7
+    if days_back == 0:
+        days_back = 0  # include today if it matches
+    return ref_date - timedelta(days=days_back)
+
+
+def get_next_weekday(ref_date, weekday_name: str) -> date:
+    """
+    Returns the next occurrence of `weekday_name` on or after `ref_date`.
+    Replicates c_m.get_next_weekday from the common module.
+    """
+    day_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    target = day_map[weekday_name.lower()[:3]]
+    if isinstance(ref_date, datetime):
+        ref_date = ref_date.date()
+    if isinstance(ref_date, pd.Timestamp):
+        ref_date = ref_date.date()
+    days_fwd = (target - ref_date.weekday()) % 7
+    return ref_date + timedelta(days=days_fwd)
+
+
+def setup_date_parameters(sqlserver_engine, cfg: Config) -> Dict:
+    """
+    Replicates set_data_parameters().
+    Running between Wednesday and Tuesday yields the same data extraction window.
+    """
+    runday = datetime.today()
+
+    # Get last snapdate from database
+    query = f"""
+        SELECT max(t.snapDate) as snapDate
+        FROM dbo.{cfg.sql_table} AS t
+        WHERE t.segment7 LIKE '4946%'
+    """
+    try:
+        loaded = pd.read_sql(query, sqlserver_engine)
+        last_snap = pd.to_datetime(loaded["snapDate"]).dt.date.max()
+        logging.info(f"Last snapDate from DB: {last_snap}")
+    except Exception as e:
+        logging.warning(f"Could not read last snapDate from DB: {e}. Treating as initial run.")
+        last_snap = None
+
+    ini_run = "Y"
+
+    week_end = get_prev_weekday(runday, "wed") - timedelta(days=5)  # previous Friday
+    prod_strt = week_end - timedelta(days=6)  # back to Saturday before
+
+    if last_snap is None or pd.isna(last_snap):
+        event_start = prod_strt
+    else:
+        event_start = prod_strt if ini_run == "Y" else last_snap + timedelta(days=1)
+
+    evnt_strt = event_start.strftime("%Y-%m-%d")
+    week_end_str = week_end.strftime("%Y-%m-%d")
+    rundt = runday.strftime("%y%m%d")
+
+    xbetween_start = f"'{evnt_strt} 00:00:00.000'"
+    xbetween_end = f"'{week_end_str} 23:59:59.999'"
+    xbetween = f"{xbetween_start} and {xbetween_end}"
+
+    params = {
+        "runday": runday,
+        "last_snap": last_snap,
+        "ini_run": ini_run,
+        "week_end": week_end,
+        "prod_strt": prod_strt,
+        "event_start": event_start,
+        "evnt_strt": evnt_strt,
+        "week_end_str": week_end_str,
+        "rundt": rundt,
+        "xbetween_start": xbetween_start,
+        "xbetween_end": xbetween_end,
+        "xbetween": xbetween,
+    }
+
+    logging.info(f"Date parameters: evnt_strt={evnt_strt}, week_end={week_end_str}, "
+                 f"ini_run={ini_run}, rundt={rundt}")
+    logging.info(f"Data range between: {xbetween}")
+    return params
+
+
+# =============================================================================
+# 5. Format dictionaries and helpers (unchanged business logic)
+# =============================================================================
+def define_formats():
+    qa_format = {
+        0: "COM16", 1: "COM19", np.nan: "COM11", None: "COM11",
+        9: "COM18", "other": "COM18",
+    }
+    flag_format = {
+        1: "Potential Fail", 0: "Pass", np.nan: "Unable to Assess",
+        None: "Unable to Assess", "other": "Not Applicable",
+    }
+    cmt_format = {
+        "COM1": "Test population (less samples)", "COM2": "Match population",
+        "COM3": "Mismatch population (less samples)", "COM4": "Non Anomaly Population",
+        "COM5": "Anomaly Population", "COM6": "Number of Deposit Sessions",
+        "COM7": "Number of Accounts", "COM8": "Number of Transactions",
+        "COM9": "Non Blank Population", "COM10": "Blank Population",
+        "COM11": "Unable to Assess", "COM12": "Number of Failed Data Elements",
+        "COM13": "Population Distribution", "COM14": "Reconciled Population",
+        "COM15": "Not Reconciled Population", "COM16": "Pass", "COM17": "Fail",
+        "COM18": "Not Applicable", "COM19": "Potential Fail",
+    }
+    ctrk_format = {
+        "Comp": "Completeness", "AccuM": "Accuracy", "AccuC": "Accuracy",
+        "Accu": "Accuracy", "Time": "Timeliness",
+    }
+    DE_I_format = {
+        "annualRt": "AnnualInterestRate", "interestRate": "InterestRate",
+        "primeRate": "PrimeRate", "statementDate": "StatementDate",
+        "srfnumber": "ClientNumber", "clientName": "ClientName",
+        "paymentDueDate": "FirstPaymentDueDate", "prinAmt": "InitialCreditLimit",
+        "accountNumber": "AccountNumber", "transitNumber": "TransitNumber",
+        "chequeFee": "ChequeFee", "dischargeFee": "DischargeFee",
+        "ppsRFee": "PPSRegistrationFee", "processingFee": "ProcessingFee",
+        "stopPaymentFee": "StopPaymentFee", "NSFChequeFee": "NSFChequeFee",
+        "documentFee": "DocumentFee",
+    }
+    return qa_format, flag_format, cmt_format, ctrk_format, DE_I_format
+
+
+def apply_qa_format(val, qa_format):
+    if pd.isna(val):
+        return qa_format.get(np.nan, qa_format.get("other", "COM18"))
+    return qa_format.get(val, qa_format.get("other", "COM18"))
+
+
+def apply_flag_format(val, flag_format):
+    if pd.isna(val):
+        return flag_format.get(np.nan, flag_format.get("other", "Not Applicable"))
+    return flag_format.get(val, flag_format.get("other", "Not Applicable"))
+
+
+# =============================================================================
+# 6. Variable lists
+# =============================================================================
+def define_variable_lists():
+    vars_rde = [
+        "annualInterestRate", "primeRate", "paymentDueDate", "statementDate",
+        "chequeFee", "ppsRegistrationFee", "stopPaymentFee", "documentFee",
+        "NSFChequeFee", "processingFee", "dischargeFee", "principalAmount",
+        "transitNumber", "accountNumber", "srfnumber", "clientName",
+    ]
+    vars_oth = [
+        "formNumber", "srcSysCd", "upstreamEventIds", "applicationID", "transactionID",
+        "productID", "eventID", "eventTimestamp", "eventDate", "docGeneratedDateTimeStamp",
+        "product", "segmentNumber", "Application_Type", "interestRate", "scheduleAInd",
+        "clientPDFactor", "partnerType", "no_srfs_ind", "no_nams_ind",
+    ]
+    all_vars = list(dict.fromkeys(vars_rde + vars_oth))
+    return vars_rde, vars_oth, all_vars
+
+
+# =============================================================================
+# 7. Data extraction — COB source database
+# =============================================================================
+def get_cob_data(cob_engine, xbetween: str, database: str) -> pd.DataFrame:
+    """Pulls raw COB data from the source database."""
+    logging.info(f"Step 4: Pulling COB data from {database}...")
+
+    sql_query = f"""
+    SELECT  txn.formNumber
+            ,app.applicationID
+            ,txn.transactionID
+            ,pr.productID
+            ,app.srcSysCd
+            ,el.upstreamEventIds
+            ,app.statementDate
+            ,txn.eventID
+            ,pd.mortgageType
+            ,txn.principalAmount
+            ,pd.Term
+            ,txn.dateOfAdvance
+            ,txn.interestAdjustmentDate
+            ,txn.applicationStatus
+            ,pr.paymentAmount
+            ,pd.paymentFrequency
+            ,pd.amortizationPeriod
+            ,pr.defaultInsurancePremium
+            ,pr.defaultInsuranceTax
+            ,pr.totalDefaultInsurance
+            ,txn.availableAmount
+            ,pd.maturityDate
+            ,pr.balanceOwingMaturity
+            ,pr.interestCostOverTerm
+            ,pr.totalCOBTerm
+            ,pr.totalPIPaymentsTerm
+            ,pr.totalPaymentAmountMonthly
+            ,pr.insuranceCostPerPayment
+            ,pr.annualInterestRate
+            ,pr.annualPercentageRate
+            ,pr.interestRate
+            ,pr.primeRate
+            ,pr.rateReduction
+            ,pr.clientPDPM
+            ,pr.clientPDFactor
+            ,pr.triggeringInterestRate
+            ,pr.processingFee
+            ,pr.documentFee
+            ,pr.dischargeFee
+            ,pr.ppsRegistrationFee
+            ,pr.NSFChequeFee
+            ,pr.stopPaymentFee
+            ,pr.chequeFee
+            ,pr.administrationFee
+            ,pd.product
+            ,pd.paymentDueDate
+            ,aar.srfnumber
+            ,aar.clientName
+            ,aar.partnerType
+            ,el.eventTimestamp
+            ,CONVERT(date, el.eventTimestamp) as eventDate
+            ,txn.docGeneratedDateTimeStamp
+            ,txn.transitNumber
+            ,txn.accountNumber
+            ,txn.segmentNumber
+            ,pd.scheduleAInd
+            ,CASE WHEN aar.applicationID = '00000000000' THEN 'Native Open'
+                  ELSE 'Origination' END as Application_Type
+            ,pr.annualFee
+            ,pr.collateralFee
+            ,pr.loanPurposeCode
+            ,pr.loanSubPurposeCode
+            ,aar.clientEmploymentStatus
+            ,aar.occupationCode
+    FROM
+        {database}.dbo.[Application]              as app,
+        {database}.dbo.[Transaction]              as txn,
+        {database}.dbo.[Pricing]                  as pr,
+        {database}.dbo.[Payment_Details]           as pd,
+        {database}.dbo.[Event_Log]                as el,
+        {database}.dbo.[Application_Applicant_Rel] as aar
+    WHERE
+            app.eventID = txn.eventID
+        and app.eventID = pr.eventID
+        and app.eventID = pd.eventID
+        and app.eventID = el.eventID
+        and app.eventID = aar.eventID
+        and (el.upstreamEventIds in ('RCLPBAgreementDigital'))
+        and el.eventTimestamp between {xbetween}
+        and app.srcSysCd in ('CASPER_Quadient', 'CASPER_Host')
+    """
+
+    dta_4946_0 = pd.read_sql(sql_query, cob_engine)
+    logging.info(f"Loaded {len(dta_4946_0)} rows from COB source.")
+
+    # Dispose engine if SQLAlchemy
+    if hasattr(cob_engine, "dispose"):
+        cob_engine.dispose()
+
+    return dta_4946_0
+
+
+# =============================================================================
+# 8. Data processing functions (business logic preserved from original)
+# =============================================================================
+def add_srf_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add no_srfs_ind and no_nams_ind indicators via in-memory SQLite."""
+    logging.info("Step 5: Adding SRF/NAM indicators...")
+    conn_sql = sqlite3.connect(":memory:")
+    try:
+        df.to_sql("tmp1", conn_sql, index=False, if_exists="replace")
+        query = """
+        SELECT dta.*, srf.no_srfs_ind, srf.no_nams_ind
+        FROM tmp1 AS dta
+        LEFT JOIN (
+            SELECT eventID,
+                   COUNT(*) AS count,
+                   SUM(CASE WHEN srfnumber IS NULL OR TRIM(srfnumber) = '' THEN 1 ELSE 0 END) AS no_srfs_ind,
+                   SUM(CASE WHEN clientName IS NULL OR TRIM(clientName) = '' THEN 1 ELSE 0 END) AS no_nams_ind
+            FROM tmp1
+            GROUP BY eventID
+        ) AS srf ON srf.eventID = dta.eventID
+        """
+        df2 = pd.read_sql_query(query, conn_sql)
+    finally:
+        conn_sql.close()
+    logging.info(f"SRF indicators added: {len(df2)} rows")
+    return df2
+
+
+def process_population_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Create dta_4946s — process population, mask PII, split valid/invalid."""
+    logging.info("Step 6: Processing population data...")
+    df = df.copy()
+
+    df["Application_Type"] = df["applicationID"].apply(
+        lambda x: "Native Open" if pd.to_numeric(x, errors="coerce") == 0 else "Origination"
+    )
+    df["srcSysCd"] = df["srcSysCd"].str.upper()
+    df["srfnumber"] = df["srfnumber"].fillna("").str.replace(";", ",")
+    df["clientName"] = df["clientName"].fillna("").str.replace(";", ",")
+    df["srfnumber"] = df["srfnumber"].apply(lambda x: "_NA_" if x == "" else x)
+    df["clientName"] = df["clientName"].apply(lambda x: "_NA_" if x == "" else x)
+    df["srfnumber"] = df["srfnumber"].apply(lambda srf: srf if srf == "_NA_" else srf.zfill(27))
+    df["srfnumber2"] = df["srfnumber"].apply(
+        lambda x: "_NA_" if x == "_NA_" else "******" + x[-3:]
+    )
+    df["clientName2"] = df["clientName"].apply(
+        lambda x: "_NA_" if x == "_NA_" else (x[0] + "*****" if len(x) > 0 else "_NA_")
+    )
+
+    if "statementDate" in df.columns:
+        df["statementDate"] = pd.to_datetime(df["statementDate"]).dt.date
+
+    df["xid"] = df["applicationID"].astype(str) + "+" + df["productID"].astype(str)
+
+    dta_4946s = df[df["applicationID"] != "99999999999"].copy()
+    dta_4946s9s = df[df["applicationID"] == "99999999999"].copy()
+
+    logging.info(f"Valid: {len(dta_4946s)} rows, Invalid (9s): {len(dta_4946s9s)} rows")
+    return dta_4946s, dta_4946s9s
+
+
+def print_data_summary(dta_4946s: pd.DataFrame) -> None:
+    """Log data summary statistics."""
+    if len(dta_4946s) > 0:
+        check_data = dta_4946s.groupby("srcSysCd").agg(
+            N_rcds=("eventID", "size"),
+            N_eventID=("eventID", "nunique"),
+            N_xid=("xid", "nunique"),
+        )
+        dta_4946s_tmp = dta_4946s.copy()
+        dta_4946s_tmp["eventID_srf"] = dta_4946s_tmp["eventID"].astype(str) + "-" + dta_4946s_tmp["srfnumber"].astype(str)
+        check_data["N_eventID_srf"] = dta_4946s_tmp.groupby("srcSysCd")["eventID_srf"].nunique()
+        logging.info(f"Data check:\n{check_data.to_string()}")
+    else:
+        logging.warning("No data to check — dta_4946s is empty")
+
+
+def aggregate_by_event(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Aggregate by eventID — concatenate srfnumber and clientName."""
+    logging.info("Step 7: Aggregating by eventID...")
+    df = df.sort_values(["eventID", "srfnumber", "clientName"])
+
+    agg_funcs = {
+        col: "last" for col in df.columns
+        if col not in ["srfnumber", "srfnumber2", "clientName", "clientName2"]
+    }
+    grouped = df.groupby("eventID", as_index=False).agg({
+        **agg_funcs,
+        "srfnumber": lambda x: ";".join(x.astype(str)),
+        "srfnumber2": lambda x: ";".join(x.astype(str)),
+        "clientName": lambda x: ";".join(x.astype(str)),
+        "clientName2": lambda x: ";".join(x.astype(str)),
+    })
+    grouped["n_srfs"] = df.groupby("eventID").size().values
+
+    dta_4946a_a = grouped.copy()
+    dta_4946a_q = grouped[grouped["srcSysCd"] == "CASPER_QUADIENT"].copy()
+    dta_4946a_h = grouped[grouped["srcSysCd"] == "CASPER_HOST"].copy()
+
+    logging.info(f"Aggregated — All: {len(dta_4946a_a)}, Quadient: {len(dta_4946a_q)}, Host: {len(dta_4946a_h)}")
+    return dta_4946a_a, dta_4946a_q, dta_4946a_h
+
+
+def get_latest_events(df_q: pd.DataFrame, df_h: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Get latest Quadient and Host events per xid."""
+    logging.info("Step 8: Getting latest events per xid...")
+    if len(df_q) > 0:
+        df_q = df_q.sort_values(["xid", "docGeneratedDateTimeStamp", "eventID"], ascending=[True, False, True])
+        df_q = df_q.drop_duplicates(subset="xid", keep="first")
+    if len(df_h) > 0:
+        df_h = df_h.sort_values(["xid", "eventTimestamp", "eventID"], ascending=[True, False, True])
+        df_h = df_h.drop_duplicates(subset="xid", keep="first")
+    logging.info(f"Latest events — Quadient: {len(df_q)}, Host: {len(df_h)}")
+    return df_q, df_h
+
+
+def merge_quadient_host(df_q: pd.DataFrame, df_h: pd.DataFrame,
+                        all_vars: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Merge Quadient and Host data on xid."""
+    logging.info("Step 9: Merging Quadient and Host data...")
+    cols_to_rename = [c for c in all_vars if c in df_q.columns]
+    rename_q = {c: f"{c}_q" for c in cols_to_rename}
+    rename_h = {c: f"{c}_h" for c in cols_to_rename}
+    rename_q["srfnumber2"] = "srfnumber2_q"
+    rename_q["clientName2"] = "clientName2_q"
+    rename_h["srfnumber2"] = "srfnumber2_h"
+    rename_h["clientName2"] = "clientName2_h"
+
+    df_q_renamed = df_q.rename(columns=rename_q)
+    df_h_renamed = df_h.rename(columns=rename_h)
+
+    merged = df_q_renamed.merge(df_h_renamed, on="xid", how="outer", indicator=True)
+
+    if "eventTimestamp_q" in merged.columns and "eventTimestamp_h" in merged.columns:
+        merged["eventTimestamp_q"] = pd.to_datetime(merged["eventTimestamp_q"])
+        merged["eventTimestamp_h"] = pd.to_datetime(merged["eventTimestamp_h"])
+        merged["time_dif_o"] = (merged["eventTimestamp_q"] - merged["eventTimestamp_h"]).dt.total_seconds()
+        merged["time_dif_a"] = merged["time_dif_o"].abs()
+
+    dta_4946a_qh = merged[merged["_merge"] == "both"].drop(columns="_merge")
+    dta_4946a_qh_nomap = merged[merged["_merge"] != "both"].drop(columns="_merge")
+
+    logging.info(f"Merged: {len(dta_4946a_qh)}, No match: {len(dta_4946a_qh_nomap)}")
+    return dta_4946a_qh, dta_4946a_qh_nomap
+
+
+def get_closest_matches(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep closest time match per xid."""
+    logging.info("Step 10: Getting closest matches...")
+    if len(df) == 0:
+        return df
+    df = df.sort_values(["xid", "time_dif_a"])
+    df = df.drop_duplicates(subset="xid", keep="first")
+    logging.info(f"Closest matches: {len(df)}")
+    return df
+
+
+def perform_accuracy_checks(df: pd.DataFrame) -> pd.DataFrame:
+    """All accuracy checks — preserved exactly from original."""
+    logging.info("Step 11: Performing accuracy checks...")
+    df = df.copy()
+
+    # Annual Interest Rate (AccuC_annualRt)
+    df["annualInterestRat2_h"] = np.where(
+        df["interestRate_h"].notna() & df["primeRate_h"].notna(),
+        np.round(df["interestRate_h"] + df["primeRate_h"], 7), np.nan,
+    )
+    df["annualInterestRate_d"] = np.where(
+        df["interestRate_q"].notna() & df["annualInterestRat2_h"].notna(),
+        np.round(
+            (df["annualInterestRat2_h"] * 1000).astype(int) / 1000
+            - (df["interestRate_q"] * 1000).astype(int) / 1000, 3
+        ), np.nan,
+    )
+    df["AccuC_annualRt"] = np.select(
+        [df["annualInterestRat2_h"].isna(), df["interestRate_q"].isna(),
+         df["annualInterestRate_d"].abs() >= 0.001],
+        [np.nan, 1, 1], default=0,
+    )
+
+    # Interest Rate (AccuM_interestRate)
+    df["interestRate_d"] = np.where(
+        df["interestRate_q"].notna() & df["annualInterestRate_h"].notna(),
+        np.round(df["annualInterestRate_h"] - df["interestRate_q"], 7), np.nan,
+    )
+    df["AccuM_interestRate"] = np.select(
+        [df["annualInterestRate_h"].isna(), df["interestRate_q"].isna(),
+         df["interestRate_d"].abs() >= 1e-6],
+        [np.nan, 1, 1], default=0,
+    )
+
+    # Prime Rate (AccuM_primeRate)
+    df["primeRate_d"] = np.where(
+        df["primeRate_q"].notna() & df["primeRate_h"].notna(),
+        np.round(df["primeRate_h"] - df["primeRate_q"], 7), np.nan,
+    )
+    df["AccuM_primeRate"] = np.select(
+        [df["primeRate_h"].isna(), df["primeRate_q"].isna(),
+         df["primeRate_d"].abs() >= 1e-6],
+        [np.nan, 1, 1], default=0,
+    )
+
+    # Statement Date (AccuM_statementDate)
+    df["statementDate_q"] = pd.to_datetime(df["statementDate_q"], errors="coerce")
+    df["statementDate_h"] = pd.to_datetime(df["statementDate_h"], errors="coerce")
+    df["statementDate_d"] = (df["statementDate_h"] - df["statementDate_q"]).dt.days
+    df["AccuM_statementDate"] = np.select(
+        [df["statementDate_h"].isna(), df["statementDate_q"].isna(),
+         df["statementDate_d"].abs() >= 1],
+        [np.nan, 1, 1], default=0,
+    )
+
+    # Payment Due Date (AccuM_paymentDueDate)
+    df["paymentDueDate_q"] = pd.to_datetime(df["paymentDueDate_q"], errors="coerce")
+    df["paymentDueDate_h"] = pd.to_datetime(df["paymentDueDate_h"], errors="coerce")
+    df["paymentDueDate_d"] = (df["paymentDueDate_h"] - df["paymentDueDate_q"]).dt.days
+    df["AccuM_paymentDueDate"] = np.select(
+        [df["paymentDueDate_h"].isna(), df["paymentDueDate_q"].isna(),
+         df["paymentDueDate_d"].abs() >= 1],
+        [np.nan, 1, 1], default=0,
+    )
+
+    # Principal Amount (AccuM_prinAmt)
+    df["principalAmount_d"] = np.where(
+        df["principalAmount_h"].notna() & df["principalAmount_q"].notna(),
+        np.round(df["principalAmount_h"] - df["principalAmount_q"], 2), np.nan,
+    )
+    df["AccuM_prinAmt"] = np.select(
+        [df["principalAmount_h"].isna(), df["principalAmount_q"].isna(),
+         df["principalAmount_d"].abs() >= 0.01],
+        [np.nan, 1, 1], default=0,
+    )
+
+    # Account Number (AccuM_accountNumber)
+    df["accountNumber_h"] = df["accountNumber_h"].astype(str).str.strip()
+    df["accountNumber_q"] = df["accountNumber_q"].astype(str).str.strip()
+    df["accountNumber_h0"] = df["accountNumber_h"].str.zfill(16)
+    df["accountNumber_q0"] = df["accountNumber_q"].str.zfill(16)
+    df["AccuM_accountNumber"] = np.select(
+        [df["accountNumber_h"].isin(["", "nan", "None"]),
+         df["accountNumber_q"].isin(["", "nan", "None"]),
+         df["accountNumber_h0"] == df["accountNumber_q0"]],
+        [np.nan, 1, 0], default=1,
+    )
+
+    # Transit Number (AccuM_transitNumber)
+    df["transitNumber_h"] = df["transitNumber_h"].astype(str).str.strip()
+    df["transitNumber_q"] = df["transitNumber_q"].astype(str).str.strip()
+    df["transitNumber_h0"] = df["transitNumber_h"].str.zfill(5)
+    df["transitNumber_q0"] = df["transitNumber_q"].str.zfill(5)
+    df["AccuM_transitNumber"] = np.select(
+        [df["transitNumber_h"].isin(["", "nan", "None"]),
+         df["transitNumber_q"].isin(["", "nan", "None"]),
+         df["transitNumber_h0"] == df["transitNumber_q0"]],
+        [np.nan, 1, 0], default=1,
+    )
+
+    # Fee checks helper
+    def check_fee(df, fee_name):
+        h_col, q_col, d_col = f"{fee_name}_h", f"{fee_name}_q", f"{fee_name}_d"
+        df[d_col] = np.where(
+            df[h_col].notna() & df[q_col].notna(),
+            np.round(df[h_col] - df[q_col], 2), np.nan,
+        )
+        return np.select(
+            [df[h_col].isna(), df[q_col].isna(), df[d_col].abs() >= 0.01],
+            [np.nan, 1, 1], default=0,
+        )
+
+    df["AccuM_chequeFee"] = check_fee(df, "chequeFee")
+
+    # Processing Fee (special logic with scheduleAInd)
+    df["scheduleAIn2_q"] = df["scheduleAInd_q"].str.upper().isin(["Y", "YES"])
+    df["processingFee_d"] = np.where(
+        df["processingFee_h"].notna() & df["processingFee_q"].notna(),
+        np.round(df["processingFee_h"] - df["processingFee_q"], 2), np.nan,
+    )
+    df["AccuM_processingFee"] = np.where(
+        ~df["scheduleAIn2_q"],
+        np.where(df["processingFee_q"] == 0, 0, 1), np.nan,
+    )
+
+    df["AccuM_stopPaymentFee"] = check_fee(df, "stopPaymentFee")
+    df["AccuM_documentFee"] = check_fee(df, "documentFee")
+
+    logging.info(f"Accuracy checks completed: {len(df)} rows")
+    return df
+
+
+def create_final_output(df: pd.DataFrame, runday) -> pd.DataFrame:
+    """Create final output dataset with aggregate failure counts."""
+    logging.info("Step 12: Creating final output dataset...")
+    df = df.copy()
+
+    accu_m_cols = [c for c in df.columns if c.startswith("AccuM_") and not c.endswith("_Fail") and not c.endswith("_RDE")]
+    accu_c_cols = [c for c in df.columns if c.startswith("AccuC_") and not c.endswith("_Fail") and not c.endswith("_RDE")]
+
+    df["AccuM_Num_Of_Fail"] = df[accu_m_cols].replace(9, np.nan).sum(axis=1, skipna=True, min_count=1)
+    df["AccuM_Accuracy_RDE"] = np.select(
+        [df["AccuM_Num_Of_Fail"].isna(), df["AccuM_Num_Of_Fail"] == 0],
+        [np.nan, 0], default=1,
+    )
+    df["AccuM_Num_Of_Fail"] = df[accu_m_cols].replace(9, np.nan).sum(axis=1, skipna=True)
+
+    df["AccuC_Num_Of_Fail"] = df[accu_c_cols].replace(9, np.nan).sum(axis=1, skipna=True, min_count=1)
+    df["AccuC_Accuracy_RDE"] = np.select(
+        [df["AccuC_Num_Of_Fail"].isna(), df["AccuC_Num_Of_Fail"] == 0],
+        [np.nan, 0], default=1,
+    )
+    df["AccuC_Num_Of_Fail"] = df[accu_c_cols].replace(9, np.nan).sum(axis=1, skipna=True)
+
+    df["Accu_Num_Of_Fail"] = df["AccuM_Num_Of_Fail"] + df["AccuC_Num_Of_Fail"]
+    df["Accu_Accuracy_RDE"] = np.maximum(df["AccuM_Accuracy_RDE"], df["AccuC_Accuracy_RDE"])
+
+    # Set reporting fields
+    df["rpt_bal"] = df["principalAmount_q"]
+    df["eventDate"] = df["eventDate_q"]
+    df["statementDate"] = df["statementDate_q"]
+    df["Application_Type"] = df["Application_Type_q"]
+    df["upstreamEventIds"] = df["upstreamEventIds_q"]
+    df["accountNumber"] = df["accountNumber_q"]
+    df["applicationID"] = df["applicationID_q"]
+    df["clientNumber"] = df["srfnumber_q"]
+    df["eventID"] = df["eventID_q"]
+    df["productID"] = df["productID_q"]
+    df["segmentNumber"] = df["segmentNumber_q"]
+    df["srfnumber"] = df["srfnumber_q"]
+    df["transactionID"] = df["transactionID_q"]
+    df["transitNumber"] = df["transitNumber_q"]
+
+    df["RegulatoryName"] = "COB"
+    df["LOB"] = "PL"
+    df["ReportName"] = "COB CASPER Report"
+    df["TestPeriod"] = "Origination"
+    df["ProductType"] = "Loans"
+    df["Segment3"] = df["Application_Type"]
+    df["Segment4"] = ""
+    df["Segment7"] = "4946,S4946"
+
+    df["eventDate"] = pd.to_datetime(df["eventDate"])
+    df["SnapDate"] = df["eventDate"].apply(lambda x: get_next_weekday(x, "fri"))
+    df["DateCompleted"] = pd.to_datetime(runday, errors="raise").date()
+
+    logging.info(f"Final output: {len(df)} rows")
+    return df
+
+
+def expand_to_borrower_level(df: pd.DataFrame) -> pd.DataFrame:
+    """Expand to borrower level (one row per SRF number)."""
+    logging.info("Step 13: Expanding to borrower level...")
+    expanded_rows = []
+
+    for idx, row in df.iterrows():
+        srfnumbers = str(row.get("srfnumber_q", "")).split(";")
+        clientNames = str(row.get("clientName_q", "")).split(";")
+
+        for k, (srf, name) in enumerate(zip(srfnumbers, clientNames)):
+            if not srf or srf == "nan":
+                break
+            new_row = row.copy()
+            new_row["srfnumber9"] = srf
+            new_row["ClientName9"] = name
+            new_row["clientNumber_mask"] = "_NA_" if srf == "_NA_" else "******" + srf[-3:]
+            new_row["Segment5"] = "P" if k == 0 else "A"
+            new_row["Segment6"] = "M" if k == 0 else "S"
+            expanded_rows.append(new_row)
+
+    result = pd.DataFrame(expanded_rows)
+    logging.info(f"Expanded to borrower level: {len(result)} rows")
+    return result
+
+
+# =============================================================================
+# 9. Autosum and Detail report functions
+# =============================================================================
+def make_autosum(df, cntl_flag, cob_num, qa_format, cmt_format, ctrk_format, DE_I_format):
+    """Creates summary statistics for one control flag."""
+    parts = cntl_flag.split("_")
+    control_type = parts[0]
+    de_name = "_".join(parts[1:])
+    control_risk = ctrk_format.get(control_type, control_type)
+
+    if parts[1] == "Num":
+        test_type = "Distribution"
+    elif control_type == "Time":
+        test_type = "Reconciliation"
+    else:
+        test_type = "Anomaly"
+
+    rde = f"{cob_num}_{DE_I_format.get(de_name, de_name)}"
+
+    df_copy = df.copy()
+    df_copy["CommentCode"] = df_copy[cntl_flag].apply(lambda v: apply_qa_format(v, qa_format)) if cntl_flag in df_copy.columns else "COM18"
+    df_copy["Comments"] = df_copy["CommentCode"].map(cmt_format)
+
+    if "_Num_" in cntl_flag:
+        df_copy["Segment"] = df_copy[cntl_flag].apply(lambda x: "NA" if pd.isna(x) else str(int(x)))
+        df_copy["CommentCode"] = "COM12"
+        df_copy["Comments"] = cmt_format.get("COM12", "")
+    else:
+        df_copy["Segment"] = ""
+
+    if "_Accuracy_RDE" in cntl_flag:
+        df_copy["CommentCode"] = np.where(df_copy["CommentCode"] == "COM11", "COM18", df_copy["CommentCode"])
+        df_copy["Comments"] = df_copy["CommentCode"].map(cmt_format)
+
+    group_cols = [
+        "RegulatoryName", "LOB", "ReportName", "TestPeriod", "ProductType",
+        "upstreamEventIds", "Segment3", "Segment4", "Segment5", "Segment6", "Segment7",
+        "DateCompleted", "SnapDate", "Segment", "CommentCode", "Comments",
+    ]
+    available_cols = [c for c in group_cols if c in df_copy.columns]
+
+    summary = df_copy.groupby(available_cols, dropna=False).agg(
+        Volume=("xid", "size"), Bal=("rpt_bal", "sum"),
+    ).reset_index()
+
+    summary["ControlRisk"] = control_risk
+    summary["TestType"] = test_type
+    summary["RDE"] = rde
+    summary["HoldoutFlag"] = "N"
+    summary["Segment2"] = summary.get("upstreamEventIds", "")
+
+    return summary
+
+
+def make_detail(df, rde_check, rde_cob_col, rde_cal_col, ctrk_format, DE_I_format, qa_format, cmt_format):
+    """Creates detail report for one RDE check."""
+    detail = df[df[rde_check].isin([1]) | df[rde_check].isna()].copy()
+
+    parts = rde_check.split("_")
+    control_type = parts[0]
+    de_name = "_".join(parts[1:])
+    control_risk = ctrk_format.get(control_type, control_type)
+
+    if control_type == "Comp":
+        rde = f"COB521_{DE_I_format.get(de_name, de_name)}"
+    elif control_type == "AccuM":
+        rde = f"COB523_{DE_I_format.get(de_name, de_name)}"
+    elif control_type == "AccuC":
+        rde = f"COB524_{DE_I_format.get(de_name, de_name)}"
+    else:
+        rde = ""
+
+    detail["ControlRisk"] = control_risk
+    detail["RDE"] = rde
+    detail["Category"] = detail[rde_check].apply(
+        lambda x: cmt_format.get(apply_qa_format(x, qa_format), "")
+    )
+    detail["COB_Value"] = detail[rde_cob_col].astype(str) if rde_cob_col in detail.columns else ""
+    detail["Comparison_Value"] = detail[rde_cal_col].astype(str) if rde_cal_col in detail.columns else ""
+    detail["FormNumber"] = "4946"
+    detail["HoldoutFlag"] = "N"
+    detail["processingCenter"] = ""
+    detail["Statement_Level"] = detail.get("Segment6", "")
+    detail["Event_Level"] = detail.get("Segment5", "")
+    detail["COB_Date"] = detail["eventDate"]
+    detail["loanNumber"] = detail["segmentNumber"]
+
+    return detail
+
+
+# =============================================================================
+# 10. Upload validation helpers
+# =============================================================================
+def check_add_missing_cols(df, required_cols, reorder=True):
+    """Ensure required_cols all exist in df; add missing with NaN."""
+    df = df.copy()
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        df[missing] = np.nan
+        logging.info(f"Added missing columns with NaN: {missing}")
+    if reorder:
+        df = df.reindex(columns=required_cols)
+    return df, missing
+
+
+def check_required_notnull(df, required_cols, treat_empty_as_missing=True):
+    """Check if required_cols contain nulls and report."""
+    report = []
+    for col in required_cols:
+        if col not in df.columns:
+            report.append({"column": col, "status": "MISSING_COLUMN",
+                           "missing_count": None, "empty_count": None, "total_missing": None})
+            continue
+        missing_count = int(df[col].isna().sum())
+        empty_count = 0
+        if treat_empty_as_missing:
+            empty_count = int((df[col].astype(str).str.strip() == "").sum())
+        total_missing = missing_count + empty_count
+        status = "OK" if total_missing == 0 else "MISSING"
+        report.append({"column": col, "status": status, "missing_count": missing_count,
+                        "empty_count": empty_count, "total_missing": total_missing})
+
+    rep_df = pd.DataFrame(report)
+    n_issues = int((rep_df["total_missing"] > 0).sum())
+    logging.info(f"Non-null check: {n_issues} column(s) with issues\n{rep_df.to_string(index=False)}")
+    return rep_df
+
+
+# =============================================================================
+# 11. Main processing function (Airflow entry point)
+# =============================================================================
+def process_cob_4946(ss, job_conf) -> None:
+    """
+    Entry point called by main.py via Airflow.
+
+    Parameters:
+        ss       : SparkSession passed from main.py
+        job_conf : dict loaded from YAML config
+    """
+    cfg = Config()
+
+    # Use the Spark session passed in and configure S3
+    spark = ss
+    configure_s3a(spark)
+
+    # Pull paths from job_conf (YAML), fall back to Config defaults
+    outpath = Path(job_conf.get("output", str(cfg.outpath)))
+    logpath = Path(job_conf.get("logpath", str(cfg.logpath)))
+    cob_conn_json = Path(job_conf.get("cob_conn_json", str(cfg.cob_conn_json)))
+    sql_secrets_json = Path(job_conf.get("sql_secrets_json", str(cfg.sql_secrets_json)))
+    cob_database = job_conf.get("cob_database", "dcb10_cob_repository")
+
+    # Setup logging
+    ymd = datetime.now().strftime("%Y%m%d")
+    log_file_name = f"COB_Repository_Prod_4946_{ymd}.log"
+    setup_logging(logpath, log_file_name)
+
+    logging.info("=" * 60)
+    logging.info("SAS to Python Migration: COB_Repository_Prod_4946 Starting...")
+    logging.info(f"Script running as user: {os.environ.get('USER', 'Unknown')}")
+    logging.info(f"Platform: {os.environ.get('HOSTNAME', 'Unknown')}")
+    logging.info(f"Spark session received. Master: {spark.sparkContext.master}")
+    logging.info(f"S3 endpoint: {S3_ENDPOINT}, Bucket: {S3_BUCKET}")
+    logging.info(f"COB database: {cob_database}")
+
+    # Ensure output directories
+    outpath.mkdir(parents=True, exist_ok=True)
+    dataout_path = outpath / ymd
+    dataout_path.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Output directory: {outpath}")
+    logging.info(f"Runday output directory: {dataout_path}")
+
+    # -------------------------------------------------------------------------
+    # Step 1: Format dictionaries
+    # -------------------------------------------------------------------------
+    qa_format, flag_format, cmt_format, ctrk_format, DE_I_format = define_formats()
+    vars_rde, vars_oth, all_vars = define_variable_lists()
+    logging.info(f"Variable lists: {len(vars_rde)} RDE, {len(vars_oth)} other, {len(all_vars)} total")
+
+    # -------------------------------------------------------------------------
+    # Step 2: SQL Server engine + date parameters
+    # -------------------------------------------------------------------------
+    logging.info("Step 2: Creating SQL Server engine and computing date parameters...")
+    sqlserver_engine = get_sqlserver_engine(sql_secrets_json)
+    params = setup_date_parameters(sqlserver_engine, cfg)
+    runday = params["runday"]
+    rundt = params["rundt"]
+    xbetween = params["xbetween"]
+
+    # -------------------------------------------------------------------------
+    # Step 3: Dispose SQL Server engine (will recreate for upload)
+    # -------------------------------------------------------------------------
+    sqlserver_engine.dispose()
+
+    # -------------------------------------------------------------------------
+    # Step 4: Pull COB source data
+    # -------------------------------------------------------------------------
+    cob_engine = get_cob_connection(cob_conn_json)
+    dta_4946_0 = get_cob_data(cob_engine, xbetween, cob_database)
+
+    # -------------------------------------------------------------------------
+    # Step 5: Add SRF indicators
+    # -------------------------------------------------------------------------
+    dta_4946_0 = add_srf_indicators(dta_4946_0)
+
+    # -------------------------------------------------------------------------
+    # Step 6: Process population data
+    # -------------------------------------------------------------------------
+    dta_4946s, dta_4946s9s = process_population_data(dta_4946_0)
+    print_data_summary(dta_4946s)
+
+    # -------------------------------------------------------------------------
+    # Step 7: Aggregate by event
+    # -------------------------------------------------------------------------
+    dta_4946a_a, dta_4946a_q, dta_4946a_h = aggregate_by_event(dta_4946s)
+
+    # -------------------------------------------------------------------------
+    # Step 8: Get latest events
+    # -------------------------------------------------------------------------
+    dta_4946b_q, dta_4946b_h = get_latest_events(dta_4946a_q.copy(), dta_4946a_h.copy())
+
+    # -------------------------------------------------------------------------
+    # Step 9: Merge Quadient and Host
+    # -------------------------------------------------------------------------
+    dta_4946a_qh, dta_4946a_qh_nomap = merge_quadient_host(dta_4946b_q, dta_4946b_h, all_vars)
+
+    # -------------------------------------------------------------------------
+    # Step 10: Get closest matches
+    # -------------------------------------------------------------------------
+    dta_4946b_qh = get_closest_matches(dta_4946a_qh.copy())
+
+    # -------------------------------------------------------------------------
+    # Step 11: Accuracy checks
+    # -------------------------------------------------------------------------
+    dta_4946c_qh = perform_accuracy_checks(dta_4946b_qh)
+
+    # -------------------------------------------------------------------------
+    # Step 12: Create final output
+    # -------------------------------------------------------------------------
+    _4946_all = create_final_output(dta_4946c_qh, runday)
+
+    # -------------------------------------------------------------------------
+    # Step 13: Expand to borrower level
+    # -------------------------------------------------------------------------
+    _4946_all_expanded = expand_to_borrower_level(_4946_all)
+
+    # -------------------------------------------------------------------------
+    # Step 14: Test results summary (logged only)
+    # -------------------------------------------------------------------------
+    logging.info("Step 14: Generating test results summary...")
+    if len(_4946_all_expanded) > 0:
+        accu_cols = [c for c in _4946_all_expanded.columns
+                     if c.startswith("AccuM_") or c.startswith("AccuC_") or c.startswith("Accu_")]
+        for col in accu_cols:
+            if "_Num_" not in col:
+                x = _4946_all_expanded[col].apply(lambda v: apply_flag_format(v, flag_format)).value_counts(dropna=False)
+            else:
+                x = _4946_all_expanded[col].astype(int).value_counts(dropna=False)
+            logging.info(f"\n{col}:\n{x.to_string()}")
+
+    # -------------------------------------------------------------------------
+    # Step 15: Generate autocomplete data
+    # -------------------------------------------------------------------------
+    logging.info("Step 15: Generating autocomplete data...")
+    autosum_flags = [
+        ("AccuC_annualRt", "COB524"), ("AccuM_interestRate", "COB523"),
+        ("AccuM_primeRate", "COB523"), ("AccuM_statementDate", "COB523"),
+        ("AccuM_paymentDueDate", "COB523"), ("AccuM_prinAmt", "COB523"),
+        ("AccuM_accountNumber", "COB523"), ("AccuM_transitNumber", "COB523"),
+        ("AccuM_chequeFee", "COB523"), ("AccuM_processingFee", "COB523"),
+        ("AccuM_stopPaymentFee", "COB523"), ("AccuM_documentFee", "COB523"),
+        ("AccuM_Num_Of_Fail", "COB523"), ("AccuM_Accuracy_RDE", "COB523"),
+        ("AccuC_Num_Of_Fail", "COB524"), ("AccuC_Accuracy_RDE", "COB524"),
+        ("Accu_Num_Of_Fail", "COB522"), ("Accu_Accuracy_RDE", "COB522"),
+    ]
+
+    auto_summaries = []
+    for flag_name, cob_num in autosum_flags:
+        if flag_name in _4946_all_expanded.columns:
+            summary = make_autosum(_4946_all_expanded, flag_name, cob_num,
+                                   qa_format, cmt_format, ctrk_format, DE_I_format)
+            if len(summary) > 0:
+                auto_summaries.append(summary)
+
+    if auto_summaries:
+        autocomplete_all_new = pd.concat(auto_summaries, ignore_index=True)
+    else:
+        autocomplete_all_new = pd.DataFrame()
+    logging.info(f"Autocomplete summary: {len(autocomplete_all_new)} rows")
+
+    new_order = [
+        "RegulatoryName", "LOB", "ReportName", "ControlRisk", "TestType", "TestPeriod",
+        "ProductType", "RDE", "Segment", "Segment2", "Segment3", "Segment4", "Segment5",
+        "Segment6", "Segment7", "Segment8", "Segment9", "segment10",
+        "HoldoutFlag", "CommentCode", "Comments", "DateCompleted", "SnapDate", "Volume", "Bal",
+    ]
+    autocomplete_all_new = autocomplete_all_new.reindex(columns=new_order)
+
+    # -------------------------------------------------------------------------
+    # Step 16: Generate fail detail reports
+    # -------------------------------------------------------------------------
+    logging.info("Step 16: Generating fail detail reports...")
+    detail_configs = [
+        ("AccuC_annualRt", "annualInterestRate_q", "annualInterestRat2_h"),
+        ("AccuM_interestRate", "interestRate_q", "annualInterestRate_h"),
+        ("AccuM_primeRate", "primeRate_q", "primeRate_h"),
+        ("AccuM_statementDate", "statementDate_q", "statementDate_h"),
+        ("AccuM_paymentDueDate", "paymentDueDate_q", "paymentDueDate_h"),
+        ("AccuM_prinAmt", "principalAmount_q", "principalAmount_h"),
+        ("AccuM_chequeFee", "chequeFee_q", "chequeFee_h"),
+        ("AccuM_processingFee", "processingFee_q", "processingFee_h"),
+        ("AccuM_stopPaymentFee", "stopPaymentFee_q", "stopPaymentFee_h"),
+        ("AccuM_documentFee", "documentFee_q", "documentFee_h"),
+        ("AccuM_accountNumber", "accountNumber_q", "accountNumber_h"),
+        ("AccuM_transitNumber", "transitNumber_q", "transitNumber_h"),
+    ]
+
+    detail_reports = []
+    for rde_check, cob_col, cal_col in detail_configs:
+        detail = make_detail(_4946_all_expanded, rde_check, cob_col, cal_col,
+                             ctrk_format, DE_I_format, qa_format, cmt_format)
+        detail_reports.append(detail)
+
+    fail_det_all_4946 = pd.concat(detail_reports, ignore_index=True)
+    logging.info(f"Fail detail: {len(fail_det_all_4946)} rows")
+
+    # -------------------------------------------------------------------------
+    # Step 17: Create final fail detail file
+    # -------------------------------------------------------------------------
+    logging.info("Step 17: Creating final fail detail file...")
+    fd_cp = fail_det_all_4946.copy()
+    fd_cp["loanNumber"] = fd_cp["segmentNumber"].apply(lambda x: str(x) if pd.notna(x) else np.nan)
+    fd_cp["interestRate"] = fd_cp["interestRate_h"]
+    fd_cp["primeRate"] = fd_cp["primeRate_h"]
+    fd_cp["scheduleAInd"] = fd_cp["scheduleAInd_q"]
+
+    grp_cols = [
+        "RegulatoryName", "LOB", "ReportName", "ControlRisk", "TestPeriod", "ProductType",
+        "DateCompleted", "COB_Date", "processingCenter", "transitNumber", "accountNumber",
+        "loanNumber", "eventID", "upstreamEventIds", "clientNumber_mask", "Statement_Level",
+        "Application_Type", "Event_Level", "Category", "FormNumber", "interestRate", "primeRate",
+        "scheduleAInd", "statementDate", "applicationID", "transactionID", "productID",
+    ]
+
+    fd_cp_grp = fd_cp.groupby(grp_cols, dropna=False).agg(
+        Failed_RDE=("RDE", "size"),
+    ).reset_index()
+    FailDetail = fd_cp.merge(fd_cp_grp, on=grp_cols, how="left")
+
+    vars_oth1 = ["Failed_RDE"]
+    vars_oth2 = ["RDE", "COB_Value", "Comparison_Value"]
+    all_detail_vars = list(dict.fromkeys(grp_cols + vars_oth1 + vars_oth2))
+    FailDetail = FailDetail.reindex(columns=all_detail_vars).sort_values(grp_cols + vars_oth2 + vars_oth1)
+    logging.info(f"FailDetail: {len(FailDetail)} rows")
+
+    # -------------------------------------------------------------------------
+    # Step 18: Save output files locally and upload to S3
+    # -------------------------------------------------------------------------
+    logging.info("Step 18: Saving output files...")
+
+    # Autocomplete Excel
+    ac_excel_path = outpath / cfg.autocomplete_file
+    autocomplete_all_new.to_excel(str(ac_excel_path), index=False)
+    logging.info(f"Saved: {ac_excel_path} ({len(autocomplete_all_new)} rows)")
+
+    s3_ac_excel = s3_path("output", "cob", "4946", cfg.autocomplete_file)
+    upload_file_to_s3(spark, str(ac_excel_path), s3_ac_excel)
+
+    # Autocomplete parquet to S3
+    s3_ac_parquet = s3_path("output", "cob", "4946", cfg.persistent_ac_file)
+    write_parquet_to_s3(spark, autocomplete_all_new, s3_ac_parquet)
+
+    # Fail Detail Excel
+    fd_excel_path = outpath / cfg.fail_detail_file
+    FailDetail.to_excel(str(fd_excel_path), index=False)
+    logging.info(f"Saved: {fd_excel_path} ({len(FailDetail)} rows)")
+
+    s3_fd_excel = s3_path("output", "cob", "4946", cfg.fail_detail_file)
+    upload_file_to_s3(spark, str(fd_excel_path), s3_fd_excel)
+
+    # Fail Detail parquet to S3
+    s3_fd_parquet = s3_path("output", "cob", "4946", "Fail_Detail_orig_4946.parquet")
+    write_parquet_to_s3(spark, FailDetail, s3_fd_parquet)
+
+    # Expanded borrower-level file
+    expanded_filename = cfg.expanded_file_template.replace("{rundt}", rundt)
+    exp_excel_path = dataout_path / expanded_filename
+    _4946_all_expanded.to_excel(str(exp_excel_path), index=False)
+    logging.info(f"Saved: {exp_excel_path} ({len(_4946_all_expanded)} rows)")
+
+    s3_exp_excel = s3_path("output", "cob", "4946", ymd, expanded_filename)
+    upload_file_to_s3(spark, str(exp_excel_path), s3_exp_excel)
+
+    # Expanded parquet to S3
+    s3_exp_parquet = s3_path("output", "cob", "4946", ymd, expanded_filename.replace(".xlsx", ".parquet"))
+    write_parquet_to_s3(spark, _4946_all_expanded, s3_exp_parquet)
+
+    # Upload log file to S3
+    log_file = logpath / log_file_name
+    if log_file.exists():
+        s3_log = s3_path("logs", "cob", "4946", log_file_name)
+        upload_file_to_s3(spark, str(log_file), s3_log)
+
+    # -------------------------------------------------------------------------
+    # Step 19: Prepare and upload to SQL Server
+    # -------------------------------------------------------------------------
+    logging.info("Step 19: Preparing data for SQL Server upload...")
+    autocomplete_all_db = autocomplete_all_new.copy()
+    autocomplete_all_db["comments"] = autocomplete_all_db["Comments"]
+    autocomplete_all_db["Control Risk"] = autocomplete_all_db["ControlRisk"]
+
+    db_cols_cob_ac = [
+        "RegulatoryName", "LOB", "ReportName", "Control Risk", "TestType", "TestPeriod", "ProductType",
+        "RDE", "SubDE", "Segment", "Segment2", "Segment3", "Segment4", "Segment5", "Segment6", "Segment7",
+        "Segment8", "Segment9", "Segment10", "Segment11", "Segment12", "Segment13", "Segment14", "Segment15",
+        "Segment16", "Segment17", "Segment18", "Segment19", "Segment20", "HoldoutFlag", "CommentCode",
+        "comments", "Volume", "Bal", "Amount", "DateCompleted", "SnapDate",
+    ]
+
+    autocomplete_all_db, added = check_add_missing_cols(autocomplete_all_db, required_cols=db_cols_cob_ac, reorder=True)
+
+    db_cols_cob_ac_notnull = [
+        "RegulatoryName", "LOB", "ReportName", "Control Risk", "TestType", "TestPeriod", "ProductType",
+        "RDE", "HoldoutFlag", "CommentCode", "comments", "Volume", "DateCompleted", "SnapDate",
+    ]
+    check_required_notnull(autocomplete_all_db, db_cols_cob_ac_notnull, treat_empty_as_missing=True)
+
+    # -------------------------------------------------------------------------
+    # Step 20: SQL Server upload (guarded — flip do_sql_upload to True when ready)
+    # -------------------------------------------------------------------------
+    do_sql_upload = False  # flip to True when ready for production upload
+    if do_sql_upload:
+        logging.info("Step 20: Uploading to SQL Server...")
+        sqlserver_engine = get_sqlserver_engine(sql_secrets_json)
+        try:
+            num_cols = len(autocomplete_all_db.columns)
+            safe_chunk_size = 2100 // num_cols
+
+            df_to_upload = autocomplete_all_db.copy()
+            df_to_upload = df_to_upload.rename(columns={"LOB": "lob"})
+
+            df_to_upload.to_sql(
+                name=cfg.sql_table, con=sqlserver_engine,
+                if_exists="append", index=False, schema="dbo",
+                method="multi", chunksize=safe_chunk_size,
+            )
+            logging.info(f"Uploaded {len(df_to_upload)} rows to dbo.{cfg.sql_table} "
+                         f"(chunk size: {safe_chunk_size})")
+        except Exception as e:
+            logging.error(f"SQL Server upload failed: {e}")
+            raise
+        finally:
+            sqlserver_engine.dispose()
+    else:
+        logging.info("Step 20: SQL Server upload SKIPPED (do_sql_upload=False)")
+
+    # -------------------------------------------------------------------------
+    # Done
+    # -------------------------------------------------------------------------
+    logging.info("=" * 60)
+    logging.info("COB_Repository_Prod_4946 completed successfully.")
+    logging.info("All outputs saved locally AND to S3.")
+    logging.info("=" * 60)
+
+    # NOTE: Do NOT call spark.stop() — main.py handles session teardown.
+
+
+# =============================================================================
+# 12. Standalone mode (for local testing outside Airflow)
+# =============================================================================
+if __name__ == "__main__":
+    """
+    Standalone mode — creates its own Spark session and default job_conf.
+    """
+    try:
+        ss = get_spark_session("COB_4946_Standalone")
+
+        job_conf = {
+            "output": "sas/RSD/REG_DEV/COB/output/cob_repository/4946",
+            "logpath": "sas/RSD/REG_DEV/COB/log/cob_repository/4946",
+            "cob_conn_json": "COBConnection.json",
+            "sql_secrets_json": "sql_cob.json",
+            "cob_database": "dcb10_cob_repository",
+        }
+
+        process_cob_4946(ss, job_conf)
+
+    except Exception as e:
+        logging.error("=" * 60)
+        logging.error(f"SCRIPT FAILED: {e}", exc_info=True)
+        logging.error("=" * 60)
+        raise
+    finally:
+        ss.sparkContext._gateway.close()
+        ss.stop()
+        print("Spark session stopped.")
