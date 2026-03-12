@@ -131,13 +131,21 @@ def configure_s3a(spark: SparkSession) -> SparkSession:
 
 def get_spark_session(app_name: str = "C86_PA_Client360") -> SparkSession:
     """Returns a Spark session already wired up for S3."""
+    # Resolve the actual Python path so Spark executors can find it
+    python_path = sys.executable or shutil.which("python3") or "/usr/bin/python3"
+    os.environ.setdefault("PYSPARK_PYTHON", python_path)
+    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", python_path)
+
     spark = (
         SparkSession.builder
-        .master("yarn")
+        .master("local")
         .appName(app_name)
+        .config("spark.pyspark.python", python_path)
+        .config("spark.pyspark.driver.python", python_path)
         .getOrCreate()
     )
     configure_s3a(spark)
+    logging.info("PySpark python path set to: %s", python_path)
     return spark
 
 
