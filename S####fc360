@@ -160,27 +160,32 @@ def upload_file_to_s3(spark: SparkSession, local_path: str, s3_uri: str) -> None
 
 
 def _normalize_column_types(df: pd.DataFrame) -> pd.DataFrame:
-    
+    """Coerce column types so Spark createDataFrame doesn't choke on mixed types."""
     date_columns = ("DateCompleted", "SnapDate")
     string_exact_columns = (
         "RegulatoryName", "LOB", "ReportName", "ControlRisk",
         "TestType", "TestPeriod", "ProductType", "RDE",
         "HoldoutFlag", "CommentCode", "Comments",
     )
+    numeric_columns = ("Volume", "Amount")
 
     for col in df.columns:
         if col in date_columns:
+            # Ensure proper datetime64 (not date objects)
             df[col] = pd.to_datetime(df[col], errors="coerce")
         elif col.startswith("segment") or col in string_exact_columns:
             df[col] = df[col].fillna("").astype(str)
+        elif col in numeric_columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Remaining object columns -> string
     for col in df.columns:
         if df[col].dtype == "object":
-            df[col] = df[col].fillna("").astype(str)
-        elif df[col].apply(type).nunique() > 1:
-            try:
+            # Check if column contains date objects (not datetime64)
+            sample = df[col].dropna().head(1)
+            if len(sample) > 0 and isinstance(sample.iloc[0], date):
                 df[col] = pd.to_datetime(df[col], errors="coerce")
-            except Exception:
+            else:
                 df[col] = df[col].fillna("").astype(str)
 
     return df
@@ -1029,8 +1034,11 @@ def main(ss, job_conf) -> None:
     ac_path = cfg.outpath
 
     # Ini-check + date setup
-    ini_run = check_ini_run(ac_path, cfg.persistent_ac_file)
-    logging.info("ini_run determined: '%s'", ini_run)
+    ini_run_from_logic = check_ini_run(ac_path, cfg.persistent_ac_file)
+    # Force 'N' for testing
+    ini_run = "N"
+    logging.info("ini_run determined: '%s' (forced to 'N' for testing, logic was '%s')",
+                 ini_run, ini_run_from_logic)
 
     dates, _week_end_dt = setup_dates(ini_run)
     runday = dates["runday"]
