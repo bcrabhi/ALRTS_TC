@@ -1,0 +1,968 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import configparser
+import logging
+import os
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from math import ceil
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import pandas as pd
+import trino
+from trino.auth import BasicAuthentication
+
+
+
+# Context + Dates 
+
+
+@dataclass(frozen=True)
+class RunDates:
+    report_dt: date
+    start_dt: date
+    end_dt: date
+    week_start_dt: str      # quoted 'YYYY-MM-DD'
+    week_end_dt: str         # quoted 'YYYY-MM-DD'
+    week_end_dt_p1: str      # quoted 'YYYY-MM-DD'
+    pardt: str               # quoted 'YYYY-MM-DD'
+    label: str               # yyyymmdd
+
+
+@dataclass
+class Context:
+    conf: dict
+    d: RunDates
+    conn: Any
+    log: logging.Logger
+
+
+
+# Date helpers — exact SAS intnx parity
+
+
+
+def _quote(d: date) -> str:
+    return f"'{d.strftime('%Y-%m-%d')}'"
+
+
+def _intnx_week4_begin(d: date) -> date:
+    """SAS intnx('week.4', d, 0) — Wednesday on or before d."""
+    days_since_wed = (d.weekday() - 2) % 7  # Mon=0..Sun=6; Wed=2
+    return d - timedelta(days=days_since_wed)
+
+
+def _intnx_week3_end(d: date) -> date:
+    """SAS intnx('week.3', d, 0, 'e') — Monday ending the Tue-start week."""
+    days_since_tue = (d.weekday() - 1) % 7  # Tue=1
+    tue = d - timedelta(days=days_since_tue)
+    return tue + timedelta(days=6)  # Monday
+
+
+def compute_dates(today: Optional[date] = None) -> RunDates:
+    """
+    SAS:
+        %let end_dt = %eval(%sysfunc(intnx(week.4, &report_dt, 0)) - 2);
+        %let start_dt = ifc(&end_dt<=&week_end_dt_ini, &start_dt_ini, &end_dt-6);
+    """
+    if not today:
+        today = date.today()
+
+    report_dt = today
+    start_dt_ini = date(2022, 6, 30)
+    week_end_dt_ini = date(2022, 7, 25)
+
+    end_dt = _intnx_week4_begin(report_dt) - timedelta(days=2)
+    start_dt = start_dt_ini if end_dt <= week_end_dt_ini else (end_dt - timedelta(days=6))
+
+    return RunDates(
+        report_dt=report_dt,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        week_start_dt=_quote(start_dt),
+        week_end_dt=_quote(end_dt),
+        week_end_dt_p1=_quote(end_dt + timedelta(days=1)),
+        pardt=_quote(start_dt - timedelta(days=7)),
+        label=report_dt.strftime("%Y%m%d"),
+    )
+
+
+
+# Logging + Config + Trino connection
+
+
+def setup_logger(log_path: Path) -> logging.Logger:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("c86_cards")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+
+def load_config(path: Path = Path("config.ini")) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing config.ini at: {path}")
+
+    cfg = configparser.ConfigParser()
+    cfg.read(path)
+    c = cfg["TRINO"]
+
+    return {
+        "host": c.get("host"),
+        "port": c.getint("port", fallback=8443),
+        "user": c.get("username"),
+        "password": c.get("password", fallback=None) or None,
+        "http_scheme": c.get("http_schema", fallback="https"),
+        "catalog": c.get("catalog", fallback="edl0_im"),
+        "schema": c.get("schema", fallback="prod_brt0_ess"),
+        "source": c.get("source", fallback="c86_alerts_cards"),
+        "out_root": c.get("out_root", fallback="./output"),
+        "log_root": c.get("log_root", fallback="./log"),
+        # memory connector location
+        "mem_catalog": c.get("mem_catalog", fallback="memory"),
+        "mem_schema": c.get("mem_schema", fallback="default"),
+    }
+
+
+def get_conn(conf: dict):
+    auth = BasicAuthentication(conf["user"], conf["password"]) if conf.get("password") else None
+    return trino.dbapi.connect(
+        host=conf["host"],
+        port=conf["port"],
+        user=conf["user"],
+        http_scheme=conf["http_scheme"],
+        auth=auth,
+        catalog=conf["catalog"],
+        schema=conf["schema"],
+        source=conf["source"],
+    )
+
+
+
+# SQL helpers
+
+
+def exec_sql(ctx: Context, sql: str) -> None:
+    ctx.log.info("SQL: %s", " ".join(sql.split())[:180])
+    cur = ctx.conn.cursor()
+    cur.execute(sql)
+    # consume results if any (Trino driver can leave pending pages)
+    try:
+        _ = cur.fetchall()
+    except Exception:
+        pass
+
+
+def fetch_df(ctx: Context, sql: str) -> pd.DataFrame:
+    ctx.log.info("FETCH: %s", " ".join(sql.split())[:180])
+    cur = ctx.conn.cursor()
+    cur.execute(sql)
+    rows = cur.fetchall()
+    cols = [c[0] for c in cur.description] if cur.description else []
+    return pd.DataFrame(rows, columns=cols)
+
+
+def mem_fqtn(ctx: Context, table: str) -> str:
+    return f'{ctx.conf["mem_catalog"]}.{ctx.conf["mem_schema"]}.{table}'
+
+
+def lake_fqtn(ctx: Context, table: str) -> str:
+    """Prod tables live in conf["schema"] under conf["catalog"]."""
+    return f'{ctx.conf["catalog"]}.{ctx.conf["schema"]}.{table}'
+
+
+
+# Memory tables — push JOINs/dedup into Trino SQL for scalability
+
+
+def drop_memory_tables(ctx: Context) -> None:
+    for t in ["cards_alert_final_m", "xb80_cards_m", "cards_dec_pref_m", "fft0_inbox_m"]:
+        exec_sql(ctx, f"DROP TABLE IF EXISTS {mem_fqtn(ctx, t)}")
+
+
+def build_memory_tables(ctx: Context) -> None:
+    d = ctx.d
+
+    ctx.log.info("Dropping memory tables...")
+    drop_memory_tables(ctx)
+
+    
+    # xb80_cards_m  (FIX: accountId in SELECT, double-underscore table)
+    
+    exec_sql(
+        ctx,
+        f"""
+    CREATE TABLE {mem_fqtn(ctx, "xb80_cards_m")} AS
+    SELECT
+        event_activity_type,
+        source_event_id,
+        partition_date,
+        try_cast(event_timestamp AS timestamp) AS event_timestamp,
+        cast(regexp_replace(eventattributes['ess_process_timestamp'],'T|Z',' ') AS timestamp) AS ess_process_timestamp,
+        cast(regexp_replace(eventattributes['ess_src_event_timestamp'],'T|Z',' ') AS timestamp) AS ess_src_event_timestamp,
+        json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventId') AS eventId,
+        cast(regexp_replace(json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp'),'T|Z',' ') AS timestamp) AS eventTimestamp,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.accountId') AS accountId,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.alertType') AS alertType,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.customerId') AS customerId,
+        cast(json_extract_scalar(eventAttributes['eventPayload'], '$.thresholdAmount') AS decimal(10,2)) AS thresholdAmount,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.accountCurrency') AS accountCurrency,
+        cast(json_extract_scalar(eventAttributes['eventPayload'], '$.creditLimit') AS decimal(10,2)) AS creditLimit,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.maskedAccount') AS maskedAccount,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.decisionId') AS decisionId,
+        cast(json_extract_scalar(eventAttributes['eventPayload'], '$.alertAmount') AS decimal(10,2)) AS alertAmount
+    FROM {lake_fqtn(ctx, "xb80__credit_card_system_interface")}
+    WHERE
+        partition_date > {d.pardt}
+        AND event_activity_type = 'Alert Decision Cards'
+        AND json_extract_scalar(eventAttributes['eventPayload'], '$.alertType') = 'AVAIL_CREDIT_REMAINING'
+        AND event_timestamp BETWEEN {d.week_start_dt} AND {d.week_end_dt_p1}
+    """,
+    )
+
+    
+    # cards_dec_pref_m  (UNION in Trino; FIX: $.custID, $.maskAccountID,
+    #                    double-underscore tables, UNION not UNION ALL)
+    
+    exec_sql(
+        ctx,
+        f"""
+    CREATE TABLE {mem_fqtn(ctx, "cards_dec_pref_m")} AS
+    SELECT *
+    FROM (
+        SELECT
+            try_cast(event_timestamp AS timestamp) AS event_timestamp_p,
+            event_channel_type AS event_channel_type_p,
+            event_activity_type AS event_activity_type_p,
+            partition_date AS partition_date_p,
+            cast(regexp_replace(eventattributes['ess_process_timestamp'],'T|Z',' ') AS timestamp) AS ess_process_timestamp_p,
+            cast(regexp_replace(eventattributes['ess_src_event_timestamp'],'T|Z',' ') AS timestamp) AS ess_src_event_timestamp_p,
+            cast(regexp_replace(json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp'),'T|Z',' ') AS timestamp) AS eventTimestamp_p,
+            json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventActivityName') AS eventActivityName_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.preferenceType') AS preferenceType_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.clientID') AS clientId_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.isBusiness') AS isBusiness_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.sendAlertEligible') AS sendAlertEligible_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.active') AS active_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.threshold') AS threshold_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.custID') AS custId_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.account') AS account_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.maskAccountID') AS maskedAccountNo_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.externalAccount') AS externalAccount_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.productType') AS productType_p
+        FROM {lake_fqtn(ctx, "ffs0__client_alert_preferences_dep__initial_load")}
+        WHERE
+            event_activity_type IN ('Create Account Preference', 'Update Account Preference')
+            AND json_extract_scalar(eventAttributes['eventPayload'], '$.preferenceType') = 'AVAIL_CREDIT_REMAINING'
+            AND json_extract_scalar(eventAttributes['eventPayload'], '$.productType') = 'CREDIT_CARD'
+            AND partition_date = '20220324'
+
+        UNION
+
+        SELECT
+            try_cast(event_timestamp AS timestamp) AS event_timestamp_p,
+            event_channel_type AS event_channel_type_p,
+            event_activity_type AS event_activity_type_p,
+            partition_date AS partition_date_p,
+            cast(regexp_replace(eventattributes['ess_process_timestamp'],'T|Z',' ') AS timestamp) AS ess_process_timestamp_p,
+            cast(regexp_replace(eventattributes['ess_src_event_timestamp'],'T|Z',' ') AS timestamp) AS ess_src_event_timestamp_p,
+            cast(regexp_replace(json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp'),'T|Z',' ') AS timestamp) AS eventTimestamp_p,
+            json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventActivityName') AS eventActivityName_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.preferenceType') AS preferenceType_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.clientID') AS clientId_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.isBusiness') AS isBusiness_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.sendAlertEligible') AS sendAlertEligible_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.active') AS active_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.threshold') AS threshold_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.custID') AS custId_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.account') AS account_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.maskAccountID') AS maskedAccountNo_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.externalAccount') AS externalAccount_p,
+            json_extract_scalar(eventAttributes['eventPayload'], '$.productType') AS productType_p
+        FROM {lake_fqtn(ctx, "ffs0__client_alert_preferences_dep")}
+        WHERE
+            json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp') < {d.week_end_dt_p1}
+            AND event_activity_type IN ('Create Account Preference', 'Update Account Preference')
+            AND json_extract_scalar(eventAttributes['eventPayload'], '$.preferenceType') = 'AVAIL_CREDIT_REMAINING'
+            AND json_extract_scalar(eventAttributes['eventPayload'], '$.productType') = 'CREDIT_CARD'
+    ) p
+    """,
+    )
+
+    
+    # fft0_inbox_m  (FIX: $.alertSent included, double-underscore table)
+    
+    exec_sql(
+        ctx,
+        f"""
+    CREATE TABLE {mem_fqtn(ctx, "fft0_inbox_m")} AS
+    SELECT
+        cast(regexp_replace(eventattributes['ess_process_timestamp'],'T|Z',' ') AS timestamp) AS ess_process_timestamp_a,
+        cast(regexp_replace(eventattributes['ess_src_event_timestamp'],'T|Z',' ') AS timestamp) AS ess_src_event_timestamp_a,
+        event_activity_type AS event_activity_type_a,
+        source_event_id AS source_event_id_a,
+        partition_date AS partition_date_a,
+        try_cast(event_timestamp AS timestamp) AS event_timestamp_a,
+        json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventId') AS eventId_a,
+        cast(regexp_replace(json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventTimestamp'),'T|Z',' ') AS timestamp) AS eventTimestamp_a,
+        json_extract_scalar(eventAttributes['SourceEventHeader'], '$.eventActivityName') AS eventActivityName_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.alertSent') AS alertSent_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.sendInbox') AS sendInbox_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.alertType') AS alertType_a,
+        cast(json_extract_scalar(eventAttributes['eventPayload'], '$.thresholdAmount') AS decimal(12,2)) AS thresholdAmount_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.sendSMS') AS sendSMS_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.sendPush') AS sendPush_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.maskedAccount') AS maskedAccount_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.reasonCode') AS reasonCode_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.decisionId') AS decisionId_a,
+        cast(json_extract_scalar(eventAttributes['eventPayload'], '$.alertAmount') AS decimal(12,2)) AS alertAmount_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.accountId') AS accountId_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.account') AS account_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.accountProduct') AS accountProduct_a,
+        json_extract_scalar(eventAttributes['eventPayload'], '$.sendEmail') AS sendEmail_a
+    FROM {lake_fqtn(ctx, "fft0__alert_inbox_dep")}
+    WHERE
+        event_activity_type = 'Alert Delivery Audit'
+        AND json_extract_scalar(eventAttributes['eventPayload'], '$.alertType') = 'AVAIL_CREDIT_REMAINING'
+        AND event_timestamp >= {d.week_start_dt}
+    """,
+    )
+
+    
+    # cards_alert_final_m (JOIN + SAS-style DEDUPE in Trino)
+      
+    exec_sql(
+        ctx,
+        f"""
+    CREATE TABLE {mem_fqtn(ctx, "cards_alert_final_m")} AS
+    WITH pref AS (
+        SELECT *
+        FROM {mem_fqtn(ctx, "cards_dec_pref_m")}
+    ),
+    inbox_dedup AS (
+        SELECT *
+        FROM (
+            SELECT
+                i.*,
+                row_number() OVER (
+                    PARTITION BY decisionid_a
+                    ORDER BY eventTimestamp_a ASC
+                ) AS rn_inbox
+            FROM {mem_fqtn(ctx, "fft0_inbox_m")} i
+        )
+        WHERE rn_inbox = 1
+    ),
+    joined AS (
+        SELECT
+            x.*,
+            p.externalAccount_p,
+            p.custId_p,
+            p.isBusiness_p,
+            p.eventTimestamp_p,
+            p.event_timestamp_p,
+            p.event_channel_type_p,
+            p.event_activity_type_p,
+            p.partition_date_p,
+            p.ess_process_timestamp_p,
+            p.ess_src_event_timestamp_p,
+            p.eventActivityName_p,
+            p.preferenceType_p,
+            p.clientId_p,
+            p.sendAlertEligible_p,
+            p.active_p,
+            p.threshold_p,
+            p.account_p,
+            p.maskedAccountNo_p,
+            p.productType_p,
+            CASE
+                WHEN x.eventTimestamp IS NOT NULL
+                 AND p.eventTimestamp_p IS NOT NULL
+                 AND x.eventTimestamp >= p.eventTimestamp_p
+                THEN 'Y' ELSE 'N'
+            END AS dec_tm_ge_pref_tm
+        FROM {mem_fqtn(ctx, "xb80_cards_m")} x
+        LEFT JOIN pref p
+            ON x.accountId  = p.externalAccount_p
+           AND x.customerId = p.custId_p
+    ),
+    decisions_dedup AS (
+        SELECT *
+        FROM (
+            SELECT
+                j.*,
+                row_number() OVER (
+                    PARTITION BY decisionid
+                    ORDER BY
+                        eventTimestamp ASC,
+                        accountId ASC,
+                        customerId ASC,
+                        dec_tm_ge_pref_tm DESC,
+                        eventTimestamp_p DESC,
+                        externalAccount_p DESC
+                ) AS rn_decision
+            FROM joined j
+        )
+        WHERE rn_decision = 1
+    )
+    SELECT
+        d.*,
+        i.ess_process_timestamp_a,
+        i.ess_src_event_timestamp_a,
+        i.event_activity_type_a,
+        i.source_event_id_a,
+        i.partition_date_a,
+        i.event_timestamp_a,
+        i.eventId_a,
+        i.eventTimestamp_a,
+        i.eventActivityName_a,
+        i.alertSent_a,
+        i.sendInbox_a,
+        i.alertType_a,
+        i.thresholdAmount_a,
+        i.sendSMS_a,
+        i.sendPush_a,
+        i.maskedAccount_a,
+        i.reasonCode_a,
+        i.decisionId_a,
+        i.alertAmount_a,
+        i.accountId_a,
+        i.account_a,
+        i.accountProduct_a,
+        i.sendEmail_a
+    FROM decisions_dedup d
+    LEFT JOIN inbox_dedup i
+        ON d.decisionid = i.decisionid_a
+    """,
+    )
+
+    ctx.log.info("Memory tables built successfully.")
+
+
+
+# SLA parity + deterministic sampling + outputs
+
+
+def sla_bucket_parity(seconds: float | None) -> str:
+    """Alert_Time bucket labels — exact SAS string parity (singular 'second')."""
+    if seconds is None or (isinstance(seconds, float) and np.isnan(seconds)):
+        return "99 - Timestamp is missing"
+    if seconds < 0:
+        return "00 - Less than 0 second"
+    if seconds <= 1800:
+        return "01 - Less than or equal to 30 minutes"
+    if seconds <= 3600:
+        return "02 - Greater than 30 mins and less than or equal to 60 mins"
+    if seconds <= 3600 * 2:
+        return "03 - Greater than 1 hour and less than or equal to 2 hours"
+    if seconds <= 3600 * 3:
+        return "04 - Greater than 2 hours and less than or equal to 3 hours"
+    if seconds <= 3600 * 4:
+        return "05 - Greater than 3 hours and less than or equal to 4 hours"
+    if seconds <= 3600 * 5:
+        return "06 - Greater than 4 hours and less than or equal to 5 hours"
+    if seconds <= 3600 * 6:
+        return "07 - Greater than 5 hours and less than or equal to 6 hours"
+    if seconds <= 3600 * 7:
+        return "08 - Greater than 6 hours and less than or equal to 7 hours"
+    if seconds <= 3600 * 8:
+        return "09 - Greater than 7 hours and less than or equal to 8 hours"
+    if seconds <= 3600 * 9:
+        return "10 - Greater than 8 hours and less than or equal to 9 hours"
+    if seconds <= 3600 * 10:
+        return "11 - Greater than 9 hours and less than or equal to 10 hours"
+    if seconds <= 3600 * 24:
+        return "12 - Greater than 10 hours and less than or equal to 24 hours"
+    if seconds <= 3600 * 48:
+        return "13 - Greater than 1 day and less than or equal to 2 days"
+    if seconds <= 3600 * 72:
+        return "14 - Greater than 2 days and less than or equal to 3 days"
+    return "15 - Greater than 3 days"
+
+
+def deterministic_sample_10_per_day(
+    df: pd.DataFrame, day_col: str, seed: int = 123,
+) -> pd.DataFrame:
+    """
+    SAS: proc surveyselect method=srs sampsize=10; strata decision_date;
+    FIX: SAS uses sampsize=10, not 18.
+    """
+    rng = np.random.default_rng(seed)
+    parts: list[pd.DataFrame] = []
+    for _, g in df.groupby(day_col, dropna=False):
+        g = g.copy()
+        k = min(10, len(g))
+        if k == 0:
+            continue
+        idx = rng.choice(g.index.to_numpy(), size=k, replace=False)
+        parts.append(g.loc[idx])
+    return pd.concat(parts, ignore_index=True) if parts else df.iloc[0:0].copy()
+
+
+def custid_mask(cid: Any) -> str:
+    """
+    SAS: '******'||substr(customerid,7,3)
+    FIX: 6 asterisks (not 5). SAS substr is 1-based pos=7 len=3 => Python [6:9].
+    """
+    s = "" if cid is None or (isinstance(cid, float) and np.isnan(cid)) else str(cid)
+    tail = s[6:9] if len(s) >= 9 else s[6:]
+    return "******" + tail
+
+
+def snapdate_week_3_end(decision_date: date) -> date:
+    """SAS intnx('week.3', date, 0, 'e') — Tuesday-based week end => Monday."""
+    return _intnx_week3_end(decision_date)
+
+
+def segment10(d: date) -> str:
+    """SAS put(decision_date, yymmn6.) => 'YYYYMM'."""
+    return d.strftime("%Y%m") if pd.notna(d) else ""
+
+
+
+# AC Week table builder (SAS-parity column frame)
+
+
+def build_ac_week_table(ac_week_raw: pd.DataFrame) -> pd.DataFrame:
+    """SAS: create table dataout.Alert_Cards_AC_week — standardized columns."""
+    return pd.DataFrame({
+        "RegulatoryName": "C86",
+        "LOB": "Credit Cards",
+        "ReportName": "C86 Alerts",
+        "ControlRisk": ac_week_raw["ControlRisk"],
+        "TestType": ac_week_raw["TestType"],
+        "TestPeriod": "Portfolio",
+        "ProductType": "Credit Cards",
+        "RDE": ac_week_raw["RDE"],
+        "SubDE": " ",
+        "Segment": " ",
+        "Segment2": " ",
+        "Segment3": " ",
+        "Segment4": " ",
+        "Segment5": " ",
+        "Segment6": " ",
+        "Segment7": " ",
+        "Segment8": " ",
+        "Segment9": " ",
+        "Segment10": ac_week_raw["Segment10"],
+        "HoldoutFlag": "N",
+        "CommentCode": ac_week_raw["CommentCode"],
+        "Comments": "",
+        "Volume": ac_week_raw["Volume"],
+        "Bal": ac_week_raw["Bal"],
+        "Amount": ac_week_raw["Amount"],
+        "DateCompleted": ac_week_raw["DateCompleted"],
+        "SnapDate": ac_week_raw["SnapDate"],
+    })
+
+
+
+# build_pandas_outputs — all pandas transforms after SQL-side work
+
+
+def build_pandas_outputs(ctx: Context) -> dict[str, pd.DataFrame]:
+    df = fetch_df(ctx, f"SELECT * FROM {mem_fqtn(ctx, 'cards_alert_final_m')}")
+
+    # Trino returns unquoted identifiers as lower-case; normalize once.
+    df.columns = [c.lower() for c in df.columns]
+
+    # Required column checks
+    required = {"eventtimestamp", "eventtimestamp_a", "decisionid", "decisionid_a"}
+    missing = sorted([c for c in required if c not in df.columns])
+    if missing:
+        raise KeyError(
+            f"Missing required columns: {missing}. "
+            f"Available columns (sample): {list(df.columns)[:25]}"
+        )
+
+    # Timestamps
+    df["decision_ts"] = pd.to_datetime(df["eventtimestamp"], errors="coerce")
+    df["sent_ts"] = pd.to_datetime(df["eventtimestamp_a"], errors="coerce")
+    df["time_diff"] = (df["sent_ts"] - df["decision_ts"]).dt.total_seconds()
+    df["sla_ind"] = np.where(df["time_diff"].notna() & (df["time_diff"] <= 1800), "Y", "N")
+    df["alert_time"] = df["time_diff"].apply(sla_bucket_parity)
+    df["decision_date"] = df["decision_ts"].dt.date
+
+    df["lob"] = "Credit Cards"
+    df["producttype"] = "Credit Cards"
+
+    # Threshold limit check
+    # SAS: ifc(alertAmount <= thresholdAmount, 'Y', 'N')
+    if "alertamount" in df.columns and "thresholdamount" in df.columns:
+        df["alertamount_num"] = pd.to_numeric(df["alertamount"], errors="coerce")
+        df["thresholdamount_num"] = pd.to_numeric(df["thresholdamount"], errors="coerce")
+        df["threshold_limit_check"] = np.where(
+            df["alertamount_num"].notna()
+            & df["thresholdamount_num"].notna()
+            & (df["alertamount_num"] <= df["thresholdamount_num"]),
+            "Y",
+            "N",
+        )
+    else:
+        df["threshold_limit_check"] = "N"
+
+    # Completeness flag
+    df["found_missing"] = np.where(
+        df["eventtimestamp_a"].isna() | df["eventtimestamp"].isna(), "Y", ""
+    )
+
+    # SAS delete condition: if isbusiness_p='true' and dec_tm_ge_pref_tm='Y' then delete;
+    # FIX: compare string "true" not boolean True
+    if "isbusiness_p" in df.columns and "dec_tm_ge_pref_tm" in df.columns:
+        df = df[
+            ~((df["isbusiness_p"] == "true") & (df["dec_tm_ge_pref_tm"] == "Y"))
+        ].copy()
+
+    # Base samples (SAS: sampsize=10, FIX from 18)
+    base_samples = deterministic_sample_10_per_day(df, "decision_date", seed=123)
+
+    # Helper functions
+    def event_month(d: date) -> str:
+        return d.strftime("%Y%m") if pd.notna(d) else ""
+
+    def event_week_ending(d: date) -> date:
+        """FIX: actual implementation (was placeholder 'return d')."""
+        return snapdate_week_3_end(d)
+
+    
+    # Aggregation table builder (SAS PROC SQL parity)
+    
+    def agg_table(
+        src: pd.DataFrame,
+        controlrisk: str,
+        testtype: str,
+        rde: str,
+        comment_logic: str,
+    ) -> pd.DataFrame:
+        tmp = src.copy()
+
+        # CommentCode logic — must match SAS direction exactly
+        if comment_logic == "threshold_limit_check":
+            # SAS: case when threshold_limit_check = 'Y' then 'COM16' else 'COM19'
+            tmp["CommentCode"] = np.where(tmp["threshold_limit_check"] == "Y", "COM16", "COM19")
+        elif comment_logic == "sla_ind":
+            # SAS: case when SLA_Ind = 'Y' then 'COM16' else 'COM19'
+            tmp["CommentCode"] = np.where(tmp["sla_ind"] == "Y", "COM16", "COM19")
+        elif comment_logic == "decisionid_a_blank":
+            # SAS: case when decisionId_a ^= '' then 'COM16' else 'COM19'
+            # FIX: NOT BLANK => COM16 (pass), BLANK/NULL => COM19 (fail)
+            tmp["CommentCode"] = np.where(
+                tmp["decisionid_a"].notna() & (tmp["decisionid_a"].astype(str).str.strip() != ""),
+                "COM16",
+                "COM19",
+            )
+        else:
+            raise ValueError(f"Unsupported comment logic: {comment_logic}")
+
+        tmp["ControlRisk"] = controlrisk
+        tmp["TestType"] = testtype
+        tmp["RDE"] = rde
+        tmp["Segment10"] = tmp["decision_date"].apply(segment10)
+        tmp["DateCompleted"] = ctx.d.report_dt
+        tmp["SnapDate"] = tmp["decision_date"].apply(
+            lambda d: snapdate_week_3_end(d) if pd.notna(d) else pd.NaT
+        )
+
+        grp = tmp.groupby(
+            ["ControlRisk", "TestType", "RDE", "CommentCode",
+             "Segment10", "DateCompleted", "SnapDate"],
+            dropna=False,
+            as_index=False,
+        ).agg(
+            Volume=("decisionid", "size"),
+            Bal=("alertamount_num" if "alertamount_num" in tmp.columns else "alertamount", "sum"),
+            Amount=("thresholdamount_num" if "thresholdamount_num" in tmp.columns else "thresholdamount", "sum"),
+        )
+        return grp
+
+    # FIX: RDE names match SAS exactly (Alert010_, Alert011_, Alert012_)
+    accuracy_grp = agg_table(
+        base_samples,
+        controlrisk="Accuracy",
+        testtype="Sample",
+        rde="Alert010_Accuracy_Available_Credit",
+        comment_logic="threshold_limit_check",
+    )
+
+    timeliness_grp = agg_table(
+        df,
+        controlrisk="Timeliness",
+        testtype="Anomaly",
+        rde="Alert011_Timeliness_SLA",
+        comment_logic="sla_ind",
+    )
+
+    completeness_grp = agg_table(
+        df,
+        controlrisk="Completeness",
+        testtype="Reconciliation",
+        rde="Alert012_Completeness_All_Clients",
+        comment_logic="decisionid_a_blank",
+    )
+
+    ac_week_raw = pd.concat([accuracy_grp, timeliness_grp, completeness_grp], ignore_index=True)
+
+    # Build final AC-week table with SAS columns
+    ac_week_final = build_ac_week_table(ac_week_raw)
+
+    # Autocomplete dataset (downstream SQL Server insert)
+    autocomplete = ac_week_final.copy()
+
+    
+    # Fail detail tables (parity fields)
+    
+
+    # Completeness_Fail: decisionid_a missing
+    completeness_fail = df[df["decisionid_a"].isna() | (df["decisionid_a"] == "")].copy()
+    completeness_fail["event_month"] = completeness_fail["decision_date"].apply(event_month)
+    completeness_fail["reporting_date"] = ctx.d.report_dt
+    completeness_fail["event_week_ending"] = completeness_fail["decision_date"].apply(event_week_ending)
+    completeness_fail["lob"] = "Credit Cards"
+    completeness_fail["product"] = "Credit Cards"
+    completeness_fail["account_number"] = completeness_fail["accountid"]
+    completeness_fail["available_credit"] = completeness_fail["alertamount"]
+    completeness_fail["event_date"] = completeness_fail["decision_date"]
+    completeness_fail["custid_mask"] = completeness_fail["customerid"].apply(custid_mask)
+    completeness_fail = completeness_fail[
+        ["event_month", "reporting_date", "event_week_ending", "lob", "product",
+         "account_number", "thresholdamount", "available_credit", "decisionid",
+         "event_date", "custid_mask"]
+    ]
+
+    # Timeliness_Fail: SLA_Ind != Y
+    timeliness_fail = df[df["sla_ind"] != "Y"].copy()
+    timeliness_fail["event_month"] = timeliness_fail["decision_date"].apply(event_month)
+    timeliness_fail["reporting_date"] = ctx.d.report_dt
+    timeliness_fail["event_week_ending"] = timeliness_fail["decision_date"].apply(event_week_ending)
+    timeliness_fail["lob"] = "Credit Cards"
+    timeliness_fail["product"] = "Credit Cards"
+    timeliness_fail["account_number"] = timeliness_fail["accountid"]
+    timeliness_fail["available_credit"] = timeliness_fail["alertamount"]
+    timeliness_fail["event_date"] = timeliness_fail["decision_date"]
+    timeliness_fail["decision_timestamp"] = timeliness_fail["decision_ts"]
+    timeliness_fail["sent_timestamp"] = timeliness_fail["sent_ts"]
+    timeliness_fail["total_minutes"] = np.where(
+        timeliness_fail["time_diff"].notna(),
+        timeliness_fail["time_diff"].apply(lambda x: ceil(x / 60.0)),
+        np.nan,
+    )
+    timeliness_fail["custid_mask"] = timeliness_fail["customerid"].apply(custid_mask)
+    timeliness_fail = timeliness_fail[
+        ["event_month", "reporting_date", "event_week_ending", "lob", "product",
+         "account_number", "thresholdamount", "available_credit", "decisionid",
+         "event_date", "decision_timestamp", "sent_timestamp", "total_minutes",
+         "custid_mask"]
+    ]
+
+    # Accuracy_Fail: base_samples where threshold_limit_check != Y
+    accuracy_fail = base_samples[base_samples["threshold_limit_check"] != "Y"].copy()
+    accuracy_fail["event_month"] = accuracy_fail["decision_date"].apply(event_month)
+    accuracy_fail["reporting_date"] = ctx.d.report_dt
+    accuracy_fail["event_week_ending"] = accuracy_fail["decision_date"].apply(event_week_ending)
+    accuracy_fail["lob"] = "Credit Cards"
+    accuracy_fail["product"] = "Credit Cards"
+    accuracy_fail["account_number"] = accuracy_fail["accountid"]
+    accuracy_fail["decision"] = "AlertDecision"
+    accuracy_fail["available_credit"] = accuracy_fail["alertamount"]
+    accuracy_fail["event_date"] = accuracy_fail["decision_date"]
+    accuracy_fail["custid_mask"] = accuracy_fail["customerid"].apply(custid_mask)
+    accuracy_fail = accuracy_fail[
+        ["event_month", "reporting_date", "event_week_ending", "lob", "product",
+         "account_number", "decision", "thresholdamount", "available_credit",
+         "decisionid", "event_date", "custid_mask"]
+    ]
+
+    
+    # Diagnostic logging (SAS proc freq / proc sql equivalents)
+    
+    ctx.log.info("Total records: %d  Distinct decisionId: %d",
+                 len(df), df["decisionid"].nunique())
+
+    if "dec_tm_ge_pref_tm" in df.columns:
+        ctx.log.info("dec_tm_ge_pref_tm distribution:\n%s",
+                     df["dec_tm_ge_pref_tm"].value_counts(dropna=False).to_string())
+    if "isbusiness_p" in df.columns:
+        ctx.log.info("isbusiness_p distribution:\n%s",
+                     df["isbusiness_p"].value_counts(dropna=False).to_string())
+    ctx.log.info("threshold_limit_check distribution:\n%s",
+                 df["threshold_limit_check"].value_counts(dropna=False).to_string())
+    ctx.log.info("sla_ind distribution:\n%s",
+                 df["sla_ind"].value_counts(dropna=False).to_string())
+    ctx.log.info("alert_time distribution:\n%s",
+                 df["alert_time"].value_counts().sort_index().to_string())
+    ctx.log.info("found_missing distribution:\n%s",
+                 df["found_missing"].value_counts(dropna=False).to_string())
+    ctx.log.info("base_samples rows: %d", len(base_samples))
+
+    # Cards_Alert_Time_Count (SAS: ac.Cards_Alert_Time_Count)
+    alert_time_count = (
+        df.groupby("alert_time", dropna=False)
+        .size()
+        .reset_index(name="Decision_Count")
+        .sort_values("alert_time")
+    )
+
+    return {
+        "alert_cards_ac_week": ac_week_final,
+        "alert_cards_completeness_detail": completeness_fail,
+        "alert_cards_timeliness_detail": timeliness_fail,
+        "alert_cards_accuracy_detail": accuracy_fail,
+        "autocomplete_alert_cards": autocomplete,
+        "cards_alert_time_count": alert_time_count,
+    }
+
+
+
+# File outputs
+
+
+def write_outputs(ctx: Context, dfs: dict[str, pd.DataFrame]) -> None:
+    out_root = Path(ctx.conf["out_root"]) / ctx.d.label
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    dfs["alert_cards_ac_week"].to_excel(out_root / "Alert_Cards_AC_week.xlsx", index=False)
+    dfs["alert_cards_completeness_detail"].to_excel(
+        out_root / "Alert_Cards_Completeness_Detail.xlsx", index=False
+    )
+    dfs["alert_cards_timeliness_detail"].to_excel(
+        out_root / "Alert_Cards_Timeliness_Detail.xlsx", index=False
+    )
+    dfs["alert_cards_accuracy_detail"].to_excel(
+        out_root / "Alert_Cards_Accuracy_Detail.xlsx", index=False
+    )
+    dfs["autocomplete_alert_cards"].to_excel(
+        out_root / "Autocomplete_Alert_Cards.xlsx", index=False
+    )
+
+    # Cards_Alert_Time_Count (SAS: ac.Cards_Alert_Time_Count)
+    ac_root = Path(ctx.conf["out_root"])
+    dfs["cards_alert_time_count"].to_csv(
+        ac_root / "Cards_Alert_Time_Count.csv", index=False
+    )
+
+    # History append (SAS: proc append + union + sort by SnapDate)
+
+    history_path = ac_root / "alert_cards_ac.csv"
+    ac_week = dfs["alert_cards_ac_week"].copy()
+    ac_week["SnapDate"] = pd.to_datetime(ac_week["SnapDate"], errors="coerce")
+
+    if history_path.exists():
+        old = pd.read_csv(history_path, parse_dates=["DateCompleted", "SnapDate"])
+        old["SnapDate"] = pd.to_datetime(old["SnapDate"], errors="coerce")
+    else:
+        old = ac_week.iloc[0:0].copy()
+
+    # Remove old rows whose SnapDate appears in new data, then combine
+    new_snaps = set(ac_week["SnapDate"].dropna().unique())
+    old_keep = old[~old["SnapDate"].isin(new_snaps)].copy()
+    merged = pd.concat([ac_week, old_keep], ignore_index=True)
+    merged = merged.sort_values(by=["SnapDate"], na_position="last")
+    merged.to_csv(history_path, index=False)
+    ctx.log.info("History rows: %d (written to %s)", len(merged), history_path)
+
+    ctx.log.info("Wrote outputs to: %s", out_root)
+
+
+
+# Optional: SQL Server insert for autocomplete
+
+
+def insert_autocomplete_sqlserver(ctx: Context, df: pd.DataFrame) -> None:
+    cfg = ctx.conf.get("sqlserver")
+    if not cfg or not cfg.get("enabled"):
+        ctx.log.info("SQL Server insert disabled.")
+        return
+
+    try:
+        import pyodbc  # type: ignore
+    except Exception as e:
+        raise RuntimeError("pyodbc not available in this runtime.") from e
+
+    if not cfg["server"] or not cfg["database"] or not cfg["table"]:
+        raise ValueError("SQLSERVER config missing server/database/table.")
+
+    if cfg.get("trusted_connection"):
+        conn_str = (
+            f"DRIVER={{{cfg['driver']}}};"
+            f"SERVER={cfg['server']};"
+            f"DATABASE={cfg['database']};"
+            "Trusted_Connection=yes;"
+            "Encrypt=yes;TrustServerCertificate=yes;"
+        )
+    else:
+        conn_str = (
+            f"DRIVER={{{cfg['driver']}}};"
+            f"SERVER={cfg['server']};"
+            f"DATABASE={cfg['database']};"
+            f"UID={cfg['username']};PWD={cfg['password']};"
+            "Encrypt=yes;TrustServerCertificate=yes;"
+        )
+
+    cols = list(df.columns)
+    placeholders = ",".join(["?"] * len(cols))
+    col_list = ",".join([f"[{c}]" for c in cols])
+    sql = f"INSERT INTO {cfg['table']} ({col_list}) VALUES ({placeholders})"
+
+    ctx.log.info("Inserting %d rows into %s", len(df), cfg["table"])
+    with pyodbc.connect(conn_str) as cn:
+        cur = cn.cursor()
+        cur.fast_executemany = True
+        cur.executemany(sql, df.where(pd.notna(df), None).values.tolist())
+        cn.commit()
+
+
+
+# MAIN
+
+
+def build_context() -> Context:
+    conf = load_config(Path("config.ini"))
+    d = compute_dates()
+
+    log_path = Path(conf["log_root"]) / f"C86_Alerts_Cards_{d.label}.log"
+    logger = setup_logger(log_path)
+
+    logger.info("Program: C86_Alerts_Cards (Memory Connector + Autocomplete)")
+    logger.info("User: %s", os.getenv("USER", "unknown"))
+    logger.info("Catalog: %s | Schema: %s", conf["catalog"], conf["schema"])
+    logger.info("Report date: %s", d.report_dt)
+    logger.info(
+        "Date window: start=%s end=%s end+1=%s pardt=%s",
+        d.week_start_dt, d.week_end_dt, d.week_end_dt_p1, d.pardt,
+    )
+
+    conn = get_conn(conf)
+    return Context(conf=conf, d=d, conn=conn, log=logger)
+
+
+def main() -> int:
+    ctx = build_context()
+
+    build_memory_tables(ctx)
+    dfs = build_pandas_outputs(ctx)
+    if dfs is None:
+        raise RuntimeError("build_pandas_outputs returned None - check for swallowed exception inside the function")
+    write_outputs(ctx, dfs)
+
+    # Optional DB insert for autocomplete
+    insert_autocomplete_sqlserver(ctx, dfs["autocomplete_alert_cards"])
+
+    ctx.log.info("DONE")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
