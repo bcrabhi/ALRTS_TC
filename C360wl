@@ -133,7 +133,7 @@ LOGPATH = Path(“sas/RSD/REG_DEV/C86/log/product_appropriateness/client360”)
 YMD = datetime.now().strftime(’%Y%m%d’)
 LOG_FILE_NAME = f”C86_pa_client360_{YMD}.log”
 
-# ── SASLogger replaces logging.basicConfig + FileHandler + StreamHandler ──
+# – SASLogger replaces logging.basicConfig + FileHandler + StreamHandler –
 
 # SASLogger creates the log directory, opens the file, and writes the
 
@@ -339,7 +339,7 @@ try:
     dates, week_end_dt = setup_dates(ini_run)
     runday = dates["runday"]
 
-    # Log macro variable values — mirrors %put &=wk_start &=wk_end &=runday &=ini_run
+    # Log macro variable values - mirrors %put &=wk_start &=wk_end &=runday &=ini_run
     sas_log.log_put(
         WK_START=dates['wk_start'],
         WK_START_MIN14=dates['wk_start_min14'],
@@ -514,7 +514,7 @@ source=“teradata”,
     # -------------------------------------------------------------------------
     # --- 7. Join Tool Info ---
     # -------------------------------------------------------------------------
-    with sas_log.step("Step 7: Join tool info — create c360_detail") as step:
+    with sas_log.step("Step 7: Join tool info - create c360_detail") as step:
 
         c360_detail = pd.merge(c360_detail_pre, tracking_tool_use, on='OPPOR_ID', how='left')
 
@@ -538,7 +538,7 @@ source=“teradata”,
     # -------------------------------------------------------------------------
     # --- 8. PROC FREQ replication ---
     # -------------------------------------------------------------------------
-    with sas_log.step("Step 8: PROC FREQ — c360_detail LOB") as step:
+    with sas_log.step("Step 8: PROC FREQ - c360_detail LOB") as step:
 
         # Print the frequency table to stdout exactly as before
         print(c360_detail['LOB'].value_counts(dropna=False))
@@ -553,7 +553,7 @@ source=“teradata”,
     # -------------------------------------------------------------------------
     # --- 9. Format ($Stagefmt) definition ---
     # -------------------------------------------------------------------------
-    with sas_log.step("Step 9: PROC FORMAT — $Stagefmt") as step:
+    with sas_log.step("Step 9: PROC FORMAT - $Stagefmt") as step:
 
         stage_format_map = {
             "Démarche exploratoire/Comprendre le besoin": "11.Démarche exploratoire/Comprendre le besoin",
@@ -737,7 +737,7 @@ source=“teradata”,
     # -------------------------------------------------------------------------
     # --- 16. Format ($cs_cmt) definition ---
     # -------------------------------------------------------------------------
-    with sas_log.step("Step 16: PROC FORMAT — $cs_cmt") as step:
+    with sas_log.step("Step 16: PROC FORMAT - $cs_cmt") as step:
 
         cs_cmt_map = {
             'COM1':  'Test population (less samples)',
@@ -854,7 +854,7 @@ source=“teradata”,
     # -------------------------------------------------------------------------
     # --- 19. Create AC Assessment (pa_C360_autocomplete_tool_use) ---
     # -------------------------------------------------------------------------
-    with sas_log.step("Step 19: Create AC assessment — pa_c360_autocomplete_tool_use") as step:
+    with sas_log.step("Step 19: Create AC assessment - pa_c360_autocomplete_tool_use") as step:
 
         df_agg = tmp_pa_c360_4ac.copy()
 
@@ -959,7 +959,7 @@ source=“teradata”,
     # -------------------------------------------------------------------------
     # --- 21. Create Tool Count Assessment ---
     # -------------------------------------------------------------------------
-    with sas_log.step("Step 21: Create Tool Count Assessment — pa_c360_autocomplete_count_tool") as step:
+    with sas_log.step("Step 21: Create Tool Count Assessment - pa_c360_autocomplete_count_tool") as step:
 
         df_agg_count = tmp_pa_c360_4ac_count.copy()
 
@@ -988,7 +988,7 @@ source=“teradata”,
         ]
 
         # Fill NaNs one time
-        # segment9 is left as empty string '' — excluded from fillna to preserve blank
+        # segment9 is left as empty string '' - excluded from fillna to preserve blank
         fill_cols_count = [c for c in group_by_cols_count if c != 'segment9']
         df_agg_count[fill_cols_count] = df_agg_count[fill_cols_count].fillna('Missing')
 
@@ -1042,7 +1042,7 @@ source=“teradata”,
 
         ac_pa_client360_autocomplete = combine_pa_autocomplete.copy()
 
-        # Log as PROC APPEND (two datasets stacked — mirrors SAS proc append)
+        # Log as PROC APPEND (two datasets stacked - mirrors SAS proc append)
         step.log_append(
             base_name="ac.pa_client360_autocomplete",
             data_name="combine_pa_autocomplete",
@@ -1083,7 +1083,7 @@ source=“teradata”,
     # -------------------------------------------------------------------------
     # --- 24. Export Autocomplete to Excel ---
     # -------------------------------------------------------------------------
-    with sas_log.step("Step 24: PROC EXPORT — autocomplete Excel") as step:
+    with sas_log.step("Step 24: PROC EXPORT - autocomplete Excel") as step:
 
         excel_path = AC_PATH / "pa_client360_autocomplete.xlsx"
         _t0 = time.time()
@@ -1109,7 +1109,7 @@ source=“teradata”,
     # -------------------------------------------------------------------------
     # --- 25. Create and Export Detail File ---
     # -------------------------------------------------------------------------
-    with sas_log.step("Step 25: PROC EXPORT — detail Excel") as step:
+    with sas_log.step("Step 25: PROC EXPORT - detail Excel") as step:
 
         # Based on tmp_pa_C360_4ac_count_pre
         df_detail = tmp_pa_c360_4ac_count_pre.copy()
@@ -1208,7 +1208,7 @@ source=“teradata”,
     # -------------------------------------------------------------------------
     # --- 26. Export Pivot Table ---
     # -------------------------------------------------------------------------
-    with sas_log.step("Step 26: PROC EXPORT — Pivot Excel") as step:
+    with sas_log.step("Step 26: PROC EXPORT - Pivot Excel") as step:
 
         pivot_excel_path = AC_PATH / "pa_client360_Pivot.xlsx"
 
