@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 # =============================================================================
 
 # C86 Client360 Product Appropriateness - SAS to Python Migration
@@ -556,11 +558,11 @@ source=“teradata”,
     with sas_log.step("Step 9: PROC FORMAT - $Stagefmt") as step:
 
         stage_format_map = {
-            "Démarche exploratoire/Comprendre le besoin": "11.Démarche exploratoire/Comprendre le besoin",
+            "D\u00e9marche exploratoire/Comprendre le besoin": "11.D\u00e9marche exploratoire/Comprendre le besoin",
             "Discovery/Understand Needs":                 "12.Discovery/Understand Needs",
             "Review Options":                             "21.Review Options",
             "Present/Gain Commitment":                    "31.Present/Gain Commitment",
-            "Intégration commencée":                      "41.Intégration commencée",
+            "Int\u00e9gration commenc\u00e9e":                      "41.Int\u00e9gration commenc\u00e9e",
             "Onboarding Started":                         "42.Onboarding Started",
             "Opportunity Lost":                           "51.Opportunity Lost",
             "Opportunity Won":                            "61.Opportunity Won",
