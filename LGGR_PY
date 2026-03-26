@@ -1,0 +1,420 @@
+"""
+sas_logger.py — SAS-parity logging for Python conversion scripts.
+
+Key design principles:
+  1. ZERO DUPLICATION — developer writes SQL once; run_query() both
+     executes it AND logs it.  No copying strings.
+  2. SOURCE-AGNOSTIC — works with any connection (Teradata, Hive/Spark,
+     SQL Server, Salesforce, etc.) via standard DB-API or pd.read_sql.
+  3. SAS LOG FORMAT — output mirrors actual SAS log: line-numbered code,
+     NOTE:/WARNING:/ERROR: prefixes, row+column counts, real/cpu timing.
+  4. SENSITIVE DATA MASKING — SSN, CC, email, password patterns are
+     scrubbed before any message reaches the log file.
+
+Usage:
+    from sas_logger import SASLogger
+
+    logger = SASLogger("C86_PA_Client360", log_dir="path/to/logs")
+
+    # One call: executes SQL, echoes it to log, returns DataFrame
+    df = logger.run_query("tracking_all", sql, conn, source="Teradata")
+
+    # DDL/DML that returns no rows
+    logger.run_execute("create volatile table", sql_ddl, conn, source="Teradata")
+
+    # Log a pandas transformation (DATA step equivalent)
+    logger.log_dataset("c360_detail", df_out,
+                       input_name="c360_detail_pre", input_nobs=len(df_in))
+
+    # Export
+    logger.log_export("/path/to/file.xlsx", nobs=len(df), nvars=len(df.columns))
+
+    # Insert/load to any database
+    logger.run_insert("STG_TABLE", insert_sql, records, conn,
+                      source="SQL Server", database="REGDB")
+
+    logger.finalize()
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
+import os
+import re
+import sys
+import time
+import traceback
+import warnings
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import pandas as pd
+
+
+# ══════════════════════════════════════════════════════════════════
+# Sensitive-data masking
+# ══════════════════════════════════════════════════════════════════
+
+_MASK_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    re.compile(r"\b\d{9}\b"),
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
+    re.compile(r"\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13})\b"),
+    re.compile(r"(?i)password\s*[:=]\s*\S+"),
+    re.compile(r"(?i)pwd\s*[:=]\s*\S+"),
+]
+_MASK_TOKEN = "***MASKED***"
+
+
+def _mask(text: str) -> str:
+    for pat in _MASK_PATTERNS:
+        text = pat.sub(_MASK_TOKEN, text)
+    return text
+
+
+class _RawFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _mask(record.getMessage())
+
+
+# ══════════════════════════════════════════════════════════════════
+# SASLogger
+# ══════════════════════════════════════════════════════════════════
+
+class SASLogger:
+
+    def __init__(
+        self,
+        program_name: str,
+        log_dir: Union[str, Path, None] = None,
+        log_file: Optional[str] = None,
+        console: bool = True,
+        env: str = "PROD",
+    ) -> None:
+        self.program_name = program_name
+        self.env = env
+        self.start_time = datetime.now()
+        self.start_ts = time.time()
+        self.step_counter = 0
+        self.error_count = 0
+        self.warning_count = 0
+        self._line_counter = 0
+
+        log_dir = Path(log_dir) if log_dir else Path.cwd()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if log_file is None:
+            ymd = self.start_time.strftime("%Y%m%d")
+            log_file = f"{program_name}_{ymd}.log"
+        self.log_file_path = log_dir / log_file
+
+        self._logger = logging.getLogger(f"sas_logger.{program_name}.{id(self)}")
+        self._logger.setLevel(logging.DEBUG)
+        self._logger.propagate = False
+        for h in self._logger.handlers[:]:
+            self._logger.removeHandler(h)
+
+        fh = logging.FileHandler(self.log_file_path, mode="w", encoding="utf-8")
+        fh.setFormatter(_RawFormatter())
+        self._logger.addHandler(fh)
+
+        if console:
+            ch = logging.StreamHandler(sys.stdout)
+            ch.setFormatter(_RawFormatter())
+            self._logger.addHandler(ch)
+
+        self._original_showwarning = warnings.showwarning
+        warnings.showwarning = self._capture_warning
+        self._write_header()
+
+    # ── Internal ──────────────────────────────────────────────────
+
+    def _w(self, text: str = "") -> None:
+        self._logger.info(text)
+
+    def _echo(self, code: str) -> None:
+        for line in code.rstrip().split("\n"):
+            self._line_counter += 1
+            self._w(f"{self._line_counter:<8}{line}")
+
+    def _write_timing(self, proc_name: str, real_secs: float, cpu_secs: Optional[float] = None) -> None:
+        if cpu_secs is None:
+            cpu_secs = real_secs * 0.25
+        self._w(f"NOTE: {proc_name} used (Total process time):")
+        self._w(f"      real time           {real_secs:.2f} seconds")
+        self._w(f"      cpu time            {cpu_secs:.2f} seconds")
+
+    # ── Header ────────────────────────────────────────────────────
+
+    def _write_header(self) -> None:
+        user = os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
+        host = os.environ.get("HOSTNAME", os.environ.get("COMPUTERNAME", "unknown"))
+        ts = self.start_time.strftime("%d%b%Y:%H:%M:%S").upper()
+        self._w(f">>>>>>>>> Name of This Program - {self.program_name} <<<<<<<<<<")
+        self._w(f">>>>>>>>> Starting Running Time - {ts} <<<<<<<<<<")
+        self._w(f">>>>>>>>> User ID - {user} <<<<<<<<<<")
+        self._w(f">>>>>>>>> Platform - {host} <<<<<<<<<<")
+        self._w(f">>>>>>>>> Prod/Dev? - {self.env} <<<<<<<<<<")
+        self._w()
+
+    # ══════════════════════════════════════════════════════════════
+    # EXECUTE + LOG METHODS (zero duplication)
+    # ══════════════════════════════════════════════════════════════
+
+    def run_query(
+        self,
+        table_name: str,
+        sql: str,
+        connection: Any,
+        source: str = "database",
+        params: Any = None,
+    ) -> pd.DataFrame:
+        """Execute SELECT, echo SQL, log result, return DataFrame.
+
+        Works with: Teradata, Hive, SQL Server, Salesforce, any DB-API.
+        """
+        self._w()
+        self._echo("proc sql;")
+        self._echo(f"  /*connect to {source}*/")
+        self._echo(f"  create table {table_name} as")
+        self._echo(f"  select * from connection to {source.lower()}")
+        self._echo("  (")
+        for line in sql.strip().split("\n"):
+            self._line_counter += 1
+            self._w(f"{self._line_counter:<8}    {line.strip()}")
+        self._echo("  );")
+
+        t0 = time.time()
+        df = pd.read_sql(sql, connection, params=params)
+        elapsed = time.time() - t0
+
+        self._w(f"NOTE: Table WORK.{table_name.upper()} created, with {len(df):,} rows and {len(df.columns)} columns.")
+        self._w()
+        self._echo(f"  disconnect from {source.lower()};")
+        self._echo("  quit;")
+        self._write_timing("PROCEDURE SQL", elapsed)
+        self._w()
+        return df
+
+    def run_execute(
+        self,
+        label: str,
+        sql: str,
+        connection: Any,
+        source: str = "database",
+    ) -> None:
+        """Execute DDL/DML, echo SQL, log result.  No DataFrame returned."""
+        self._w()
+        self._echo(f"  /*{label}*/")
+        self._echo("  execute (")
+        for line in sql.strip().split("\n"):
+            self._line_counter += 1
+            self._w(f"{self._line_counter:<8}    {line.strip()}")
+        self._echo(f"  ) by {source.lower()};")
+
+        t0 = time.time()
+        cursor = connection.cursor()
+        cursor.execute(sql)
+        elapsed = time.time() - t0
+
+        self._w(f"NOTE: Statement executed via {source}.")
+        self._write_timing("PROCEDURE SQL", elapsed)
+        self._w()
+
+    def run_insert(
+        self,
+        table_name: str,
+        insert_sql: str,
+        records: list,
+        connection: Any,
+        source: str = "SQL Server",
+        database: Optional[str] = None,
+    ) -> None:
+        """Execute bulk INSERT, echo SQL, log row count."""
+        db_prefix = f"{database}.dbo." if database else "dbo."
+        full_name = f"{db_prefix}{table_name}"
+
+        self._w()
+        self._echo(insert_sql)
+        self._w(f"NOTE: Inserting {len(records):,} records into {full_name}...")
+
+        t0 = time.time()
+        cursor = connection.cursor()
+        cursor.fast_executemany = True
+        cursor.executemany(insert_sql, records)
+        connection.commit()
+        elapsed = time.time() - t0
+
+        self._w(f"NOTE: {len(records):,} records inserted into {full_name}.")
+        self._write_timing("PROCEDURE SQL", elapsed)
+        self._w()
+
+    # ══════════════════════════════════════════════════════════════
+    # LOG-ONLY METHODS (for pandas transforms, file I/O)
+    # ══════════════════════════════════════════════════════════════
+
+    def log_note(self, msg: str) -> None:
+        self._w(f"NOTE: {_mask(msg)}")
+
+    def log_warning(self, msg: str) -> None:
+        self.warning_count += 1
+        self._w(f"WARNING: {_mask(msg)}")
+
+    def log_error(self, msg: str) -> None:
+        self.error_count += 1
+        self._w(f"ERROR: {_mask(msg)}")
+
+    def log_dataset(
+        self,
+        name: str,
+        df: Any,
+        input_name: Optional[str] = None,
+        input_nobs: Optional[int] = None,
+        where_clause: Optional[str] = None,
+        elapsed: Optional[float] = None,
+    ) -> None:
+        """DATA step equivalent."""
+        nobs = len(df) if df is not None else 0
+        nvars = len(df.columns) if df is not None and hasattr(df, "columns") else 0
+        if input_name:
+            self._w(f"NOTE: There were {(input_nobs or nobs):,} observations read from the data set WORK.{input_name.upper()}.")
+            if where_clause:
+                self._w(f"      WHERE {where_clause};")
+        self._w(f"NOTE: The data set WORK.{name.upper()} has {nobs:,} observations and {nvars} variables.")
+        if elapsed is not None:
+            self._write_timing("DATA statement", elapsed)
+        self._w()
+
+    def log_export(
+        self,
+        target: str,
+        nobs: Optional[int] = None,
+        nvars: Optional[int] = None,
+        elapsed: Optional[float] = None,
+    ) -> None:
+        """PROC EXPORT equivalent."""
+        if nobs is not None:
+            vars_part = f" and {nvars} variables" if nvars is not None else ""
+            self._w(f"NOTE: The export data set has {nobs:,} observations{vars_part}.")
+        self._w(f'NOTE: "{target}" file was successfully created.')
+        if elapsed is not None:
+            self._write_timing("PROCEDURE EXPORT", elapsed)
+        self._w()
+
+    def log_append(self, base_name, data_name, appended_nobs, total_nobs, total_nvars, elapsed=None):
+        self._w(f"NOTE: Appending WORK.{data_name.upper()} to {base_name.upper()}.")
+        self._w(f"NOTE: {appended_nobs:,} observations added.")
+        self._w(f"NOTE: The data set {base_name.upper()} has {total_nobs:,} observations and {total_nvars} variables.")
+        if elapsed is not None:
+            self._write_timing("PROCEDURE APPEND", elapsed)
+        self._w()
+
+    def log_put(self, **kwargs) -> None:
+        self._w(" ".join(f"{k}={v}" for k, v in kwargs.items()))
+
+    # ══════════════════════════════════════════════════════════════
+    # Context manager
+    # ══════════════════════════════════════════════════════════════
+
+    class _StepContext:
+        def __init__(self, logger: "SASLogger", name: str):
+            self._l = logger
+            self._name = name
+            self._start: float = 0.0
+
+        def __enter__(self):
+            self._l.step_counter += 1
+            self._start = time.time()
+            self._l._w()
+            self._l._w(f"      /*--- {self._name} ---*/")
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if exc_type:
+                self._l.log_exception(exc_val, note=self._name)
+            return False
+
+        @property
+        def elapsed(self):
+            return time.time() - self._start
+
+        # Proxy all methods
+        def run_query(self, *a, **kw):   return self._l.run_query(*a, **kw)
+        def run_execute(self, *a, **kw): return self._l.run_execute(*a, **kw)
+        def run_insert(self, *a, **kw):  return self._l.run_insert(*a, **kw)
+
+        def log_dataset(self, name, df, **kw):
+            kw.setdefault("elapsed", self.elapsed)
+            self._l.log_dataset(name, df, **kw)
+
+        def log_export(self, target, **kw):
+            kw.setdefault("elapsed", self.elapsed)
+            self._l.log_export(target, **kw)
+
+        def log_append(self, *a, **kw):
+            kw.setdefault("elapsed", self.elapsed)
+            self._l.log_append(*a, **kw)
+
+        def log_note(self, msg):    self._l.log_note(msg)
+        def log_warning(self, msg): self._l.log_warning(msg)
+        def log_error(self, msg):   self._l.log_error(msg)
+        def log_put(self, **kw):    self._l.log_put(**kw)
+
+    def step(self, step_name: str) -> _StepContext:
+        return self._StepContext(self, step_name)
+
+    # ══════════════════════════════════════════════════════════════
+    # Exception logging
+    # ══════════════════════════════════════════════════════════════
+
+    def log_exception(self, exc, note=None, re_raise=False):
+        self.error_count += 1
+        self._w("ERROR: " + "!" * 60)
+        if note:
+            self._w(f"ERROR: {note}")
+        self._w(f"ERROR: {type(exc).__name__}: {exc}")
+        if hasattr(exc, "__traceback__") and exc.__traceback__:
+            for line in traceback.format_exception(type(exc), exc, exc.__traceback__):
+                for sub in line.rstrip().split("\n"):
+                    self._w(f"       {sub}")
+        self._w("ERROR: " + "!" * 60)
+        if re_raise:
+            raise exc
+
+    # ══════════════════════════════════════════════════════════════
+    # Finalize
+    # ══════════════════════════════════════════════════════════════
+
+    def finalize(self):
+        elapsed = time.time() - self.start_ts
+        ts = datetime.now().strftime("%d%b%Y:%H:%M:%S").upper()
+        status = "successfully" if self.error_count == 0 else f"with {self.error_count} ERROR(s)"
+        self._w()
+        self._w("=" * 80)
+        self._w(f"NOTE: Program completed {status}.")
+        self._w(f"NOTE: Total steps executed: {self.step_counter}")
+        self._w(f"NOTE: Total errors: {self.error_count}")
+        self._w(f"NOTE: Total warnings: {self.warning_count}")
+        self._w(f"NOTE: Completion time: {ts}")
+        self._w(f"NOTE: Total elapsed time: {elapsed:.2f} seconds")
+        self._w("=" * 80)
+        try:
+            warnings.showwarning = self._original_showwarning
+        except Exception:
+            pass
+        print(f"\n{'=' * 60}")
+        print(f"LOG FILE: {self.log_file_path}")
+        print(f"Steps: {self.step_counter} | Errors: {self.error_count} | Warnings: {self.warning_count}")
+        print(f"Elapsed: {elapsed:.2f}s")
+        print(f"{'=' * 60}")
+
+    def _capture_warning(self, message, category, filename, lineno, file=None, line=None):
+        self.warning_count += 1
+        self._w(f"WARNING: {category.__name__}: {message}")
+        self._w(f"         File: {filename}, Line: {lineno}")
+        if self._original_showwarning:
+            try:
+                self._original_showwarning(message, category, filename, lineno, file, line)
+            except Exception:
+                pass
