@@ -1,0 +1,720 @@
+#!/usr/bin/env python3
+"""
+C86_PA_Client360 — Converted to use sas_logger.py
+
+All SQL is written ONCE — run_query() / run_execute() both execute AND log.
+All pandas transforms use log_dataset() with SAS DATA step output format.
+All exports use log_export() with SAS PROC EXPORT output format.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import os
+os.environ["SPARK_VERSION"] = "3.3"
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from pyspark.sql import SparkSession
+import teradatasql
+import openpyxl
+
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+
+from sas_logger import SASLogger
+
+SPARK_APP_NAME = "C86_PA_Client360"
+
+
+# ── Config (unchanged) ────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Config:
+    outpath: Path = Path("sas/RSD/REG_DEV/C86/output/product_appropriateness/client360")
+    logpath: Path = Path("sas/RSD/REG_DEV/C86/log/product_appropriateness/client360")
+    teradata_conn_json: Path = Path("TeradataConnection_T.json")
+    sql_secrets_json: Path = Path("sql.json")
+    persistent_ac_file: str = "pa_client360_autocomplete.parquet"
+    excel_autocomplete_file: str = "pa_client360_autocomplete.xlsx"
+    excel_pivot_file: str = "pa_client360_Pivot.xlsx"
+    sql_table: str = "STG_REG_AUTOCOMPLETE_C86"
+
+
+S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"
+S3_BUCKET = "ryu0-s3-sas-migration"
+S3_FOLDERS = {
+    "raw":          f"s3a://{S3_BUCKET}/raw",
+    "intermediate": f"s3a://{S3_BUCKET}/intermediate",
+    "output":       f"s3a://{S3_BUCKET}/output",
+    "logs":         f"s3a://{S3_BUCKET}/logs",
+    "smoke_tests":  f"s3a://{S3_BUCKET}/SAS_Dataset_Conversions/_smoke_tests",
+}
+
+# ── Constants (unchanged) ─────────────────────────────────────────
+
+PA_RESULT_MAP = {
+    "Product Appropriateness assessed outside Client 360": "Product Appropriate",
+    "Not Appropriate - Rationale": "Product Not Appropriate",
+    "Client declined product appropriateness assessment": "Client declined",
+    "Product Appropriate": "Product Appropriate",
+}
+PA_SEG4_COUNT_MAP = {
+    "Not Appropriate - Rationale": "Product Not Appropriate",
+    "Client declined product appropriateness assessment": "Client declined",
+    "Product Appropriate": "Product Appropriate",
+    "Product Appropriateness assessed outside Client 360": "Product Appropriateness assessed outside Client 360",
+}
+CS_CMT_MAP = {
+    "COM1": "Test population (less samples)", "COM2": "Match population",
+    "COM3": "Mismatch population (less samples)", "COM4": "Non Anomaly Population",
+    "COM5": "Anomaly Population", "COM6": "Number of Deposit Sessions",
+    "COM7": "Number of Accounts", "COM8": "Number of Transactions",
+    "COM9": "Non Blank Population", "COM10": "Blank Population",
+    "COM11": "Unable to Assess", "COM12": "Number of Failed Data Elements",
+    "COM13": "Population Distribution", "COM14": "Reconciled Population",
+    "COM15": "Not Reconciled Population", "COM16": "Pass", "COM17": "Fail",
+    "COM18": "Not Applicable", "COM19": "Potential Fail",
+}
+PA_SEG4_TOOL_USE_MAP = {
+    "Product Appropriateness assessed outside Client 360": "Product Appropriate assessed outside Client 360",
+    "Not Appropriate - Rationale": "Product Not Appropriate",
+    "Client declined product appropriateness assessment": "Client declined product appropriateness assessment",
+    "Product Appropriate": "Product Appropriate",
+}
+STAGE_FORMAT_MAP = {
+    "Démarche exploratoire/Comprendre le besoin": "11.Démarche exploratoire/Comprendre le besoin",
+    "Discovery/Understand Needs": "12.Discovery/Understand Needs",
+    "Review Options": "21.Review Options",
+    "Present/Gain Commitment": "31.Present/Gain Commitment",
+    "Intégration commencée": "41.Intégration commencée",
+    "Onboarding Started": "42.Onboarding Started",
+    "Opportunity Lost": "51.Opportunity Lost",
+    "Opportunity Won": "61.Opportunity Won",
+}
+
+
+# ── Spark / S3 helpers ────────────────────────────────────────────
+
+def configure_s3a(spark: SparkSession) -> SparkSession:
+    hconf = spark.sparkContext._jsc.hadoopConfiguration()
+    hconf.set("fs.s3a.endpoint", S3_ENDPOINT)
+    hconf.set("fs.s3a.connection.ssl.enabled", "true")
+    hconf.set("fs.s3a.path.style.access", "true")
+    hconf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    return spark
+
+
+def get_spark_session(app_name: str = "C86_PA_Client360") -> SparkSession:
+    spark = SparkSession.builder.master("yarn").appName(app_name).getOrCreate()
+    configure_s3a(spark)
+    return spark
+
+
+def s3_path(folder: str, *parts: str) -> str:
+    base = S3_FOLDERS.get(folder, folder)
+    return "/".join([base.rstrip("/")] + list(parts))
+
+
+def upload_file_to_s3(spark, local_path, s3_uri, log: SASLogger):
+    sc = spark.sparkContext
+    jvm = sc._jvm
+    conf = sc._jsc.hadoopConfiguration()
+    local_fs_path = jvm.org.apache.hadoop.fs.Path(f"file://{os.path.abspath(local_path)}")
+    s3_fs_path = jvm.org.apache.hadoop.fs.Path(s3_uri)
+    fs = s3_fs_path.getFileSystem(conf)
+    fs.copyFromLocalFile(False, True, local_fs_path, s3_fs_path)
+    log.log_note(f"Uploaded to S3 -> {s3_uri}")
+
+
+def _normalize_column_types(df: pd.DataFrame) -> pd.DataFrame:
+    date_columns = ("DateCompleted", "SnapDate")
+    string_exact_columns = (
+        "RegulatoryName", "LOB", "ReportName", "ControlRisk",
+        "TestType", "TestPeriod", "ProductType", "RDE",
+        "HoldoutFlag", "CommentCode", "Comments",
+    )
+    numeric_columns = ("Volume", "Amount")
+    for col in df.columns:
+        if col in date_columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+        elif col.startswith("segment") or col in string_exact_columns:
+            df[col] = df[col].fillna("").astype(str)
+        elif col in numeric_columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in df.columns:
+        if df[col].dtype == "object":
+            sample = df[col].dropna().head(1)
+            if len(sample) > 0 and isinstance(sample.iloc[0], date):
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+            else:
+                df[col] = df[col].fillna("").astype(str)
+    return df
+
+
+def write_parquet_to_s3(spark, df, s3_uri, log: SASLogger):
+    import time as _t
+    t0 = _t.time()
+    df = _normalize_column_types(df.copy())
+    sdf = spark.createDataFrame(df)
+    sdf.write.mode("overwrite").parquet(s3_uri)
+    log.log_export(s3_uri, nobs=len(df), elapsed=_t.time() - t0)
+
+
+# ── Teradata connection ───────────────────────────────────────────
+
+def get_teradata_connection(conn_file: Path, log: SASLogger) -> teradatasql.TeradataConnection:
+    if not conn_file.exists():
+        log.log_error(f"Connection file not found at: {conn_file.resolve()}")
+        raise FileNotFoundError(f"Connection file not found at: {conn_file.resolve()}")
+    with open(conn_file, "r", encoding="utf-8") as f:
+        conn_details = json.load(f)
+    url = conn_details.get("url")
+    user = conn_details.get("user")
+    pwd = conn_details.get("password")
+    log.log_note(f"Connecting to Teradata URL: {url} with user: {user} using LDAP...")
+    try:
+        conn = teradatasql.connect(host=url, user=user, password=pwd, logmech="LDAP")
+        log.log_note("Teradata connection successful.")
+        return conn
+    except Exception as e:
+        log.log_exception(e, note="Failed to connect to Teradata")
+        raise
+
+
+# ── Date helpers ──────────────────────────────────────────────────
+
+def check_ini_run(outpath, autocomplete_filename, log: SASLogger):
+    autocomplete_file = Path(outpath) / autocomplete_filename
+    autocomplete_backup = Path(outpath) / f"{autocomplete_file.stem}_backup{autocomplete_file.suffix}"
+    if autocomplete_file.exists():
+        log.log_note(f"Found existing autocomplete file: {autocomplete_file}")
+        try:
+            shutil.copy(autocomplete_file, autocomplete_backup)
+            log.log_note(f"Backed up to: {autocomplete_backup}")
+        except Exception as e:
+            log.log_warning(f"Could not create backup: {e}")
+        return "N"
+    log.log_note("Autocomplete file not found. Setting ini_run = 'Y'.")
+    return "Y"
+
+
+def setup_dates(ini_run, log: SASLogger):
+    tday = date.today()
+    runday = tday.strftime("%Y%m%d")
+    days_to_wednesday = (tday.weekday() - 2) % 7
+    intnx_week4_b = tday - timedelta(days=days_to_wednesday)
+    week_start_dt = intnx_week4_b - timedelta(days=12)
+    week_end_dt = intnx_week4_b - timedelta(days=6)
+    fmt = lambda d: f"'{d:%Y-%m-%d}'"
+    dates = {}
+    if ini_run.upper() == "Y":
+        log.log_note("ini_run = 'Y'. Using initial launch dates.")
+        dates["wk_start"] = fmt(date(2023, 5, 7))
+        dates["wk_start_min14"] = fmt(date(2023, 4, 23))
+        dates["wk_end"] = fmt(week_end_dt)
+    else:
+        log.log_note("ini_run = 'N'. Using rolling weekly dates.")
+        dates["wk_start"] = fmt(week_start_dt)
+        dates["wk_start_min14"] = fmt(week_start_dt - timedelta(days=14))
+        dates["wk_end"] = fmt(week_end_dt)
+    dates["runday"] = runday
+    dates["tday"] = runday
+    log.log_put(WK_START=dates['wk_start'], WK_END=dates['wk_end'],
+                RUNDAY=runday, INI_RUN=f"'{ini_run}'",
+                TDAY=dates['tday'], WK_START_MIN14=dates['wk_start_min14'])
+    return dates, week_end_dt
+
+
+def validate_rationale(text):
+    if pd.isna(text) or not isinstance(text, str):
+        return "Invalid", 1, 1, 1
+    x = " ".join(text.split()).upper()
+    xfail_chars_gt5 = 0 if len(x) > 5 else 1
+    x2 = x.replace(x[0], "") if len(x) > 0 else ""
+    xfail_rep_char = 0 if len(x2) > 0 else 1
+    x3 = re.sub(r"[^A-Za-z0-9]", "", x)
+    xfail_ge_2_alnum = 0 if len(x3) > 2 else 1
+    is_valid = (xfail_chars_gt5 + xfail_rep_char + xfail_ge_2_alnum) == 0
+    return ("Valid" if is_valid else "Invalid"), xfail_chars_gt5, xfail_rep_char, xfail_ge_2_alnum
+
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════
+
+def process_c86_pa_client360(ss, job_conf) -> None:
+    cfg = Config()
+
+    # ── Initialize logger (replaces setup_logging + manual header) ──
+    log = SASLogger(
+        program_name="C86_PA_Client360.sas",
+        log_dir=cfg.logpath,
+        env="PROD",
+    )
+
+    # ── Spark init ──
+    with log.step("Initialize Spark") as s:
+        spark = get_spark_session("C86_PA_Client360")
+        s.log_note(f"Spark session initialized. Master: {spark.sparkContext.master}")
+        s.log_note(f"S3 endpoint: {S3_ENDPOINT}, Bucket: {S3_BUCKET}")
+
+    # ── Directories (libref equivalents) ──
+    cfg.outpath.mkdir(parents=True, exist_ok=True)
+    log.log_libref("AC", str(cfg.outpath))
+    ac_path = cfg.outpath
+
+    # ── ini_check + dates ──
+    with log.step("ini_check and date setup") as s:
+        ini_run = check_ini_run(ac_path, cfg.persistent_ac_file, log)
+        s.log_put(INI_RUN=f"'{ini_run}'")
+        dates, _week_end_dt = setup_dates(ini_run, log)
+        runday = dates["runday"]
+
+        dataout_path = cfg.outpath / runday
+        dataout_path.mkdir(parents=True, exist_ok=True)
+        s.log_directory_created(str(dataout_path))
+        s.log_libref("DATAOUT", str(dataout_path))
+
+    # ── Pull tracking data — SQL written ONCE ──
+    sql_tracking_all = """
+        SELECT *
+        FROM DDWV01.EVNT_PROD_TRACK_LOG
+        WHERE advr_selt_typ = 'Advice Tool'
+        AND EVNT_DT > (CAST({wk_start} AS DATE) - 90)
+    """.format(wk_start=dates['wk_start'])
+
+    with log.step("pull data from tracking") as s:
+        with get_teradata_connection(cfg.teradata_conn_json, log) as conn:
+            tracking_all = s.run_query("tracking_all", sql_tracking_all, conn, source="Teradata")
+
+    # ── Process tracking data (3 PROC SQL steps) ──
+    with log.step("create tracking_tool_use_distinct") as s:
+        tracking_all_filtered = tracking_all.dropna(subset=["OPPOR_ID", "ADVC_TOOL_NM"]).copy()
+        tracking_all_filtered["ADVC_TOOL_NM"] = tracking_all_filtered["ADVC_TOOL_NM"].astype(str).str.upper()
+
+        tracking_tool_use_distinct = tracking_all_filtered[["OPPOR_ID", "ADVC_TOOL_NM"]].drop_duplicates()
+        s.log_dataset("tracking_tool_use_distinct", tracking_tool_use_distinct,
+                      input_name="tracking_all", input_nobs=len(tracking_all_filtered))
+
+    with log.step("create tracking_count_tool_use_pre2") as s:
+        tracking_count_tool_use_pre2 = (
+            tracking_all_filtered.groupby("OPPOR_ID")["ADVC_TOOL_NM"]
+            .nunique().reset_index(name="count_unique_tool_used")
+            .sort_values(by="count_unique_tool_used", ascending=False)
+        )
+        s.log_dataset("tracking_count_tool_use_pre2", tracking_count_tool_use_pre2)
+
+    with log.step("create tracking_tool_use") as s:
+        tracking_tool_use = tracking_count_tool_use_pre2[
+            tracking_count_tool_use_pre2["count_unique_tool_used"] > 0
+        ][["OPPOR_ID"]].copy()
+        tracking_tool_use["tool_used"] = "Tool Used"
+        s.log_dataset("tracking_tool_use", tracking_tool_use,
+                      input_name="tracking_count_tool_use_pre2", input_nobs=len(tracking_count_tool_use_pre2))
+
+    # ── Pull C360 detail (volatile table + select) ──
+    sql_create_vt = """
+        CREATE MULTISET VOLATILE TABLE c360_short AS (
+            SELECT evnt_id, CAST(rbc_oppor_own_id AS INTEGER) AS emp_id, evnt_dt AS snap_dt
+            FROM DDWV01.evnt_prod_oppor
+            WHERE rbc_oppor_own_id IS NOT NULL AND evnt_dt IS NOT NULL AND evnt_id IS NOT NULL
+            AND evnt_dt BETWEEN {wk_start} AND {wk_end}
+        ) WITH DATA PRIMARY INDEX (emp_id, snap_dt) ON COMMIT PRESERVE ROWS
+    """.format(wk_start=dates['wk_start'], wk_end=dates['wk_end'])
+
+    sql_stats = "COLLECT STATISTICS COLUMN (emp_id, snap_dt) ON c360_short"
+
+    sql_c360_detail_pre = """
+        SELECT c360.*, emp.org_unt_no, emp.hr_posn_titl_en,
+               emp.posn_strt_dt, emp.posn_end_dt, emp.occpt_job_cd
+        FROM DDWV01.evnt_prod_oppor AS c360
+        LEFT JOIN (
+            SELECT c3.evnt_id, e1.org_unt_no, e1.hr_posn_titl_en,
+                   e2.posn_strt_dt, e2.posn_end_dt, e1.occpt_job_cd
+            FROM c360_short AS c3
+            INNER JOIN DDWV01.emp AS e1 ON e1.emp_id = c3.emp_id
+                AND c3.snap_dt >= e1.captr_dt AND c3.snap_dt < e1.chg_dt
+            INNER JOIN DDWV01.empl_reltn AS e2 ON e2.emp_id = c3.emp_id
+                AND c3.snap_dt >= e2.captr_dt AND c3.snap_dt < e2.chg_dt
+        ) AS emp ON emp.evnt_id = c360.evnt_id
+        WHERE c360.evnt_id IS NOT NULL
+          AND c360.evnt_dt BETWEEN {wk_start} AND {wk_end}
+    """.format(wk_start=dates['wk_start'], wk_end=dates['wk_end'])
+
+    with log.step("pull C360 detail data") as s:
+        with get_teradata_connection(cfg.teradata_conn_json, log) as conn:
+            s.run_execute("create volatile table c360_short", sql_create_vt, conn, source="Teradata")
+            s.run_execute("collect statistics on c360_short", sql_stats, conn, source="Teradata")
+            c360_detail_pre = s.run_query("c360_detail_pre", sql_c360_detail_pre, conn, source="Teradata")
+
+    # ── Join tool info ──
+    with log.step("join tool info") as s:
+        c360_detail = pd.merge(c360_detail_pre, tracking_tool_use, on="OPPOR_ID", how="left")
+        c360_detail["TOOL_USED"] = c360_detail["tool_used"].fillna("Tool Not Used")
+        c360_detail = c360_detail.drop(columns=["tool_used"])
+        if "LOB" not in c360_detail.columns:
+            c360_detail["LOB"] = "Retail"
+        else:
+            c360_detail["LOB"] = c360_detail["LOB"].fillna("Retail")
+        s.log_dataset("c360_detail", c360_detail,
+                      input_name="c360_detail_pre", input_nobs=len(c360_detail_pre))
+
+    # ── Pull AOT data ──
+    sql_aot_all_oppor = """
+        SELECT oppor_id, COUNT(*) AS count_aot
+        FROM DDWV01.evnt_prod_aot
+        WHERE ess_src_evnt_dt BETWEEN {wk_start_min14} AND {wk_end}
+          AND oppor_id IS NOT NULL
+        GROUP BY 1
+    """.format(wk_start_min14=dates['wk_start_min14'], wk_end=dates['wk_end'])
+
+    with log.step("pull data from AOT") as s:
+        with get_teradata_connection(cfg.teradata_conn_json, log) as conn:
+            aot_all_oppor = s.run_query("aot_all_oppor", sql_aot_all_oppor, conn, source="Teradata")
+
+    with log.step("create aot_all_oppor_unique") as s:
+        aot_all_oppor_unique = aot_all_oppor[["OPPOR_ID"]].drop_duplicates().copy()
+        aot_all_oppor_unique.rename(columns={"OPPOR_ID": "aot_oppor_id"}, inplace=True)
+        s.log_dataset("aot_all_oppor_unique", aot_all_oppor_unique,
+                      input_name="aot_all_oppor", input_nobs=len(aot_all_oppor))
+
+    # ── Link AOT ──
+    with log.step("create c360_detail_link_aot") as s:
+        c360_detail_link_aot = pd.merge(
+            c360_detail, aot_all_oppor_unique, left_on="OPPOR_ID", right_on="aot_oppor_id", how="left")
+        cond_prod = c360_detail_link_aot["PROD_CATG_NM"] == "Personal Accounts"
+        cond_aot = c360_detail_link_aot["aot_oppor_id"].notna()
+        c360_detail_link_aot["C360_PDA_Link_AOT"] = np.where(cond_prod & cond_aot, 1, 0)
+        s.log_dataset("c360_detail_link_aot", c360_detail_link_aot,
+                      input_name="c360_detail", input_nobs=len(c360_detail))
+
+    # ── Filter + format ──
+    with log.step("filter c360_detail_more_in") as s:
+        log.log_format("$STAGEFMT")
+
+        df_more = c360_detail_link_aot.copy()
+        df_more["oppor_stage_nm_f"] = df_more["OPPOR_STAGE_NM"].map(STAGE_FORMAT_MAP)
+        cond1 = df_more["ASCT_PROD_FMLY_NM"] != "Risk Protection"
+        cond2 = df_more["LOB"] == "Retail"
+        cond3 = df_more["C360_PDA_Link_AOT"] == 0
+        cond4 = df_more["OPPOR_STAGE_NM"].isin(["Opportunity Won", "Opportunity Lost"])
+        c360_detail_more_in = df_more[cond1 & cond2 & cond3 & cond4].copy()
+        s.log_dataset("c360_detail_more_in", c360_detail_more_in,
+                      input_name="c360_detail_link_aot", input_nobs=len(c360_detail_link_aot))
+
+    # ── PA rationale validation ──
+    with log.step("PA rationale validation") as s:
+        pa_rationale_base = c360_detail_more_in[
+            c360_detail_more_in["IS_PROD_APRP_FOR_CLNT"] == "Not Appropriate - Rationale"
+        ].copy()
+        pa_rationale = pa_rationale_base[["EVNT_ID", "IS_PROD_APRP_FOR_CLNT", "CLNT_RTNL_TXT"]].copy()
+        validation_results = pa_rationale["CLNT_RTNL_TXT"].apply(
+            lambda x: pd.Series(validate_rationale(x),
+                                index=["prod_not_aprp_rtnl_txt_cat", "xfail_chars_gt5", "xfail_rep_char", "xfail_ge_2_alnum"]))
+        pa_rationale = pd.concat([pa_rationale, validation_results], axis=1)
+        s.log_dataset("pa_rationale", pa_rationale,
+                      input_name="c360_detail_more_in", input_nobs=len(pa_rationale_base),
+                      where_clause="IS_PROD_APRP_FOR_CLNT='Not Appropriate - Rationale'")
+
+    # ── Join validation back ──
+    with log.step("join PA rationale back to c360_detail_more_in") as s:
+        c360_detail_more_in = pd.merge(
+            c360_detail_more_in,
+            pa_rationale.drop(columns=["IS_PROD_APRP_FOR_CLNT", "CLNT_RTNL_TXT"]),
+            on="EVNT_ID", how="left")
+        conds = [c360_detail_more_in["IS_PROD_APRP_FOR_CLNT"].isna(),
+                 c360_detail_more_in["IS_PROD_APRP_FOR_CLNT"] != "Not Appropriate - Rationale"]
+        choices = ["Not Available", "Not Applicable"]
+        c360_detail_more_in["prod_not_aprp_rtnl_txt_cat"] = np.select(
+            conds, choices, default=c360_detail_more_in["prod_not_aprp_rtnl_txt_cat"])
+        s.log_dataset("c360_detail_more_in", c360_detail_more_in)
+
+    # ── Sort + dedup ──
+    with log.step("sort and dedup by OPPOR_ID") as s:
+        tmp0 = c360_detail_more_in.sort_values(by="OPPOR_ID").copy()
+        tmp0["level_oppor"] = tmp0.groupby("OPPOR_ID").cumcount() + 1
+        s.log_sort("c360_detail_more_in", "tmp0", tmp0, by_cols="OPPOR_ID",
+                   input_nobs=len(c360_detail_more_in))
+
+    # ── Build base AC table ──
+    with log.step("create tmp_pa_c360_4ac") as s:
+        tmp_pa_c360_4ac = tmp0[tmp0["level_oppor"] == 1].copy()
+        tmp_pa_c360_4ac["EVNT_DT"] = pd.to_datetime(tmp_pa_c360_4ac["EVNT_DT"], errors="coerce")
+        day_of_week = tmp_pa_c360_4ac["EVNT_DT"].dt.weekday
+        days_to_friday = 4 - day_of_week
+        days_to_friday = days_to_friday.where(days_to_friday >= 0, 7 + days_to_friday)
+        snapdate_series = tmp_pa_c360_4ac["EVNT_DT"] + pd.to_timedelta(days_to_friday, unit="d")
+        tmp_pa_c360_4ac = tmp_pa_c360_4ac.assign(
+            RegulatoryName="C86", LOB="Retail",
+            ReportName="C86 Client360 Product Appropriateness",
+            ControlRisk="Completeness", TestType="Anomaly", TestPeriod="Origination",
+            ProductType=tmp_pa_c360_4ac["PROD_CATG_NM"],
+            RDE="PA002_Client360_Completeness_RDE", segment="Account Open",
+            segment2=tmp_pa_c360_4ac["ASCT_PROD_FMLY_NM"],
+            segment3=tmp_pa_c360_4ac["PROD_SRVC_NM"],
+            segment6=tmp_pa_c360_4ac["OPPOR_STAGE_NM"],
+            segment7=tmp_pa_c360_4ac["TOOL_USED"],
+            segment10=tmp_pa_c360_4ac["EVNT_DT"].dt.strftime("%Y%m"),
+            CommentCode="COM13", Comments=CS_CMT_MAP["COM13"], HoldoutFlag="N",
+            SnapDate=snapdate_series.dt.date,
+            DateCompleted=pd.to_datetime(dates["tday"], format="%Y%m%d").date(),
+        )
+        s.log_dataset("tmp_pa_c360_4ac", tmp_pa_c360_4ac,
+                      input_name="tmp0", input_nobs=len(tmp0), where_clause="level_oppor=1")
+
+    # ── Tool use assessment (PA002) ──
+    with log.step("create tmp_pa_c360_ac_assessment") as s:
+        df_agg = tmp_pa_c360_4ac.copy()
+        df_agg["segment4"] = df_agg["IS_PROD_APRP_FOR_CLNT"].map(PA_SEG4_TOOL_USE_MAP).fillna("Missing")
+        df_agg["segment5"] = df_agg["prod_not_aprp_rtnl_txt_cat"]
+        df_agg["segment9"] = ""
+        df_agg["segment3"] = df_agg["segment3"].fillna("")
+        group_by_cols = [
+            "RegulatoryName", "LOB", "ReportName", "ControlRisk", "TestType", "TestPeriod",
+            "ProductType", "RDE", "segment", "segment2", "segment3", "segment4", "segment5",
+            "segment6", "segment7", "segment9", "segment10", "HoldoutFlag", "CommentCode",
+            "Comments", "DateCompleted", "SnapDate",
+        ]
+        fill_cols = [c for c in group_by_cols if c != "segment9"]
+        df_agg[fill_cols] = df_agg[fill_cols].fillna("Missing")
+        tmp_pa_c360_ac_assessment = df_agg.groupby(group_by_cols, dropna=False).size().reset_index(name="Volume")
+        tmp_pa_c360_ac_assessment["Amount"] = np.nan
+        tmp_pa_c360_ac_assessment["DateCompleted"] = pd.to_datetime(tmp_pa_c360_ac_assessment["DateCompleted"], errors="coerce")
+        tmp_pa_c360_ac_assessment["SnapDate"] = pd.to_datetime(tmp_pa_c360_ac_assessment["SnapDate"], errors="coerce")
+        pa_c360_autocomplete_tool_use = tmp_pa_c360_ac_assessment.copy()
+        s.log_dataset("tmp_pa_c360_ac_assessment", pa_c360_autocomplete_tool_use,
+                      input_name="tmp_pa_c360_4ac", input_nobs=len(tmp_pa_c360_4ac))
+
+    # ── Tool count merge (PA003) ──
+    with log.step("create tmp_pa_c360_4ac_count_pre") as s:
+        tmp_pa_c360_4ac_count_pre = pd.merge(
+            tmp_pa_c360_4ac, tracking_tool_use_distinct, on="OPPOR_ID", how="left")
+        tmp_pa_c360_4ac_count = tmp_pa_c360_4ac_count_pre.copy()
+        tmp_pa_c360_4ac_count["segment8"] = tmp_pa_c360_4ac_count["ADVC_TOOL_NM"].fillna("")
+        s.log_dataset("tmp_pa_c360_4ac_count_pre", tmp_pa_c360_4ac_count_pre)
+
+    with log.step("create tmp_pa_c360_ac_count_assessment") as s:
+        df_agg_count = tmp_pa_c360_4ac_count.copy()
+        df_agg_count["segment9"] = ""
+        df_agg_count["segment4"] = df_agg_count["IS_PROD_APRP_FOR_CLNT"].map(PA_SEG4_COUNT_MAP).fillna("Missing")
+        df_agg_count["RDE"] = "PA003_Client360_Completeness_Tool"
+        df_agg_count["segment5"] = df_agg_count["prod_not_aprp_rtnl_txt_cat"]
+        group_by_cols_count = [
+            "RegulatoryName", "LOB", "ReportName", "ControlRisk", "TestType", "TestPeriod",
+            "ProductType", "RDE", "segment", "segment2", "segment3", "segment4", "segment5",
+            "segment6", "segment7", "segment8", "segment9", "segment10",
+            "HoldoutFlag", "CommentCode", "Comments", "DateCompleted", "SnapDate",
+        ]
+        fill_cols_count = [c for c in group_by_cols_count if c != "segment9"]
+        df_agg_count[fill_cols_count] = df_agg_count[fill_cols_count].fillna("Missing")
+        tmp_pa_c360_ac_count_assessment = df_agg_count.groupby(group_by_cols_count, dropna=False).size().reset_index(name="Volume")
+        tmp_pa_c360_ac_count_assessment["Amount"] = np.nan
+        tmp_pa_c360_ac_count_assessment["DateCompleted"] = pd.to_datetime(tmp_pa_c360_ac_count_assessment["DateCompleted"], errors="coerce")
+        tmp_pa_c360_ac_count_assessment["SnapDate"] = pd.to_datetime(tmp_pa_c360_ac_count_assessment["SnapDate"], errors="coerce")
+        pa_c360_autocomplete_count_tool = tmp_pa_c360_ac_count_assessment.copy()
+        s.log_dataset("tmp_pa_c360_ac_count_assessment", pa_c360_autocomplete_count_tool)
+
+    # ── Combine autocomplete ──
+    with log.step("combine pa autocomplete") as s:
+        combine = pd.concat([pa_c360_autocomplete_count_tool, pa_c360_autocomplete_tool_use], ignore_index=True)
+        combine["DateCompleted"] = pd.to_datetime(combine["DateCompleted"], errors="coerce")
+        combine["SnapDate"] = pd.to_datetime(combine["SnapDate"], errors="coerce")
+        s.log_dataset("combine_pa_autocomplete", combine)
+
+    ac_pa_client360_autocomplete = combine
+
+    # ── Export autocomplete ──
+    with log.step("export autocomplete") as s:
+        import time as _t
+        autocomplete_path = ac_path / cfg.persistent_ac_file
+        today_date = pd.to_datetime(dates["tday"], format="%Y%m%d").date()
+        if autocomplete_path.exists():
+            ac_old = pd.read_parquet(autocomplete_path)
+            ac_old["DateCompleted"] = pd.to_datetime(ac_old["DateCompleted"], errors="coerce").dt.date
+            ac_filtered = ac_old[ac_old["DateCompleted"] != today_date].copy()
+            old_count = len(ac_filtered)
+            ac_pa_client360_autocomplete = pd.concat([ac_filtered, ac_pa_client360_autocomplete], ignore_index=True)
+            s.log_append("AC.PA_CLIENT360_AUTOCOMPLETE", "COMBINE_PA_AUTOCOMPLETE",
+                         read_nobs=len(combine), appended_nobs=len(combine),
+                         total_nobs=len(ac_pa_client360_autocomplete),
+                         total_nvars=len(ac_pa_client360_autocomplete.columns))
+
+        ac_pa_client360_autocomplete.to_parquet(autocomplete_path, index=False)
+        s.log_note(f"Saved persistent file: {autocomplete_path}")
+        write_parquet_to_s3(spark, ac_pa_client360_autocomplete,
+                            s3_path("output", cfg.persistent_ac_file), log)
+
+        excel_path = ac_path / cfg.excel_autocomplete_file
+        t0 = _t.time()
+        with pd.ExcelWriter(excel_path, engine="openpyxl",
+                            datetime_format="MM/DD/YYYY H:MM:SS", date_format="MM/DD/YYYY") as writer:
+            ac_pa_client360_autocomplete.to_excel(writer, sheet_name="autocomplete", index=False)
+        s.log_export(str(excel_path), nobs=len(ac_pa_client360_autocomplete),
+                     nvars=len(ac_pa_client360_autocomplete.columns))
+        upload_file_to_s3(spark, str(excel_path), s3_path("output", cfg.excel_autocomplete_file), log)
+
+    # ── Export detail ──
+    with log.step("export detail file") as s:
+        df_detail = tmp_pa_c360_4ac_count_pre.copy()
+        df_detail["PA_result"] = df_detail["IS_PROD_APRP_FOR_CLNT"].map(PA_RESULT_MAP).fillna("Missing")
+        filter_cond = df_detail["PA_result"].isin(
+            ["Product Not Appropriate", "Missing", "Product Appropriateness assessed outside Client 360"])
+        df_detail_filtered = df_detail[filter_cond].copy()
+
+        pa_client360_detail = pd.DataFrame({
+            "event_month": df_detail_filtered.get("segment10", np.nan),
+            "reporting_date": pd.to_datetime(df_detail_filtered.get("DateCompleted"), errors="coerce"),
+            "event_week_ending": pd.to_datetime(df_detail_filtered.get("SnapDate"), errors="coerce"),
+            "event_date": pd.to_datetime(df_detail_filtered.get("EVNT_DT"), errors="coerce"),
+            "event_timestamp": pd.to_datetime(df_detail_filtered.get("EVNT_TMSTMP"), errors="coerce"),
+            "opportunity_id": df_detail_filtered.get("OPPOR_ID", np.nan),
+            "opportunity_type": df_detail_filtered.get("OPPOR_REC_TYP", np.nan),
+            "product_code": df_detail_filtered.get("PROD_CD", np.nan),
+            "product_category_name": df_detail_filtered.get("PROD_CATG_NM", np.nan),
+            "product_family_name": df_detail_filtered.get("ASCT_PROD_FMLY_NM", np.nan),
+            "product_name": df_detail_filtered.get("PROD_SRVC_NM", np.nan),
+            "oppor_stage_nm": df_detail_filtered.get("OPPOR_STAGE_NM", np.nan),
+            "tool_used": df_detail_filtered.get("TOOL_USED", np.nan),
+            "tool_nm": df_detail_filtered.get("ADVC_TOOL_NM", np.nan),
+            "PA_result": df_detail_filtered.get("PA_result", np.nan),
+            "PA_rationale": df_detail_filtered.get("CLNT_RTNL_TXT", np.nan),
+            "PA_rationale_validity": df_detail_filtered.get("prod_not_aprp_rtnl_txt_cat", np.nan),
+            "employee_id": df_detail_filtered.get("RBC_OPPOR_OWN_ID", np.nan),
+            "jobcode": df_detail_filtered.get("OCCPT_JOB_CD", np.nan),
+            "position_title": df_detail_filtered.get("HR_POSN_TITL_EN", np.nan),
+            "employee_transit": df_detail_filtered.get("ORG_UNT_NO", np.nan),
+            "position_start_date": pd.to_datetime(df_detail_filtered.get("POSN_STRT_DT"), errors="coerce"),
+        })
+
+        detail_filename = f"pa_client360_detail_{runday}.xlsx"
+        detail_excel_path = dataout_path / detail_filename
+        with pd.ExcelWriter(detail_excel_path, engine="openpyxl") as writer:
+            pa_client360_detail.to_excel(writer, sheet_name="detail", index=False)
+            ws = writer.sheets["detail"]
+            col_letters = {str(c.value): c.column_letter for c in ws[1]}
+            for cn in ["reporting_date", "event_week_ending", "event_date", "position_start_date"]:
+                if cn in col_letters:
+                    for cell in ws[col_letters[cn]][1:]:
+                        if cell.value:
+                            cell.number_format = "DD/MM/YYYY"
+            if "event_timestamp" in col_letters:
+                for cell in ws[col_letters["event_timestamp"]][1:]:
+                    if cell.value:
+                        cell.number_format = "M/D/YYYY H:MM:SS AM/PM"
+
+        s.log_export(str(detail_excel_path), nobs=len(pa_client360_detail),
+                     nvars=len(pa_client360_detail.columns))
+        upload_file_to_s3(spark, str(detail_excel_path), s3_path("output", detail_filename), log)
+        write_parquet_to_s3(spark, pa_client360_detail,
+                            s3_path("output", f"pa_client360_detail_{runday}.parquet"), log)
+
+    # ── Export pivot ──
+    with log.step("update pivot table") as s:
+        pivot_excel_path = ac_path / cfg.excel_pivot_file
+        ac_for_pivot = ac_pa_client360_autocomplete.copy()
+        ac_for_pivot["DateCompleted"] = pd.to_datetime(ac_for_pivot["DateCompleted"], errors="coerce").dt.date
+        ac_for_pivot["SnapDate"] = pd.to_datetime(ac_for_pivot["SnapDate"], errors="coerce").dt.date
+        with pd.ExcelWriter(pivot_excel_path, engine="openpyxl",
+                            datetime_format="MM/DD/YYYY", date_format="MM/DD/YYYY") as writer:
+            ac_for_pivot.to_excel(writer, sheet_name="Autocomplete", index=False)
+        s.log_export(str(pivot_excel_path), nobs=len(ac_for_pivot), nvars=len(ac_for_pivot.columns))
+        upload_file_to_s3(spark, str(pivot_excel_path), s3_path("output", cfg.excel_pivot_file), log)
+        write_parquet_to_s3(spark, ac_for_pivot, s3_path("output", "pa_client360_Pivot.parquet"), log)
+
+    # ── Stop Spark ──
+    spark.stop()
+    log.log_note("Spark session stopped.")
+
+    # ── Optional SQL Server load ──
+    do_sql_load = False
+    if do_sql_load:
+        with log.step("SQL Server load") as s:
+            _load_to_sql_server(cfg, ac_path / cfg.excel_autocomplete_file, log)
+
+    # ── Finalize (replaces manual footer) ──
+    log.finalize()
+
+
+def _load_to_sql_server(cfg, excel_path, log: SASLogger):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc not installed")
+    with open(cfg.sql_secrets_json, "r", encoding="utf-8") as f:
+        secrets = json.load(f)
+    sql_server = secrets["SQL_SERVER"]
+    sql_database = secrets["SQL_DATABASE"]
+    uid = secrets["SQL_UID"]
+    pwd = secrets["SQL_PWD"]
+    conn = None
+    cursor = None
+    try:
+        conn = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={sql_server};DATABASE={sql_database};"
+            f"UID={uid};PWD={pwd};TrustServerCertificate=Yes;Connection Timeout=10;")
+        cursor = conn.cursor()
+        cursor.execute(f"select top 1 * from {sql_database}.dbo.{cfg.sql_table}")
+        expected_columns = [col[0] for col in cursor.description]
+        if "RowID" in expected_columns:
+            expected_columns.remove("RowID")
+
+        df_load = pd.read_excel(str(excel_path))
+        rename_map = {"Control Risk": "ControlRisk", "segment": "Segment", "segment2": "Segment2",
+                      "segment3": "Segment3", "segment4": "Segment4", "segment5": "Segment5",
+                      "segment6": "Segment6", "segment7": "Segment7", "segment8": "Segment8",
+                      "segment9": "Segment9", "segment10": "Segment10",
+                      "Commentcode": "CommentCode", "comments": "Comments"}
+        df_load.rename(columns=rename_map, inplace=True)
+        for col in expected_columns:
+            if col not in df_load.columns:
+                df_load[col] = np.nan
+        df_load = df_load[expected_columns]
+        df_load = df_load.map(lambda x: None if pd.isna(x) or str(x).strip() == "" else x)
+
+        placeholders = ", ".join(["?"] * len(expected_columns))
+        columns_str = ", ".join([f"[{c}]" for c in expected_columns])
+        insert_sql = f"INSERT INTO dbo.{cfg.sql_table} ({columns_str}) VALUES ({placeholders})"
+        records = df_load.where(pd.notnull(df_load), None).values.tolist()
+
+        log.run_insert(cfg.sql_table, insert_sql, records, conn,
+                       source="SQL Server", database=sql_database)
+    except Exception as e:
+        log.log_exception(e, note="SQL Server load failed")
+        raise
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+        log.log_note("Database connection closed.")
+
+
+if __name__ == "__main__":
+    try:
+        ss = get_spark_session("C86_PA_Client360_Standalone")
+        job_conf = {
+            "output": "sas/RSD/REG_DEV/C86/output/product_appropriateness/client360",
+            "logpath": "sas/RSD/REG_DEV/C86/log/product_appropriateness/client360",
+            "teradata_conn_json": "TeradataConnection_T.json",
+        }
+        process_c86_pa_client360(ss, job_conf)
+    except Exception as e:
+        import traceback
+        print(f"SCRIPT FAILED: {e}", file=sys.stderr)
+        traceback.print_exc()
+        raise
+    finally:
+        try:
+            ss.sparkContext._gateway.close()
+            ss.stop()
+        except Exception:
+            pass
