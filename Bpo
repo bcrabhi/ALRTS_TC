@@ -1,203 +1,72 @@
-def build_pandas_outputs(ctx: Context) -> dict[str, pd.DataFrame]:
-    df = fetch_df(ctx, f"SELECT * FROM {mem_fqtn(ctx, 'cards_alert_final_m')}")
+# Teradata Update Limitation & Solution Options
 
-    # Trino returns unquoted identifiers as lower-case; normalize once.
-    df.columns = [c.lower() for c in df.columns]
+## Problem Statement
 
-    # ----------------------------
-    # Required column checks (fail fast, avoids silent None returns)
-    # ----------------------------
-    required = {
-        "eventtimestamp",       # decision timestamp from xb80
-        "eventtimestamp_a",     # sent timestamp from inbox
-        "decisionid",           # decision id from xb80
-        "decisionid_a",         # decision id from inbox (may be null)
-    }
-    missing = sorted([c for c in required if c not in df.columns])
-    if missing:
-        raise KeyError(f"Missing required columns from cards_alert_final_m: {missing}. "
-                       f"Available columns (sample): {list(df.columns)[:25]}")
+The current Teradata environment enforces a limitation on the number of update operations that can be executed concurrently (observed limit ~6). This constraint is controlled at the database/platform level and cannot be managed within application logic.
 
-    # ----------------------------
-    # Timestamps
-    # ----------------------------
-    df["decision_ts"] = pd.to_datetime(df["eventtimestamp"], errors="coerce")
-    df["sent_ts"] = pd.to_datetime(df["eventtimestamp_a"], errors="coerce")
+This limitation directly impacts the ability to execute parallel processing, resulting in:
 
-    # SLA seconds (float; keep as float to avoid NaN->int crashes)
-    df["time_diff"] = (df["sent_ts"] - df["decision_ts"]).dt.total_seconds()
+- Increased execution time  
+- Reduced scalability  
+- Potential delays in meeting project timelines  
 
-    # SLA flag
-    df["sla_ind"] = np.where(df["time_diff"].notna() & (df["time_diff"] <= 1800), "Y", "N")
+It is currently unclear whether this limit is configurable. Confirmation is required from the Teradata platform team.
 
-    # Full bucket parity
-    df["alert_time"] = df["time_diff"].apply(sla_bucket_parity)
+---
 
-    # decision_date for sampling
-    df["decision_date"] = df["decision_ts"].dt.date
+## Proposed Solutions
 
-    # ----------------------------
-    # Threshold limit check (avoid NaN->int failures)
-    # ----------------------------
-    # Convert to numeric safely (keeps NaN as NaN; no astype(int))
-    if "alertamount" in df.columns and "thresholdamount" in df.columns:
-        df["alertamount_num"] = pd.to_numeric(df["alertamount"], errors="coerce")
-        df["thresholdamount_num"] = pd.to_numeric(df["thresholdamount"], errors="coerce")
+### Option 1: Request Increase in Teradata Limit
 
-        df["threshold_limit_check"] = np.where(
-            df["alertamount_num"].notna()
-            & df["thresholdamount_num"].notna()
-            & (df["alertamount_num"] <= df["thresholdamount_num"]),
-            "Y",
-            "N",
-        )
-    else:
-        # keep pipeline running; you can tighten later if SAS requires it
-        df["threshold_limit_check"] = "N"
+Submit a ServiceNow request to the Teradata team to confirm whether the update limit can be increased or reconfigured.
 
-    # ----------------------------
-    # Completeness flag
-    # ----------------------------
-    df["found_missing"] = np.where(
-        df["eventtimestamp_a"].isna() | df["eventtimestamp"].isna(),
-        "Y",
-        "",
-    )
+**Advantages:**
+- Clean and scalable solution  
+- No architectural changes required  
 
-    # SAS delete condition parity:
-    # if isBusiness_p="true" and dec_tm_ge_pref_tm="Y" then delete;
-    if "isbusiness_p" in df.columns and "dec_tm_ge_pref_tm" in df.columns:
-        df = df[~((df["isbusiness_p"] == "true") & (df["dec_tm_ge_pref_tm"] == "Y"))].copy()
+**Disadvantages:**
+- Dependent on platform approval  
+- May be restricted due to system stability and governance policies  
 
-    # ----------------------------
-    # Base samples (18 per decision_date deterministic)
-    # ----------------------------
-    base_samples = deterministic_sample_18_per_day(df, "decision_date", seed=123)
+---
 
-    # ----------------------------
-    # Aggregations (AC week + autocomplete)
-    # (Assumes helper functions exist in your script:
-    #   - segment10(d) -> 'YYYYMM' or ''
-    #   - event_week_ending(d) -> date (SAS week end)
-    #   - custid_mask(...) if used in details
-    # )
-    # ----------------------------
-    def _segment10_safe(d: Any) -> str:
-        try:
-            return segment10(d)  # your existing helper
-        except Exception:
-            return ""
+### Option 2: Use Multiple Service IDs for Parallel Execution
 
-    def _event_week_ending_safe(d: Any) -> Any:
-        try:
-            return event_week_ending(d)  # your existing helper
-        except Exception:
-            return pd.NaT
+Introduce multiple service IDs and distribute workloads across them to bypass per-ID limitations.
 
-    def agg_table(
-        src: pd.DataFrame,
-        rde: str,
-        producttype: str,
-        testtype: str,
-        controlrisk: str,
-        lob: str,
-        comment_logic: str,
-    ) -> pd.DataFrame:
-        tmp = src.copy()
+**Advantages:**
+- Enables parallel execution immediately  
+- Does not require platform-level changes  
 
-        # CommentCode logic (extend if your SAS has more branches)
-        if comment_logic == "threshold_limit_check":
-            tmp["commentcode"] = np.where(tmp["threshold_limit_check"] == "Y", "COM16", "COM19")
-            fail_flag = (tmp["threshold_limit_check"] != "Y")
-        elif comment_logic == "sla_ind":
-            tmp["commentcode"] = np.where(tmp["sla_ind"] == "Y", "COM16", "COM19")
-            fail_flag = (tmp["sla_ind"] != "Y")
-        elif comment_logic == "completeness":
-            tmp["commentcode"] = np.where(tmp["decisionid_a"].isna() | (tmp["decisionid_a"] == ""), "COM19", "COM16")
-            fail_flag = (tmp["decisionid_a"].isna() | (tmp["decisionid_a"] == ""))
-        else:
-            tmp["commentcode"] = "COM16"
-            fail_flag = pd.Series(False, index=tmp.index)
+**Disadvantages:**
+- Increased complexity in credential and access management  
+- Potential audit and compliance concerns  
+- Higher operational overhead  
 
-        vol = int(len(tmp))
-        fail = int(fail_flag.sum())
-        passed = vol - fail
-        fail_pct = (fail / vol) if vol else 0.0
+---
 
-        reporting_date = pd.to_datetime(ctx.d.report_dt)
-        event_date = pd.to_datetime(tmp["decision_ts"]).dt.date if "decision_ts" in tmp.columns else pd.Series([pd.NaT] * len(tmp))
-        # representative date for aggregation: use report date as SAS often does; adjust if your SAS uses decision date
-        rep_event_date = pd.to_datetime(ctx.d.report_dt).date()
+### Option 3: Sequential / Batched Execution
 
-        out = pd.DataFrame(
-            [{
-                "event_month": _segment10_safe(rep_event_date),
-                "reporting_date": reporting_date.date(),
-                "event_week_ending": _event_week_ending_safe(rep_event_date),
-                "lob": lob,
-                "product": producttype,
-                "rde": rde,
-                "testtype": testtype,
-                "controlrisk": controlrisk,
-                "commentcode": tmp["commentcode"].iloc[0] if vol else "COM16",
-                "volume": vol,
-                "pass": passed,
-                "fail": fail,
-                "fail_pct": fail_pct,
-            }]
-        )
-        return out
+Divide the workload into smaller batches and execute them sequentially within the allowed limits.
 
-    # AC Week table pieces (align to your SAS intent)
-    # Accuracy: sample-based threshold check (typical for cards alerts)
-    ac_accuracy = agg_table(
-        base_samples,
-        rde="Threshold Amount",
-        producttype="Credit Cards",
-        testtype="Sample",
-        controlrisk="Accuracy",
-        lob="Credit Cards",
-        comment_logic="threshold_limit_check",
-    )
+**Advantages:**
+- Simple implementation  
+- No dependency on external teams  
 
-    # Timeliness: SLA over full population
-    ac_timeliness = agg_table(
-        df,
-        rde="Alert Delivery SLA",
-        producttype="Credit Cards",
-        testtype="Anomaly",
-        controlrisk="Timeliness",
-        lob="Credit Cards",
-        comment_logic="sla_ind",
-    )
+**Disadvantages:**
+- Slower execution  
+- Not scalable for large data volumes  
 
-    # Completeness: inbox match (decisionid_a missing)
-    ac_completeness = agg_table(
-        df,
-        rde="Inbox Reconciliation",
-        producttype="Credit Cards",
-        testtype="Reconciliation",
-        controlrisk="Completeness",
-        lob="Credit Cards",
-        comment_logic="completeness",
-    )
+---
 
-    ac_week_final = pd.concat([ac_accuracy, ac_timeliness, ac_completeness], ignore_index=True)
+### Option 4: Reduce Dependency on Updates (Set-Based Processing)
 
-    # Autocomplete dataset (downstream SQL Server insert)
-    autocomplete = ac_week_final.copy()
+Refactor logic to use set-based operations such as MERGE statements, staging tables, or bulk transformations instead of multiple updates.
 
-    # ----------------------------
-    # Detail files
-    # ----------------------------
-    completeness_fail = df[df["decisionid_a"].isna() | (df["decisionid_a"] == "")].copy()
-    timeliness_fail = df[df["sla_ind"] != "Y"].copy()
-    accuracy_fail = base_samples[base_samples["threshold_limit_check"] != "Y"].copy()
+**Advantages:**
+- Improves performance  
+- Aligns with best practices  
 
-    return {
-        "alert_cards_ac_week": ac_week_final, if
-        "alert_cards_completeness_detail": completeness_fail,
-        "alert_cards_timeliness_detail": timeliness_fail,
-        "alert_cards_accuracy_detail": accuracy_fail,
-        "autocomplete_alert_cards": autocomplete,
-    }
+**Disadvantages:**
+- Requires redesign effort  
+- Potential deviation risk from existing SAS logic if not validated carefully  
