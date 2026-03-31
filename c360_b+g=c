@@ -1,4 +1,5 @@
 
+
 # C86_pa_client360 - SAS to Python Migration
 # Product Appropriateness | Client 360 | Batch Backfill Script
 
@@ -1148,8 +1149,226 @@ def load_to_sql_server():
 
 
 
+# SQL SERVER DETAIL LOAD SECTION
+# Loads pa_client360_detail_{runday}.csv into dbo.PA_CLIENT360_DTL
+#
+# Target table DDL (dbo.PA_CLIENT360_DTL):
+#   [event_month]           varchar(255) NULL
+#   [reporting_date]        date         NULL
+#   [event_week_ending]     date         NULL
+#   [event_date]            date         NULL
+#   [event_timestamp]       datetime     NULL
+#   [opportunity_id]        varchar(255) NULL
+#   [opportunity_type]      varchar(255) NULL
+#   [product_code]          varchar(255) NULL
+#   [product_category_name] varchar(255) NULL
+#   [product_family_name]   varchar(255) NULL
+#   [product_name]          varchar(255) NULL
+#   [oppor_stage_nm]        varchar(255) NULL
+#   [tool_used]             varchar(255) NULL
+#   [tool_nm]               varchar(255) NULL
+#   [PA_result]             varchar(255) NULL
+#   [PA_rationale]          varchar(255) NULL
+#   [PA_rationale_validity] varchar(255) NULL
+#   [employee_id]           varchar(255) NULL
+#   [job_code]              varchar(255) NULL
+#   [position_title]        varchar(255) NULL
+#   [employee_transit]      varchar(255) NULL
+#   [position_start_date]   date         NULL
+
+
+def load_detail_to_sql_server(runday: str = None):
+    """
+    Reads the pa_client360_detail_{runday}.csv produced by Step 25
+    and bulk-inserts into dbo.PA_CLIENT360_DTL on SQL Server via pyodbc.
+
+    Parameters
+    ----------
+    runday : str, optional
+        8-digit run date string (YYYYMMDD).
+        Defaults to the BATCH_DATES[BATCH_ID] end-date if not supplied.
+    """
+    import pyodbc
+
+    # ----------------------------------------------------------------
+    # Resolve runday and CSV path
+    # ----------------------------------------------------------------
+    if runday is None:
+        _, batch_end = BATCH_DATES[BATCH_ID]
+        runday = batch_end.replace("-", "")
+
+    csv_path = OUTPATH / runday / f"pa_client360_detail_{runday}.csv"
+
+    logging.info("=" * 50)
+    logging.info("Starting SQL Server detail load (PA_CLIENT360_DTL)...")
+    logging.info(f"Source file : {csv_path}")
+
+    # ----------------------------------------------------------------
+    # Load credentials
+    # ----------------------------------------------------------------
+    with open(r'sql.json', "r") as f:
+        secrets = json.load(f)
+
+    SQL_SERVER      = secrets["SQL_SERVER"]
+    SQL_DATABASE    = secrets["SQL_DATABASE"]
+    UID             = secrets["SQL_UID"]
+    PWD             = secrets["SQL_PWD"]
+    SQL_TABLE       = "PA_CLIENT360_DTL"
+    identity_column = 'RowID'
+
+    conn_str = (
+        f'DRIVER={{ODBC Driver 17 for SQL Server}};'
+        f'SERVER={SQL_SERVER};'
+        f'DATABASE={SQL_DATABASE};'
+        f'UID={UID};'
+        f'PWD={PWD};'
+        f'TrustServiceCertificate=Yes;'
+        f'Connection Timeout=10;'
+    )
+
+    # ----------------------------------------------------------------
+    # Discover expected columns from target table at runtime
+    # ----------------------------------------------------------------
+    conn_probe   = pyodbc.connect(conn_str)
+    cursor_probe = conn_probe.cursor()
+    cursor_probe.execute(
+        f"SELECT TOP 1 * FROM {SQL_DATABASE}.dbo.{SQL_TABLE}"
+    )
+    expected_columns_raw = [col[0] for col in cursor_probe.description]
+    expected_columns     = [col[0] for col in cursor_probe.description]
+    cursor_probe.close()
+    conn_probe.close()
+
+    # Remove identity / auto-increment column if present
+    if identity_column in expected_columns:
+        expected_columns.remove(identity_column)
+    if identity_column in expected_columns_raw:
+        expected_columns_raw.remove(identity_column)
+
+    logging.info(f"Target table columns: {expected_columns_raw}")
+
+    # ----------------------------------------------------------------
+    # Check source file exists
+    # ----------------------------------------------------------------
+    if not os.path.exists(csv_path):
+        logging.error(
+            f"Detail CSV not found: {csv_path}. "
+            f"Ensure Step 25 (main) completed for BATCH_ID={BATCH_ID}."
+        )
+        return
+
+    # ----------------------------------------------------------------
+    # Read CSV and coerce types to match DDL
+    # ----------------------------------------------------------------
+    df = pd.read_csv(csv_path)
+    logging.info(f"Read {len(df)} rows from {csv_path}")
+
+    # date columns  → SQL date
+    date_cols = [
+        'reporting_date',
+        'event_week_ending',
+        'event_date',
+        'position_start_date',
+    ]
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+
+    # datetime column → SQL datetime (preserves time component)
+    if 'event_timestamp' in df.columns:
+        df['event_timestamp'] = pd.to_datetime(
+            df['event_timestamp'], errors='coerce'
+        )
+
+    # PA_rationale truncated to 255 chars to match varchar(255) DDL
+    if 'PA_rationale' in df.columns:
+        df['PA_rationale'] = (
+            df['PA_rationale'].astype(str).str.slice(0, 255)
+        )
+        df['PA_rationale'] = df['PA_rationale'].replace(
+            {'nan': None, 'NaT': None}
+        )
+
+    # Add any columns the target table expects but the CSV is missing
+    for col in expected_columns:
+        if col not in df.columns:
+            logging.warning(
+                f"Column '{col}' expected by target table but missing "
+                f"from CSV — filling with NULL."
+            )
+            df[col] = np.nan
+
+    # Reorder to match target table column order
+    df = df[expected_columns]
+
+    # Replace empty strings / NaN / NaT with None for pyodbc
+    df = df.where(pd.notnull(df), None)
+    df = df.map(
+        lambda x: None
+        if (x is None
+            or (isinstance(x, float) and np.isnan(x))
+            or str(x).strip() in ('', 'nan', 'NaT'))
+        else x
+    )
+
+    records = df.values.tolist()
+    logging.info(f"Prepared {len(records)} records for insert.")
+
+    print(f"Columns  : {list(df.columns)}")
+    print(f"Col count: {len(df.columns)}")
+
+    # ----------------------------------------------------------------
+    # Bulk insert
+    # ----------------------------------------------------------------
+    conn   = None
+    cursor = None
+    try:
+        conn   = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        cursor.fast_executemany = True
+
+        placeholders = ', '.join(['?'] * len(expected_columns_raw))
+        columns_str  = ', '.join(
+            [f'[{col}]' for col in expected_columns_raw]
+        )
+        insert_sql = (
+            f"INSERT INTO dbo.{SQL_TABLE} ({columns_str}) "
+            f"VALUES ({placeholders})"
+        )
+
+        logging.info(f"INSERT statement: {insert_sql}")
+        logging.info(
+            f"Inserting {len(records)} records into "
+            f"{SQL_DATABASE}.dbo.{SQL_TABLE}..."
+        )
+
+        cursor.executemany(insert_sql, records)
+        conn.commit()
+
+        logging.info(
+            f"Successfully inserted {len(records)} records into "
+            f"{SQL_DATABASE}.dbo.{SQL_TABLE}."
+        )
+        print("Detail data inserted successfully.")
+
+    except Exception as e:
+        logging.error(
+            f"Detail SQL Server load failed: {e}", exc_info=True
+        )
+        print(f"An error occurred: {e}")
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+        logging.info("Detail database connection closed.")
+        logging.info("=" * 50)
+
+
+
 # ENTRY POINT
 
 if __name__ == "__main__":
     main()
     load_to_sql_server()
+    load_detail_to_sql_server()
