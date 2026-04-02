@@ -1,0 +1,73 @@
+| Program Name | Phase | Task | What to Do | Execution Layer | Output Expected | Status | Notes |
+|--------------|-------|------|------------|-----------------|-----------------|--------|------|
+| C86_Alerts | Understand | Identify inputs | List source tables from SAS | SAS | Table list | Done | 3 tables identified |
+| C86_Alerts | Design | Define execution | Decide Trino for heavy queries | Trino | Execution plan | Done | Avoid pandas |
+| C86_Alerts | Convert | Convert SQL | Rewrite PROC SQL to Trino SQL | Trino | Query runs | In Progress | JSON parsing issue |
+| C86_Alerts | Validate | Row count check | Compare SAS vs Python counts | SQL + Python | Match counts | Failed | mismatch due to date |
+| C86_Alerts | Output | Schema match | Align column names/types | Python | Matching schema | Pending | |
+| C86_Alerts | Finalize | Add logging | Add run_id + counts logging | Python | Structured logs | Pending | |
+
+
+A. What your Excel should look like (Developer-optimized)
+
+Use this structure:
+
+| Program Name | Phase | Task | What to Do | Execution Layer | Output Expected | Status | Notes |
+
+Keep it practical.
+
+B. Phases (simplified for developers)
+
+Do not use 12 phases.
+Reduce to 6 execution phases.
+
+Phase 1 — Understand
+Identify input tables
+Identify output
+Identify joins
+Identify filters
+Identify type (ETL / QA)
+Phase 2 — Design
+Decide execution layer (Trino / SQL / Python)
+Define data flow
+Identify critical columns
+Phase 3 — Convert
+Convert SQL logic
+Convert transformations
+Replace SAS functions
+Integrate into template
+Phase 4 — Validate
+Compare row counts
+Compare distinct keys
+Compare null %
+Identify mismatches
+Phase 5 — Output Alignment
+Match SAS output structure
+Validate schema
+Validate downstream compatibility
+Phase 6 — Finalize
+Add logging
+Add config
+Prepare for scheduling
+Mark ready for deployment
+C. Example (what one program should look like)
+| Program Name | Phase | Task | What to Do | Execution Layer | Output Expected | Status | Notes |
+|--------------|-------|------|------------|-----------------|-----------------|--------|------|
+| C86_Alerts | Understand | Identify inputs | List source tables from SAS | SAS | Table list | Done | 3 tables identified |
+| C86_Alerts | Design | Define execution | Decide Trino for heavy queries | Trino | Execution plan | Done | Avoid pandas |
+| C86_Alerts | Convert | Convert SQL | Rewrite PROC SQL to Trino SQL | Trino | Query runs | In Progress | JSON parsing issue |
+| C86_Alerts | Validate | Row count check | Compare SAS vs Python counts | SQL + Python | Match counts | Failed | mismatch due to date |
+| C86_Alerts | Output | Schema match | Align column names/types | Python | Matching schema | Pending | |
+| C86_Alerts | Finalize | Add logging | Add run_id + counts logging | Python | Structured logs | Pending | |
+D. Why this works for developers
+Clear what to do
+Clear where to do it
+Clear what success looks like
+Easy to update
+Easy to reuse across 200 programs
+E. What to tell the developer
+
+You respond like this:
+
+I’ve structured the conversion into phases so each script follows the same steps — understanding, design, conversion, validation, and finalization. This will help ensure consistency across all programs and make it easier to track progress and issues.
+
