@@ -1,52 +1,31 @@
 """
-sas_logger.py — Production-grade logging for SAS-to-Python migration scripts.
+logger.py - Reusable logging module for SAS-to-Python migration scripts.
 
-Version: 2.0
+Version : 3.0
 Audience: Migration Engineers, Regulatory Reporting Division
-Module: Shared across all migrated scripts (deploy alongside common.py)
+Deploy  : Place alongside common.py in the shared modules directory.
 
-Design:
-  - Python-native log format with SAS-equivalent information
-  - Zero duplication: run_query() executes AND logs in one call
-  - Source-agnostic: Teradata, Hive/Spark, SQL Server, Salesforce, any DB-API
-  - Sensitive data masking: SSN, CC, email, password auto-scrubbed
-  - Production features: log rotation, JSON logging, run IDs, data validation
-  - Thread-safe: duplicate-handler guards on all logger creation
+Architecture:
+    TIER 1 - MANDATORY STANDARD (use in every script)
+    TIER 2 - OPTIONAL EXTENDED (use when needed)
 
-Usage (minimal):
-    from sas_logger import SASLogger
+Usage (minimum):
+    from logger import init_logger, log_query, log_dataset, log_export,
+                       log_step, log_exception, log_summary
 
-    log = SASLogger("C86_PA_Client360", log_dir="path/to/logs")
-    df = log.run_query("tracking_all", sql, conn, source="Teradata")
-    log.log_dataset("c360_detail", df)
-    log.log_export("/path/to/file.xlsx", nobs=len(df), nvars=len(df.columns))
-    log.finalize()
-
-Usage (production JSON):
-    from sas_logger import get_json_logger, log_stage, log_run_header
-
-    logger = get_json_logger("C86_PA_Client360", log_dir="path/to/logs")
-    log_run_header(logger, {"report": "C86", "env": "PROD"})
-    with log_stage(logger, "Pull tracking data", source="Teradata"):
-        df = pd.read_sql(sql, conn)
+    logger = init_logger("C86_PA_Client360", log_dir="path/to/logs")
+    with log_step(logger, "Pull tracking data"):
+        df = log_query(logger, "tracking_all", sql, conn, source="Teradata")
+    log_dataset(logger, "c360_detail", df)
+    log_export(logger, "/path/to/output.xlsx", nobs=len(df))
+    log_summary(logger)
 """
 
 from __future__ import annotations
 
-# ═══════════════════════════════════════════════════════════════════
-# ANTI-PATTERN GUARDS — do NOT use these in any converted script:
-#   1. print() for logging        — use logger methods instead
-#   2. f-strings in logger args   — use lazy % formatting
-#   3. bare except:               — always catch specific exceptions
-#   4. logging.basicConfig()      — use SASLogger or get_*_logger()
-#   5. PII in log messages        — masking handles known patterns,
-#                                   but never log raw customer data
-# ═══════════════════════════════════════════════════════════════════
-
 import contextlib
 import json
 import logging
-import logging.config
 import logging.handlers
 import os
 import re
@@ -57,971 +36,262 @@ import uuid
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Generator, List, Optional, Union
-
+from typing import Any, Generator, Optional
 
 __all__ = [
-    # Primary API — SASLogger class (existing scripts)
-    "SASLogger",
-    # Production logger factories
-    "get_logger",
-    "get_production_logger",
-    "get_json_logger",
-    # Utility functions
-    "log_stage",
-    "log_run_header",
-    "log_run_summary",
-    "validate_column_check",
-    "load_logging_config",
-    # Formatters and filters (for custom configuration)
-    "JsonFormatter",
-    "RunIdFilter",
-    "MaskingFilter",
-    # Constants
-    "LOG_FORMAT_STANDARD",
-    "LOG_FORMAT_JSON_FIELDS",
-    "DEFAULT_MAX_BYTES",
-    "DEFAULT_BACKUP_COUNT",
-    "NULL_PCT_WARN_THRESHOLD",
+    "init_logger",
+    "log_query", "log_execute", "log_insert",
+    "log_dataset", "log_export",
+    "log_step",
+    "log_warn", "log_error", "log_exception",
+    "log_summary",
+    "log_note", "log_vars", "log_validate", "log_header",
 ]
 
+_LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+_MAX_BYTES = 50 * 1024 * 1024
+_BACKUP_COUNT = 10
+_NULL_THRESHOLD = 5.0
 
-# ═══════════════════════════════════════════════════════════════════
-# CONSTANTS
-# ═══════════════════════════════════════════════════════════════════
-
-LOG_FORMAT_STANDARD: str = (
-    "%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(lineno)d | %(message)s"
-)
-
-LOG_FORMAT_JSON_FIELDS: tuple = (
-    "@timestamp", "level", "report", "run_id",
-    "logger", "module", "filename", "lineno", "message",
-)
-
-DEFAULT_MAX_BYTES: int = 50 * 1024 * 1024   # 50 MB
-DEFAULT_BACKUP_COUNT: int = 10
-NULL_PCT_WARN_THRESHOLD: float = 5.0
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SENSITIVE-DATA MASKING
-# ═══════════════════════════════════════════════════════════════════
-
-_MASK_PATTERNS: List[re.Pattern] = [
-    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),                                      # SSN
-    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),        # Email
-    re.compile(r"\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13})\b"),         # CC
-    re.compile(r"(?i)password\s*[:=]\s*\S+"),                                    # password=xxx
-    re.compile(r"(?i)pwd\s*[:=]\s*\S+"),                                         # pwd=xxx
+_MASK_PATTERNS = [
+    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
+    re.compile(r"\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13})\b"),
+    re.compile(r"(?i)password\s*[:=]\s*\S+"),
+    re.compile(r"(?i)pwd\s*[:=]\s*\S+"),
 ]
-_MASK_TOKEN: str = "***MASKED***"
 
-
-def _mask(text: str) -> str:
-    """Replace known sensitive patterns with mask token."""
+def _mask(text):
     for pat in _MASK_PATTERNS:
-        text = pat.sub(_MASK_TOKEN, text)
+        text = pat.sub("***MASKED***", text)
     return text
 
-
-# ═══════════════════════════════════════════════════════════════════
-# FILTERS
-# ═══════════════════════════════════════════════════════════════════
-
-class RunIdFilter(logging.Filter):
-    """Attaches a run_id attribute to every log record.
-
-    Args:
-        run_id: Unique identifier for this pipeline run.
-    """
-
-    def __init__(self, run_id: str) -> None:
-        super().__init__()
-        self.run_id = run_id
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.run_id = self.run_id  # type: ignore[attr-defined]
-        return True  # never suppress
-
-
-class MaskingFilter(logging.Filter):
-    """Scrubs sensitive data patterns from log messages after formatting.
-
-    Applied at the formatter level, not on raw args, to avoid breaking
-    %-style format specifiers like %d and %.2f.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        # Only mask the msg string itself (not args — those need to stay
-        # as their original types for % formatting to work)
-        if isinstance(record.msg, str):
-            record.msg = _mask(record.msg)
-        return True
-
-
-# ═══════════════════════════════════════════════════════════════════
-# FORMATTERS
-# ═══════════════════════════════════════════════════════════════════
-
-class JsonFormatter(logging.Formatter):
-    """Emits structured JSON log lines for production/SIEM ingestion.
-
-    Args:
-        report_name: Name of the regulatory report.
-        run_id: Unique pipeline run identifier.
-    """
-
-    def __init__(self, report_name: str, run_id: str) -> None:
-        super().__init__()
-        self.report_name = report_name
-        self.run_id = run_id
-
-    def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "@timestamp": datetime.fromtimestamp(
-                record.created, tz=timezone.utc
-            ).isoformat(),
-            "level": record.levelname,
-            "report": self.report_name,
-            "run_id": self.run_id,
-            "logger": record.name,
-            "module": record.module,
-            "filename": record.filename,
-            "lineno": record.lineno,
-            "message": _mask(record.getMessage()),
-        }
-        if record.exc_info and record.exc_info[0] is not None:
-            payload["exception"] = traceback.format_exception(*record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
-
-
-class _StandardMaskingFormatter(logging.Formatter):
-    """Standard formatter with sensitive-data masking built in."""
-
-    def __init__(self, fmt: str = LOG_FORMAT_STANDARD) -> None:
-        super().__init__(fmt=fmt)
-
-    def format(self, record: logging.LogRecord) -> str:
+class _MaskFormatter(logging.Formatter):
+    def format(self, record):
         return _mask(super().format(record))
 
+_run_state = {}
 
-# ═══════════════════════════════════════════════════════════════════
-# LOGGER FACTORIES
-# ═══════════════════════════════════════════════════════════════════
+def _state(logger):
+    name = logger.name
+    if name not in _run_state:
+        _run_state[name] = {
+            "start_ts": time.time(), "start_dt": datetime.now(),
+            "steps": 0, "errors": 0, "warnings": 0,
+            "run_id": str(uuid.uuid4()),
+        }
+    return _run_state[name]
 
-def _guard_duplicate_handlers(logger: logging.Logger) -> None:
-    """Remove existing handlers to prevent duplicates on re-init."""
+# ===================================================================
+# TIER 1 - MANDATORY STANDARD
+# ===================================================================
+
+def init_logger(report_name, log_dir=None, console=True, env="PROD", json_output=False):
+    log_dir = Path(log_dir) if log_dir else Path.cwd()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / ("%s_%s.log" % (report_name, ts))
+
+    logger = logging.getLogger("regulatory.migration.%s" % report_name)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
     for h in logger.handlers[:]:
         logger.removeHandler(h)
         h.close()
 
-
-def get_logger(
-    report_name: str,
-    log_dir: str | Path,
-    level: int = logging.DEBUG,
-) -> logging.Logger:
-    """Create a UAT/staging logger with console + timestamped file output.
-
-    Args:
-        report_name: Used as logger name and filename prefix.
-        log_dir: Directory for log files (created if missing).
-        level: Logging level (default DEBUG).
-
-    Returns:
-        Configured Logger instance.
-    """
-    log_dir = Path(log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"{report_name}_{ts}.log"
-
-    run_id = str(uuid.uuid4())
-    logger = logging.getLogger(f"regulatory.migration.{report_name}")
-    logger.setLevel(level)
-    _guard_duplicate_handlers(logger)
-
-    formatter = _StandardMaskingFormatter()
-    run_filter = RunIdFilter(run_id)
-
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(formatter)
-    fh.addFilter(run_filter)
-    fh.addFilter(MaskingFilter())
+    fmt = _MaskFormatter(_LOG_FORMAT)
+    fh = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8")
+    fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(formatter)
-    ch.addFilter(run_filter)
-    ch.addFilter(MaskingFilter())
-    logger.addHandler(ch)
+    if console:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
-    logger.propagate = False
+    if json_output:
+        class _JF(logging.Formatter):
+            def format(self, record):
+                return json.dumps({
+                    "@timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+                    "level": record.levelname, "report": report_name,
+                    "run_id": _state(logger)["run_id"],
+                    "message": _mask(record.getMessage()),
+                }, ensure_ascii=False)
+        jf = log_dir / ("%s.jsonl" % report_name)
+        jh = logging.handlers.RotatingFileHandler(
+            jf, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8")
+        jh.setFormatter(_JF())
+        logger.addHandler(jh)
+
+    st = _state(logger)
+    user = os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
+    host = os.environ.get("HOSTNAME", os.environ.get("COMPUTERNAME", "unknown"))
+    logger.info("=" * 70)
+    logger.info("Program: %s | run_id: %s", report_name, st["run_id"])
+    logger.info("Started: %s | User: %s | Host: %s | Env: %s",
+                st["start_dt"].strftime("%Y-%m-%d %H:%M:%S"), user, host, env)
+    logger.info("=" * 70)
     return logger
 
 
-def get_production_logger(
-    report_name: str,
-    log_dir: str | Path,
-    run_id: Optional[str] = None,
-) -> logging.Logger:
-    """Create a production logger with rotating file handler.
-
-    Args:
-        report_name: Used as logger name and filename prefix.
-        log_dir: Directory for log files.
-        run_id: Pipeline run ID (auto-generated if None).
-
-    Returns:
-        Configured Logger with RotatingFileHandler.
-    """
-    log_dir = Path(log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    if run_id is None:
-        run_id = str(uuid.uuid4())
-
-    log_file = log_dir / f"{report_name}.log"
-    logger = logging.getLogger(f"regulatory.migration.{report_name}")
-    logger.setLevel(logging.DEBUG)
-    _guard_duplicate_handlers(logger)
-
-    formatter = _StandardMaskingFormatter()
-
-    rh = logging.handlers.RotatingFileHandler(
-        log_file, maxBytes=DEFAULT_MAX_BYTES, backupCount=DEFAULT_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    rh.setFormatter(formatter)
-    rh.addFilter(RunIdFilter(run_id))
-    rh.addFilter(MaskingFilter())
-    logger.addHandler(rh)
-
-    logger.propagate = False
-    return logger
+def log_query(logger, table_name, sql, connection, source="database", params=None):
+    import pandas as pd
+    logger.info("QUERY | table=%s | source=%s", table_name, source)
+    sql_flat = " ".join(sql.split())
+    logger.info("  SQL: %s", sql_flat[:500] + "..." if len(sql_flat) > 500 else sql_flat)
+    t0 = time.perf_counter()
+    df = pd.read_sql(sql, connection, params=params)
+    elapsed = time.perf_counter() - t0
+    logger.info("  Result | rows=%d | cols=%d | elapsed=%.2fs", len(df), len(df.columns), elapsed)
+    return df
 
 
-def get_json_logger(
-    report_name: str,
-    log_dir: str | Path,
-    run_id: Optional[str] = None,
-) -> logging.Logger:
-    """Create a production JSON logger (preferred for SIEM/ELK ingestion).
-
-    Writes one JSON object per line to {report_name}.jsonl.
-
-    Args:
-        report_name: Used as logger name and filename prefix.
-        log_dir: Directory for log files.
-        run_id: Pipeline run ID (auto-generated if None).
-
-    Returns:
-        Configured Logger with JSON output.
-    """
-    log_dir = Path(log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    if run_id is None:
-        run_id = str(uuid.uuid4())
-
-    log_file = log_dir / f"{report_name}.jsonl"
-    logger = logging.getLogger(f"regulatory.migration.{report_name}.json")
-    logger.setLevel(logging.DEBUG)
-    _guard_duplicate_handlers(logger)
-
-    rh = logging.handlers.RotatingFileHandler(
-        log_file, maxBytes=DEFAULT_MAX_BYTES, backupCount=DEFAULT_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    rh.setFormatter(JsonFormatter(report_name, run_id))
-    rh.addFilter(RunIdFilter(run_id))
-    rh.addFilter(MaskingFilter())
-    logger.addHandler(rh)
-
-    logger.propagate = False
-    return logger
+def log_execute(logger, label, sql, connection, source="database"):
+    logger.info("EXECUTE | label=%s | source=%s", label, source)
+    sql_flat = " ".join(sql.split())
+    logger.info("  SQL: %s", sql_flat[:500] + "..." if len(sql_flat) > 500 else sql_flat)
+    t0 = time.perf_counter()
+    cursor = connection.cursor()
+    cursor.execute(sql)
+    elapsed = time.perf_counter() - t0
+    logger.info("  Done | elapsed=%.2fs", elapsed)
 
 
-def load_logging_config(config_path: str | Path) -> None:
-    """Load logging configuration from a YAML file.
-
-    Args:
-        config_path: Path to YAML config file.
-
-    Raises:
-        ImportError: If PyYAML is not installed.
-        FileNotFoundError: If config file doesn't exist.
-    """
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except ImportError:
-        raise ImportError(
-            "PyYAML is required for YAML config loading. "
-            "Install with: pip install pyyaml"
-        )
-
-    config_path = Path(config_path)
-    if not config_path.exists():
-        raise FileNotFoundError(
-            "Logging config file not found: %s" % config_path
-        )
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    logging.config.dictConfig(config)
+def log_insert(logger, table_name, insert_sql, records, connection, source="SQL Server", database=None):
+    target = "%s.dbo.%s" % (database, table_name) if database else "dbo.%s" % table_name
+    logger.info("INSERT | rows=%d | target=%s | source=%s", len(records), target, source)
+    t0 = time.perf_counter()
+    cursor = connection.cursor()
+    cursor.fast_executemany = True
+    cursor.executemany(insert_sql, records)
+    connection.commit()
+    elapsed = time.perf_counter() - t0
+    logger.info("  Done | elapsed=%.2fs", elapsed)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# UTILITY FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════
+def log_dataset(logger, name, df, input_name=None, input_nobs=None, where=None):
+    nobs = len(df) if df is not None else 0
+    nvars = len(df.columns) if df is not None and hasattr(df, "columns") else 0
+    logger.info("DATASET | name=%s | rows=%d | cols=%d", name, nobs, nvars)
+    if input_name:
+        logger.info("  Input: %s (%d rows)", input_name, input_nobs or nobs)
+    if where:
+        logger.info("  WHERE: %s", where)
+
+
+def log_export(logger, target, nobs=None, nvars=None):
+    parts = ["EXPORT | target=%s" % target]
+    if nobs is not None: parts.append("rows=%d" % nobs)
+    if nvars is not None: parts.append("cols=%d" % nvars)
+    logger.info(" | ".join(parts))
+
 
 @contextlib.contextmanager
-def log_stage(
-    logger: logging.Logger,
-    stage_name: str,
-    **kwargs: Any,
-) -> Generator[None, None, None]:
-    """Context manager that logs stage start/end with elapsed time.
-
-    Args:
-        logger: Logger instance.
-        stage_name: Name of the processing stage.
-        **kwargs: Additional key=value pairs logged on the START line.
-
-    Example:
-        with log_stage(logger, "Pull tracking data", source="Teradata"):
-            df = pd.read_sql(sql, conn)
-    """
+def log_step(logger, step_name, **kwargs):
+    st = _state(logger)
+    st["steps"] += 1
+    step_num = st["steps"]
     extra = "".join(" | %s=%s" % (k, v) for k, v in kwargs.items())
-    logger.info("STAGE START | stage=%s%s", stage_name, extra)
+    logger.info("STEP START | step=%d | name=%s%s", step_num, step_name, extra)
     t0 = time.perf_counter()
     try:
         yield
         elapsed = time.perf_counter() - t0
-        logger.info(
-            "STAGE END | stage=%s | elapsed=%.2fs | status=SUCCESS",
-            stage_name, elapsed,
-        )
+        logger.info("STEP END | step=%d | name=%s | elapsed=%.2fs | status=SUCCESS",
+                     step_num, step_name, elapsed)
     except Exception as exc:
         elapsed = time.perf_counter() - t0
-        logger.error(
-            "STAGE END | stage=%s | elapsed=%.2fs | status=FAILED | error=%s",
-            stage_name, elapsed, exc,
-        )
+        st["errors"] += 1
+        logger.error("STEP END | step=%d | name=%s | elapsed=%.2fs | status=FAILED | error=%s",
+                      step_num, step_name, elapsed, exc)
         raise
 
 
-def log_run_header(logger: logging.Logger, config: dict) -> None:
-    """Emit a structured run header with configuration parameters.
+def log_warn(logger, msg):
+    _state(logger)["warnings"] += 1
+    logger.warning(msg)
 
-    Args:
-        logger: Logger instance.
-        config: Dictionary of configuration key-value pairs to log.
-    """
+
+def log_error(logger, msg):
+    _state(logger)["errors"] += 1
+    logger.error(msg)
+
+
+def log_exception(logger, exc, note=None, re_raise=False):
+    _state(logger)["errors"] += 1
+    if note:
+        logger.error("EXCEPTION | context=%s | type=%s | msg=%s", note, type(exc).__name__, exc)
+    else:
+        logger.error("EXCEPTION | type=%s | msg=%s", type(exc).__name__, exc)
+    if hasattr(exc, "__traceback__") and exc.__traceback__:
+        for line in traceback.format_exception(type(exc), exc, exc.__traceback__):
+            for sub in line.rstrip().split("\n"):
+                logger.error("  %s", sub)
+    if re_raise:
+        raise exc
+
+
+def log_summary(logger, **extra_metrics):
+    st = _state(logger)
+    elapsed = time.time() - st["start_ts"]
+    status = "SUCCESS" if st["errors"] == 0 else "FAILED (%d errors)" % st["errors"]
+    name = logger.name.split(".")[-1]
     logger.info("=" * 70)
-    logger.info("REGULATORY PIPELINE RUN HEADER")
-    logger.info("  %-24s : %s", "Timestamp", datetime.now().isoformat())
-    logger.info("  %-24s : %s", "Python version", sys.version.split()[0])
-    logger.info("  %-24s : %s", "Working dir", os.getcwd())
-    logger.info(
-        "  %-24s : %s", "User",
-        os.environ.get("USER", os.environ.get("USERNAME", "unknown")),
-    )
+    logger.info("Program: %s - %s | run_id: %s", name, status, st["run_id"])
+    logger.info("Steps: %d | Errors: %d | Warnings: %d | Elapsed: %.2f seconds",
+                st["steps"], st["errors"], st["warnings"], elapsed)
+    for key, val in extra_metrics.items():
+        logger.info("  %s: %s", key, val)
+    logger.info("=" * 70)
+
+
+# ===================================================================
+# TIER 2 - OPTIONAL EXTENDED
+# ===================================================================
+
+def log_note(logger, msg):
+    logger.info(msg)
+
+def log_vars(logger, **kwargs):
+    pairs = " | ".join("%s=%s" % (k, v) for k, v in kwargs.items())
+    logger.info("VARS | %s", pairs)
+
+def log_validate(logger, df, columns, period="", threshold=_NULL_THRESHOLD):
+    n = len(df)
+    if n == 0:
+        logger.warning("Validation skipped - DataFrame is empty | period=%s", period)
+        return
+    for col in columns:
+        if col not in df.columns:
+            logger.warning("Column not found | col=%s", col)
+            continue
+        null_count = int(df[col].isna().sum())
+        null_pct = null_count / n * 100
+        if null_pct == 0:
+            logger.debug("Null check PASSED | col=%s", col)
+        elif null_pct < threshold:
+            logger.warning("Null check | col=%s | null_pct=%.2f | rows=%d", col, null_pct, null_count)
+        else:
+            logger.error("Null check | col=%s | null_pct=%.2f | rows=%d", col, null_pct, null_count)
+    logger.info("Data validation complete | period=%s | rows=%d", period, n)
+
+def log_header(logger, config):
     logger.info("CONFIGURATION PARAMETERS")
     for key, val in config.items():
         logger.info("  %-24s : %s", key, val)
-    logger.info("=" * 70)
 
-
-def log_run_summary(logger: logging.Logger, metrics: dict) -> None:
-    """Emit a structured run summary with metrics.
-
-    Args:
-        logger: Logger instance.
-        metrics: Dictionary of metric key-value pairs.
-    """
-    logger.info("=" * 70)
-    logger.info("RUN SUMMARY")
-    for key, val in metrics.items():
-        logger.info("  %-28s : %s", key, val)
-    logger.info("=" * 70)
-
-
-def validate_column_check(
-    logger: logging.Logger,
-    df: Any,
-    columns: list,
-    report_period: str,
-    null_threshold: float = NULL_PCT_WARN_THRESHOLD,
-) -> None:
-    """Check columns for null percentages and log results.
-
-    Args:
-        logger: Logger instance.
-        df: pandas DataFrame to validate.
-        columns: List of column names to check.
-        report_period: Reporting period label for the log.
-        null_threshold: Percentage threshold — below = WARNING, at/above = ERROR.
-    """
-    n = len(df)
-    if n == 0:
-        logger.warning("Data validation skipped — DataFrame is empty | period=%s", report_period)
-        return
-
-    for col in columns:
-        if col not in df.columns:
-            logger.warning("Column not found in DataFrame | col=%s", col)
-            continue
-
-        null_count = int(df[col].isna().sum())
-        null_pct = null_count / n * 100
-
-        if null_pct == 0:
-            logger.debug("Null check PASSED | col=%s", col)
-        elif null_pct < null_threshold:
-            logger.warning(
-                "Null check | col=%s | null_pct=%.2f | rows=%d",
-                col, null_pct, null_count,
-            )
-        else:
-            logger.error(
-                "Null check | col=%s | null_pct=%.2f | rows=%d",
-                col, null_pct, null_count,
-            )
-
-    logger.info("Data validation complete | period=%s | rows=%d", report_period, n)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SASLogger — HIGH-LEVEL API (existing scripts, zero duplication)
-# ═══════════════════════════════════════════════════════════════════
-
-class SASLogger:
-    """High-level logger for converted SAS scripts.
-
-    Provides zero-duplication methods that both execute database operations
-    AND log them.  Works with any DB-API connection (Teradata, Hive,
-    SQL Server, Salesforce).
-
-    Args:
-        program_name: Script/job name (appears in log header).
-        log_dir: Directory for the log file.
-        log_file: Optional explicit log filename.
-        console: Mirror output to stdout (default True).
-        env: Environment label ("PROD", "DEV", "UAT").
-        json_mode: If True, also writes JSON logs alongside standard logs.
-        run_id: Pipeline run ID (auto-generated if None).
-
-    Example:
-        log = SASLogger("C86_PA_Client360", log_dir="path/to/logs")
-        df = log.run_query("tracking_all", sql, conn, source="Teradata")
-        log.log_dataset("c360_detail", df)
-        log.finalize()
-    """
-
-    def __init__(
-        self,
-        program_name: str,
-        log_dir: str | Path | None = None,
-        log_file: Optional[str] = None,
-        console: bool = True,
-        env: str = "PROD",
-        json_mode: bool = False,
-        run_id: Optional[str] = None,
-    ) -> None:
-        self.program_name = program_name
-        self.env = env
-        self.run_id = run_id or str(uuid.uuid4())
-        self.start_time = datetime.now()
-        self.start_ts = time.time()
-        self.step_counter: int = 0
-        self.error_count: int = 0
-        self.warning_count: int = 0
-
-        # Resolve log path
-        log_dir_path = Path(log_dir) if log_dir else Path.cwd()
-        log_dir_path.mkdir(parents=True, exist_ok=True)
-        if log_file is None:
-            ymd = self.start_time.strftime("%Y%m%d_%H%M%S")
-            log_file = "%s_%s.log" % (program_name, ymd)
-        self.log_file_path = log_dir_path / log_file
-
-        # Create logger with naming convention
-        self._logger = logging.getLogger(
-            "regulatory.migration.%s" % program_name
-        )
-        self._logger.setLevel(logging.DEBUG)
-        self._logger.propagate = False
-        _guard_duplicate_handlers(self._logger)
-
-        # Filters
-        run_filter = RunIdFilter(self.run_id)
-        mask_filter = MaskingFilter()
-
-        # Standard file handler
-        fh = logging.FileHandler(self.log_file_path, mode="w", encoding="utf-8")
-        fh.setFormatter(_StandardMaskingFormatter())
-        fh.addFilter(run_filter)
-        fh.addFilter(mask_filter)
-        self._logger.addHandler(fh)
-
-        # Console handler
-        if console:
-            ch = logging.StreamHandler(sys.stdout)
-            ch.setFormatter(_StandardMaskingFormatter())
-            ch.addFilter(run_filter)
-            ch.addFilter(mask_filter)
-            self._logger.addHandler(ch)
-
-        # Optional JSON handler
-        if json_mode:
-            json_file = log_dir_path / ("%s.jsonl" % program_name)
-            jh = logging.handlers.RotatingFileHandler(
-                json_file, maxBytes=DEFAULT_MAX_BYTES,
-                backupCount=DEFAULT_BACKUP_COUNT, encoding="utf-8",
-            )
-            jh.setFormatter(JsonFormatter(program_name, self.run_id))
-            jh.addFilter(run_filter)
-            jh.addFilter(mask_filter)
-            self._logger.addHandler(jh)
-
-        # Warning capture
-        self._original_showwarning = warnings.showwarning
-        warnings.showwarning = self._capture_warning
-
-        # Emit header
-        self._write_header()
-
-    # ── Header / Footer ──────────────────────────────────────────
-
-    def _write_header(self) -> None:
-        user = os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
-        host = os.environ.get("HOSTNAME", os.environ.get("COMPUTERNAME", "unknown"))
-        self._logger.info("=" * 70)
-        self._logger.info("Program: %s | run_id: %s", self.program_name, self.run_id)
-        self._logger.info(
-            "Started: %s | User: %s | Host: %s | Env: %s",
-            self.start_time.strftime("%Y-%m-%d %H:%M:%S"), user, host, self.env,
-        )
-        self._logger.info(
-            "Python: %s | Working dir: %s",
-            sys.version.split()[0], os.getcwd(),
-        )
-        self._logger.info("=" * 70)
-
-    def finalize(self) -> None:
-        """Write closing summary. Always call at end of script."""
-        elapsed = time.time() - self.start_ts
-        status = "SUCCESS" if self.error_count == 0 else "FAILED (%d errors)" % self.error_count
-        self._logger.info("=" * 70)
-        self._logger.info(
-            "Program: %s — %s | run_id: %s",
-            self.program_name, status, self.run_id,
-        )
-        self._logger.info(
-            "Steps: %d | Errors: %d | Warnings: %d | Elapsed: %.2f seconds",
-            self.step_counter, self.error_count, self.warning_count, elapsed,
-        )
-        self._logger.info("=" * 70)
-        try:
-            warnings.showwarning = self._original_showwarning
-        except Exception:
-            pass
-
-    # ── Execute + Log (zero duplication) ─────────────────────────
-
-    def run_query(
-        self,
-        table_name: str,
-        sql: str,
-        connection: Any,
-        source: str = "database",
-        params: Any = None,
-    ) -> "pd.DataFrame":
-        """Execute SELECT, log SQL + result, return DataFrame.
-
-        Works with any DB-API connection: Teradata, Hive, SQL Server, Salesforce.
-
-        Args:
-            table_name: Logical name for the result table.
-            sql: SELECT statement to execute.
-            connection: Any DB-API connection or SQLAlchemy engine.
-            source: Label for the data source.
-            params: Optional query parameters for pd.read_sql.
-
-        Returns:
-            Query result as a pandas DataFrame.
-        """
-        import pandas as pd  # deferred import — module has no hard pandas dep
-
-        self._logger.info("QUERY | table=%s | source=%s", table_name, source)
-        sql_oneline = " ".join(sql.split())
-        if len(sql_oneline) > 500:
-            self._logger.info("  SQL: %s...", sql_oneline[:500])
-        else:
-            self._logger.info("  SQL: %s", sql_oneline)
-
-        t0 = time.perf_counter()
-        df = pd.read_sql(sql, connection, params=params)
-        elapsed = time.perf_counter() - t0
-
-        self._logger.info(
-            "  Result | rows=%d | cols=%d | elapsed=%.2fs",
-            len(df), len(df.columns), elapsed,
-        )
-        return df
-
-    def run_execute(
-        self,
-        label: str,
-        sql: str,
-        connection: Any,
-        source: str = "database",
-    ) -> None:
-        """Execute DDL/DML (CREATE TABLE, COLLECT STATS, etc.), log it.
-
-        Args:
-            label: Description for the log.
-            sql: DDL/DML statement.
-            connection: Any DB-API connection.
-            source: Label for the data source.
-        """
-        self._logger.info("EXECUTE | label=%s | source=%s", label, source)
-        sql_oneline = " ".join(sql.split())
-        if len(sql_oneline) > 500:
-            self._logger.info("  SQL: %s...", sql_oneline[:500])
-        else:
-            self._logger.info("  SQL: %s", sql_oneline)
-
-        t0 = time.perf_counter()
-        cursor = connection.cursor()
-        cursor.execute(sql)
-        elapsed = time.perf_counter() - t0
-
-        self._logger.info("  Done | elapsed=%.2fs", elapsed)
-
-    def run_insert(
-        self,
-        table_name: str,
-        insert_sql: str,
-        records: list,
-        connection: Any,
-        source: str = "SQL Server",
-        database: Optional[str] = None,
-    ) -> None:
-        """Execute bulk INSERT via executemany, log row count.
-
-        Args:
-            table_name: Target table name.
-            insert_sql: INSERT statement with placeholders.
-            records: List of row tuples/lists.
-            connection: Any DB-API connection.
-            source: Label for the data source.
-            database: Optional database name for the log.
-        """
-        db_prefix = "%s.dbo." % database if database else "dbo."
-        full_name = "%s%s" % (db_prefix, table_name)
-
-        self._logger.info(
-            "INSERT | rows=%d | target=%s | source=%s",
-            len(records), full_name, source,
-        )
-
-        t0 = time.perf_counter()
-        cursor = connection.cursor()
-        cursor.fast_executemany = True
-        cursor.executemany(insert_sql, records)
-        connection.commit()
-        elapsed = time.perf_counter() - t0
-
-        self._logger.info("  Done | elapsed=%.2fs", elapsed)
-
-    # ── Log-only methods ─────────────────────────────────────────
-
-    def log_dataset(
-        self,
-        name: str,
-        df: Any,
-        input_name: Optional[str] = None,
-        input_nobs: Optional[int] = None,
-        where_clause: Optional[str] = None,
-        elapsed: Optional[float] = None,
-    ) -> None:
-        """Log a pandas transformation result.
-
-        Args:
-            name: Output dataset name.
-            df: The result DataFrame.
-            input_name: Optional source dataset name.
-            input_nobs: Optional source row count.
-            where_clause: Optional filter description.
-            elapsed: Optional elapsed seconds.
-        """
-        nobs = len(df) if df is not None else 0
-        nvars = len(df.columns) if df is not None and hasattr(df, "columns") else 0
-
-        time_part = " | elapsed=%.2fs" % elapsed if elapsed is not None else ""
-        self._logger.info(
-            "DATASET | name=%s | rows=%d | cols=%d%s",
-            name, nobs, nvars, time_part,
-        )
-
-        if input_name:
-            read_count = input_nobs if input_nobs is not None else nobs
-            self._logger.info("  Input: %s (%d rows)", input_name, read_count)
-        if where_clause:
-            self._logger.info("  WHERE: %s", where_clause)
-
-    def log_export(
-        self,
-        target: str,
-        nobs: Optional[int] = None,
-        nvars: Optional[int] = None,
-        elapsed: Optional[float] = None,
-    ) -> None:
-        """Log a file export.
-
-        Args:
-            target: File path or target name.
-            nobs: Optional row count.
-            nvars: Optional column count.
-            elapsed: Optional elapsed seconds.
-        """
-        parts = ["EXPORT | target=%s" % target]
-        if nobs is not None:
-            parts.append("rows=%d" % nobs)
-        if nvars is not None:
-            parts.append("cols=%d" % nvars)
-        if elapsed is not None:
-            parts.append("elapsed=%.2fs" % elapsed)
-        self._logger.info(" | ".join(parts))
-
-    def log_note(self, msg: str) -> None:
-        """General info message."""
-        self._logger.info(msg)
-
-    def log_warning(self, msg: str) -> None:
-        """Warning (increments counter)."""
-        self.warning_count += 1
-        self._logger.warning(msg)
-
-    def log_error(self, msg: str) -> None:
-        """Error (increments counter)."""
-        self.error_count += 1
-        self._logger.error(msg)
-
-    def log_put(self, **kwargs: Any) -> None:
-        """Log variable values (pipe-delimited key=value)."""
-        pairs = " | ".join("%s=%s" % (k, v) for k, v in kwargs.items())
-        self._logger.info("VARS | %s", pairs)
-
-    # ── Context manager — step() ─────────────────────────────────
-
-    class _StepContext:
-        """Context manager for a logical processing step with auto-timing."""
-
-        def __init__(self, logger: "SASLogger", name: str) -> None:
-            self._l = logger
-            self._name = name
-            self._start: float = 0.0
-
-        def __enter__(self) -> "SASLogger._StepContext":
-            self._l.step_counter += 1
-            self._start = time.perf_counter()
-            self._l._logger.info(
-                "STEP START | step=%d | name=%s",
-                self._l.step_counter, self._name,
-            )
-            return self
-
-        def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
-            elapsed = time.perf_counter() - self._start
-            if exc_type:
-                self._l.log_exception(exc_val, note=self._name)
-                self._l._logger.info(
-                    "STEP END | step=%d | name=%s | elapsed=%.2fs | status=FAILED",
-                    self._l.step_counter, self._name, elapsed,
-                )
-            else:
-                self._l._logger.info(
-                    "STEP END | step=%d | name=%s | elapsed=%.2fs | status=SUCCESS",
-                    self._l.step_counter, self._name, elapsed,
-                )
-            return False
-
-        @property
-        def elapsed(self) -> float:
-            return time.perf_counter() - self._start
-
-        # Proxy methods
-        def run_query(self, *a: Any, **kw: Any) -> Any:
-            return self._l.run_query(*a, **kw)
-
-        def run_execute(self, *a: Any, **kw: Any) -> None:
-            return self._l.run_execute(*a, **kw)
-
-        def run_insert(self, *a: Any, **kw: Any) -> None:
-            return self._l.run_insert(*a, **kw)
-
-        def log_dataset(self, name: str, df: Any, **kw: Any) -> None:
-            kw.setdefault("elapsed", self.elapsed)
-            self._l.log_dataset(name, df, **kw)
-
-        def log_export(self, target: str, **kw: Any) -> None:
-            kw.setdefault("elapsed", self.elapsed)
-            self._l.log_export(target, **kw)
-
-        def log_note(self, msg: str) -> None:
-            self._l.log_note(msg)
-
-        def log_warning(self, msg: str) -> None:
-            self._l.log_warning(msg)
-
-        def log_error(self, msg: str) -> None:
-            self._l.log_error(msg)
-
-        def log_put(self, **kw: Any) -> None:
-            self._l.log_put(**kw)
-
-    def step(self, step_name: str) -> _StepContext:
-        """Context manager for a logical step with auto-timing.
-
-        Args:
-            step_name: Description of the processing step.
-
-        Example:
-            with log.step("Pull tracking data") as s:
-                df = s.run_query("tracking_all", sql, conn, source="Teradata")
-        """
-        return self._StepContext(self, step_name)
-
-    # ── Exception handling ───────────────────────────────────────
-
-    def log_exception(
-        self,
-        exc: BaseException,
-        note: Optional[str] = None,
-        re_raise: bool = False,
-    ) -> None:
-        """Log a caught exception with full traceback.
-
-        Args:
-            exc: The caught exception.
-            note: Optional context description.
-            re_raise: If True, re-raises after logging.
-        """
-        self.error_count += 1
-        if note:
-            self._logger.error(
-                "EXCEPTION | context=%s | type=%s | msg=%s",
-                note, type(exc).__name__, exc,
-            )
-        else:
-            self._logger.error(
-                "EXCEPTION | type=%s | msg=%s", type(exc).__name__, exc,
-            )
-        if hasattr(exc, "__traceback__") and exc.__traceback__:
-            tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
-            for line in tb_lines:
-                for sub in line.rstrip().split("\n"):
-                    self._logger.error("  %s", sub)
-        if re_raise:
-            raise exc
-
-    # ── Data validation ──────────────────────────────────────────
-
-    def validate_columns(
-        self,
-        df: Any,
-        columns: list,
-        report_period: str = "",
-        null_threshold: float = NULL_PCT_WARN_THRESHOLD,
-    ) -> None:
-        """Check columns for null percentages and log results.
-
-        Convenience wrapper around validate_column_check() using
-        the SASLogger's internal logger.
-
-        Args:
-            df: pandas DataFrame to validate.
-            columns: Column names to check.
-            report_period: Reporting period label.
-            null_threshold: Null percentage threshold.
-        """
-        validate_column_check(
-            self._logger, df, columns, report_period, null_threshold,
-        )
-
-    # ── Warning capture ──────────────────────────────────────────
-
-    def _capture_warning(
-        self,
-        message: Any,
-        category: type,
-        filename: str,
-        lineno: int,
-        file: Any = None,
-        line: Any = None,
-    ) -> None:
-        self.warning_count += 1
-        self._logger.warning(
-            "%s: %s (File: %s, Line: %d)",
-            category.__name__, message, filename, lineno,
-        )
-        if self._original_showwarning:
-            try:
-                self._original_showwarning(message, category, filename, lineno, file, line)
-            except Exception:
-                pass
-
-
-# ═══════════════════════════════════════════════════════════════════
-# EXAMPLE / SMOKE TEST
-# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import pandas as pd
-
-    # -- SASLogger usage (existing scripts) --
-    log = SASLogger("C86_PA_Client360", log_dir="/tmp/sas_logger_test", env="DEV")
-
-    log.log_put(WK_START="'2026-03-07'", WK_END="'2026-03-13'", INI_RUN="'N'")
-
-    with log.step("Build test data") as s:
-        df = pd.DataFrame({
-            "OPPOR_ID": range(1000),
-            "AMOUNT": [100.0] * 900 + [None] * 100,
-            "NAME": ["test"] * 1000,
-        })
-        s.log_dataset("test_data", df)
-
-    with log.step("Validate columns") as s:
-        log.validate_columns(df, ["OPPOR_ID", "AMOUNT", "NAME"], report_period="2026-Q1")
-
-    with log.step("Export results") as s:
-        s.log_export("/tmp/test_output.xlsx", nobs=len(df), nvars=len(df.columns))
-
-    log.finalize()
-
-    # -- Production JSON logger usage --
-    json_logger = get_json_logger("C86_PA_Client360", log_dir="/tmp/sas_logger_test")
-
-    log_run_header(json_logger, {
-        "report": "C86_PA_Client360",
-        "env": "PROD",
-        "source": "Teradata",
-    })
-
-    with log_stage(json_logger, "Build test data", source="Teradata"):
-        df2 = pd.DataFrame({"X": [1, 2, 3]})
-
-    log_run_summary(json_logger, {
-        "total_rows": 1000,
-        "exports": 3,
-        "status": "SUCCESS",
-    })
-
-    print("\nSmoke test complete. Check /tmp/sas_logger_test/")
+    logger = init_logger("C86_PA_Client360", log_dir="/tmp/logger_test", env="DEV")
+    log_vars(logger, WK_START="'2026-03-07'", WK_END="'2026-03-13'", INI_RUN="'N'")
+    with log_step(logger, "Build test data"):
+        df = pd.DataFrame({"OPPOR_ID": range(1000), "AMOUNT": [100.0]*900 + [None]*100})
+        log_dataset(logger, "test_data", df)
+    with log_step(logger, "Validate columns"):
+        log_validate(logger, df, ["OPPOR_ID", "AMOUNT"], period="2026-Q1")
+    with log_step(logger, "Export results"):
+        log_export(logger, "/tmp/test_output.xlsx", nobs=len(df), nvars=len(df.columns))
+    log_summary(logger, total_rows=1000, exports=1)
