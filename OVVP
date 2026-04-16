@@ -1,0 +1,126 @@
+# Find:
+from dotenv import load_dotenv  # NEW - add alongside existing imports
+
+# ── Vault / credential bootstrap ────────────────────────────────────────────
+# In production (OCP/CDN0), vault-initc writes secrets to
+#   /rbc_vault/secrets/vault_secrets.env
+# before the app container starts. In local dev, developers provide their own
+# vault.secrets.env alongside the script (gitignored).
+#
+# Either way, the rest of the code only reads from os.environ — it does not
+# care where the values came from.
+
+_VAULT_ENV_PATHS = (
+    "/rbc_vault/secrets/vault_secrets.env",  # production (vault-initc)
+    "vault.secrets.env",                     # local dev fallback
+)
+for _p in _VAULT_ENV_PATHS:
+    if os.path.exists(_p):
+        load_dotenv(_p, override=False)
+        break
+
+
+def _require_env(var_name: str) -> str:
+    """Read a required credential env var; fail loudly if missing."""
+    value = os.environ.get(var_name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required credential env var: {var_name}. "
+            f"In production, check ocp_secret_mapping.yaml "
+            f"(the `to_env_var` field). In local dev, check vault.secrets.env."
+        )
+    return value
+
+def get_teradata_connection(
+    conn_file: Optional[Path] = None,
+    logger=None,
+) -> teradatasql.TeradataConnection:
+    """
+    Opens a Teradata connection.
+
+    Production: credentials are read from environment variables populated
+    by vault-initc (see ocp_secret_mapping.yaml):
+        TD_HOST, TD_USERNAME, TD_PASSWORD
+    Local dev: same env vars, populated from vault.secrets.env.
+
+    The `conn_file` argument is retained only as a last-resort local dev
+    fallback — if the env vars are not set AND a JSON file is provided
+    and exists, credentials are read from the JSON. This path must not
+    be used in production.
+    """
+    # Preferred path: env vars (vault or local .env)
+    if all(os.environ.get(k) for k in ("TD_HOST", "TD_USERNAME", "TD_PASSWORD")):
+        host = _require_env("TD_HOST")
+        user = _require_env("TD_USERNAME")
+        pwd  = _require_env("TD_PASSWORD")
+        source = "env"
+    elif conn_file is not None and conn_file.exists():
+        # Local dev fallback only — do not use in production
+        with open(conn_file, "r", encoding="utf-8") as f:
+            conn_details = json.load(f)
+        host = conn_details.get("url")
+        user = conn_details.get("user")
+        pwd  = conn_details.get("password")
+        source = f"json:{conn_file.name}"
+        if logger:
+            log_warn(
+                logger,
+                "Teradata credentials loaded from JSON file (%s). "
+                "This path is for local dev only — production must use vault env vars.",
+                conn_file.resolve(),
+            )
+    else:
+        raise RuntimeError(
+            "No Teradata credentials available. Set TD_HOST / TD_USERNAME / "
+            "TD_PASSWORD via vault-initc (prod) or vault.secrets.env (local), "
+            "or provide a local JSON file for dev fallback."
+        )
+
+    if logger:
+        logger.info(
+            "Connecting to Teradata: host=%s  user=%s  logmech=LDAP  source=%s",
+            host, user, source,
+        )
+    conn = teradatasql.connect(host=host, user=user, password=pwd, logmech="LDAP")
+    if logger:
+        logger.info("Teradata connection successful.")
+    return conn
+
+# Production: env vars populated by vault-initc (per ocp_secret_mapping.yaml).
+# Local dev: same env vars, populated from vault.secrets.env.
+# Fallback to cfg.sql_secrets_json only when env vars are absent AND the file exists.
+_sql_env_keys = ("SQL_SERVER", "SQL_DATABASE", "SQL_USERNAME", "SQL_PASSWORD")
+if all(os.environ.get(k) for k in _sql_env_keys):
+    sql_server   = _require_env("SQL_SERVER")
+    sql_database = _require_env("SQL_DATABASE")
+    uid          = _require_env("SQL_USERNAME")
+    pwd          = _require_env("SQL_PASSWORD")
+    if logger:
+        logger.info("SQL Server credentials loaded from environment.")
+elif cfg.sql_secrets_json and Path(cfg.sql_secrets_json).exists():
+    if logger:
+        log_warn(
+            logger,
+            "SQL Server credentials loaded from JSON file (%s). "
+            "Local dev only — production must use vault env vars.",
+            cfg.sql_secrets_json,
+        )
+    with open(cfg.sql_secrets_json, "r", encoding="utf-8") as f:
+        secrets = json.load(f)
+    sql_server   = secrets["SQL_SERVER"]
+    sql_database = secrets["SQL_DATABASE"]
+    uid          = secrets["SQL_UID"]
+    pwd          = secrets["SQL_PWD"]
+else:
+    raise RuntimeError(
+        "No SQL Server credentials available. Set SQL_SERVER / SQL_DATABASE / "
+        "SQL_USERNAME / SQL_PASSWORD via vault-initc (prod) or vault.secrets.env (local)."
+    )
+
+# Local-dev-only credential JSON files. In production these are ignored;
+# credentials flow through vault-initc → env vars instead.
+teradata_conn_json: Optional[Path] = Path("TeradataConnection_T.json")
+sql_secrets_json: Optional[Path]   = Path("sql.json")
+
+
+
