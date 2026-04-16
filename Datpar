@@ -1,0 +1,135 @@
+Dataset migration is not a file movement problem. It is a long-term access, audit, and compute strategy decision. The discussion exposes three competing objectives: speed of migration, audit defensibility, and future usability.
+
+1. Core Decision Axis
+
+The team is implicitly choosing between:
+	•	Physical portability (Excel / raw SAS files)
+	•	Analytical usability (Parquet)
+	•	Operational simplicity (minimal transformation during migration)
+
+These cannot be optimized simultaneously.
+
+⸻
+
+2. Format-Level Implications
+
+Parquet (Target-state aligned)
+	•	Columnar storage → efficient scans for large datasets
+	•	Compression → reduces storage footprint significantly
+	•	Native compatibility with Python (pandas, PySpark), SQL engines, and Trino
+	•	Schema preservation → critical for regulatory reproducibility
+	•	Supports partitioning → enables scalable processing
+
+Constraint:
+	•	Requires upfront conversion effort
+	•	Needs schema discipline during conversion
+
+⸻
+
+Excel (Transit convenience, not a system of record)
+	•	Easy for business users to inspect
+	•	Minimal transformation effort during migration
+
+Failure modes:
+	•	No schema enforcement
+	•	Type ambiguity (dates, nulls, numeric precision)
+	•	Not scalable (file size, memory limits)
+	•	No audit lineage or reproducibility guarantees
+
+Conclusion: Excel introduces irreversible data degradation in a regulated pipeline.
+
+⸻
+
+Raw SAS datasets (deferred risk)
+	•	Preserves original structure
+	•	No immediate conversion effort
+
+Critical flaw:
+	•	Post-SAS decommission → loss of native readability
+	•	Python access depends on libraries like pyreadstat → not guaranteed for:
+	•	full metadata fidelity
+	•	large-scale performance
+	•	audit defensibility
+
+This creates future access risk, not just technical debt.
+
+⸻
+
+3. Hidden Constraint: Regulatory and Audit Requirements
+
+Given the context (SOX, IFRS9, AML-type workloads):
+	•	Data must be:
+	•	reproducible
+	•	schema-consistent
+	•	queryable without proprietary dependencies
+	•	Transformation logic must be traceable
+
+Implication:
+	•	Any format that loses schema or requires proprietary runtime (SAS) is non-compliant long term.
+
+⸻
+
+4. Migration Strategy (Implied but not formalized)
+
+A viable architecture emerges:
+
+Tier 1: Critical datasets (active pipelines)
+	•	Convert → Parquet
+	•	Register in metadata layer (Hive Metastore if using Trino)
+	•	Store in S3 with partitioning strategy
+	•	Enforce schema validation during conversion
+
+Tier 2: Informational datasets (audit / rarely accessed)
+Two options:
+
+Option A (safe):
+	•	Convert to Parquet once
+	•	Store compressed in S3
+	•	Minimal cost increase, eliminates future dependency risk
+
+Option B (risky, current team inclination):
+	•	Store as-is (SAS files)
+	•	Accept:
+	•	future conversion complexity
+	•	potential inability to read without SAS
+	•	audit friction
+
+⸻
+
+5. Conversion Pipeline Requirements
+
+A compliant migration requires:
+	•	Schema extraction from SAS
+	•	Explicit datatype mapping (no inference)
+	•	Null handling standardization
+	•	Date format normalization
+	•	Row count + checksum validation (SAS vs Parquet)
+	•	Logging of:
+	•	source file
+	•	conversion logic
+	•	output location
+	•	validation metrics
+
+This aligns with existing audit expectations already discussed in the program.
+
+⸻
+
+6. Performance and Cost Tradeoff
+	•	Parquet reduces storage footprint (often 3–10x compression)
+	•	Enables pushdown queries → reduces compute cost
+	•	Eliminates repeated conversion overhead during audits
+
+Excel / raw SAS:
+	•	Cheap now
+	•	Expensive later (reprocessing, re-validation, audit reconstruction)
+
+⸻
+
+7. Failure Pattern in Current Discussion
+
+Observed anti-pattern:
+	•	Optimizing for migration speed
+	•	Ignoring post-SAS survivability
+
+This creates a deferred failure:
+	•	At SAS shutdown → data becomes operationally unusable or requires emergency conversion under audit pressure
