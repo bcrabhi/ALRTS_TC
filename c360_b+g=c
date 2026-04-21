@@ -1,7 +1,7 @@
 
 
-# C86_pa_client360 - SAS to Python Migration
-# Product Appropriateness | Client 360 | Batch Backfill Script
+# C86_pa_client360 - BATCH MIGRATION
+
 
 
 # --- 0. Package Installation Check ---
@@ -92,7 +92,6 @@ def setup_logging(log_path: Path, log_file_name: str) -> Path:
 
 
 # --- Configuration ---
-# Per user request, hardcode the main output path
 OUTPATH = Path("sas/RSD/REG_DEV/C86/output/product_appropriateness/client360")
 LOGPATH = Path("sas/RSD/REG_DEV/C86/log/product_appropriateness/client360")
 
@@ -112,7 +111,7 @@ AC_PATH = OUTPATH
 
 
 
-# SECTION 2: HELPER FUNCTIONS (Connections, Date Logic, Rationale)
+# HELPER FUNCTIONS
 
 
 def get_teradata_connection():
@@ -163,9 +162,7 @@ def check_ini_run(outpath: Path, autocomplete_filename: str) -> str:
 
 
 def setup_dates(ini_run: str) -> Tuple[Dict[str, str], date, date]:
-    """
-    Replicates the main _null_ data step to set up all date macro variables.
-    """
+    
     tday = date.today()
     runday = tday.strftime('%Y%m%d')
 
@@ -201,10 +198,7 @@ def setup_dates(ini_run: str) -> Tuple[Dict[str, str], date, date]:
 
 
 def validate_rationale(text) -> tuple:
-    """
-    Replicates the pa_rationale data step logic to validate text.
-    Returns: (category, xfail_chars_gt5, xfail_rep_char, xfail_ge_2_alnum)
-    """
+    
     if pd.isna(text) or not isinstance(text, str):
         return "Invalid", 1, 1, 1
 
@@ -261,7 +255,7 @@ def main() -> None:
         )
 
         # ---------------------------------------------------------------
-        # OVERRIDE DATES FOR INITIAL BACKFILL (SPOOL-SAFE)
+        # OVERRIDE DATES FOR INITIAL BACKFILL 
         # ---------------------------------------------------------------
         batch_start, batch_end = BATCH_DATES[BATCH_ID]
 
@@ -282,9 +276,9 @@ def main() -> None:
         logging.info(f"Ensured runday output directory exists: {DATAOUT_PATH}")
 
 
-        # =================================================================
+        
         # STEP 4: Pull Tracking Data
-        # =================================================================
+        
         logging.info("Step 4: Pulling data from tracking_all (DDWV01.EVNT_PROD_TRACK_LOG)...")
 
         sql_tracking_all = f"""
@@ -299,9 +293,9 @@ WHERE advr_selt_typ = 'Advice Tool'
         logging.info(f"Loaded {len(tracking_all)} rows into tracking_all.")
 
 
-        # =================================================================
+        
         # STEP 5: Process Tracking Data (in-memory)
-        # =================================================================
+        
         logging.info("Step 5: Processing tracking data (replicating 3 PROC SQL steps)...")
 
         # Filter once for all subsequent steps
@@ -343,9 +337,9 @@ WHERE advr_selt_typ = 'Advice Tool'
         )
 
 
-        # =================================================================
+        
         # STEP 6: Pull C360 Detail Data (Volatile Table)
-        # =================================================================
+        
         logging.info("Step 6: Pulling C360 detail data (using Volatile Table)...")
 
         sql_create_vt_c360_short = f"""
@@ -405,9 +399,9 @@ WHERE c360.evnt_id IS NOT NULL
         # Volatile table is dropped when connection closes
 
 
-        # =================================================================
+        
         # STEP 7: Join Tool Info
-        # =================================================================
+        
         logging.info("Step 7: Joining tool info to c360_detail_pre...")
 
         c360_detail = pd.merge(
@@ -432,16 +426,16 @@ WHERE c360.evnt_id IS NOT NULL
         )
 
 
-        # =================================================================
+        
         # STEP 8: PROC FREQ Replication
-        # =================================================================
+        
         logging.info("PROC FREQ for c360_detail['LOB']:")
         logging.info(f"\n{c360_detail['LOB'].value_counts(dropna=False)}")
 
 
-        # =================================================================
+        
         # STEP 9: Format ($Stagefmt) Definition
-        # =================================================================
+        
         logging.info("Step 9: Defining $Stagefmt map...")
 
         stage_format_map = {
@@ -464,9 +458,9 @@ WHERE c360.evnt_id IS NOT NULL
         }
 
 
-        # =================================================================
+        
         # STEP 10: Pull AOT Data
-        # =================================================================
+        
         logging.info("Step 10: Pulling AOT data (ddwv01.evnt_prod_aot)...")
 
         sql_aot_all_oppor = f"""
@@ -484,9 +478,9 @@ GROUP BY 1
         logging.info(f"Loaded {len(aot_all_oppor)} rows into aot_all_oppor.")
 
 
-        # =================================================================
+        
         # STEP 11: Process AOT Data (in-memory)
-        # =================================================================
+        
         aot_all_oppor_unique = (
             aot_all_oppor[['OPPOR_ID']].drop_duplicates().copy()
         )
@@ -499,9 +493,9 @@ GROUP BY 1
         )
 
 
-        # =================================================================
+        
         # STEP 12: Create c360_detail_link_aot
-        # =================================================================
+        
         logging.info("Step 12: Creating c360_detail_link_aot...")
 
         c360_detail_link_aot = pd.merge(
@@ -524,9 +518,9 @@ GROUP BY 1
         )
 
 
-        # =================================================================
+        
         # STEP 13: Create c360_detail_more
-        # =================================================================
+        
         logging.info("Step 13: Filtering to c360_detail_more_in_pre...")
 
         df = c360_detail_link_aot.copy()
@@ -549,9 +543,9 @@ GROUP BY 1
         )
 
 
-        # =================================================================
+        
         # STEP 14: PA Rationale Validation
-        # =================================================================
+        
         logging.info("Step 14: Running PA Rationale validation...")
 
         pa_rationale_base = c360_detail_more_i0[
@@ -578,9 +572,9 @@ GROUP BY 1
         logging.info(f"Validated {len(pa_rationale)} rationale entries.")
 
 
-        # =================================================================
+        
         # STEP 15: Create C360_detail_more_in
-        # =================================================================
+        
         logging.info("Step 15: Creating C360_detail_more_in...")
 
         c360_detail_more_in = pd.merge(
@@ -610,9 +604,9 @@ GROUP BY 1
         )
 
 
-        # =================================================================
+        
         # STEP 16: Format ($cs_cmt) Definition
-        # =================================================================
+        
         logging.info("Step 16: Defining $cs_cmt map...")
 
         cs_cmt_map = {
@@ -638,18 +632,18 @@ GROUP BY 1
         }
 
 
-        # =================================================================
+        
         # STEP 17: Deduplicate Data (tmp0)
-        # =================================================================
+        
         logging.info("Step 17: Deduplicating by OPPOR_ID...")
 
         tmp0 = c360_detail_more_in.sort_values(by='OPPOR_ID').copy()
         tmp0['level_oppor'] = tmp0.groupby('OPPOR_ID').cumcount() + 1
 
 
-        # =================================================================
+        
         # STEP 18: Create Base AC Table (tmp_pa_C360_4ac)
-        # =================================================================
+        
         logging.info("Step 18: Creating base AC table tmp_pa_C360_4ac...")
 
         tmp_pa_c360_4ac = tmp0[tmp0['level_oppor'] == 1].copy()
@@ -694,9 +688,9 @@ GROUP BY 1
         logging.info(f"Created tmp_pa_C360_4ac: {len(tmp_pa_c360_4ac)} rows.")
 
 
-        # =================================================================
+        
         # STEP 19: Create AC Assessment (pa_C360_autocomplete_tool_use)
-        # =================================================================
+        
         logging.info("Step 19: Creating AC assessment tmp_pa_C360_ac_assessment...")
 
         df_agg = tmp_pa_c360_4ac.copy()
@@ -750,9 +744,9 @@ GROUP BY 1
         )
 
 
-        # =================================================================
+        
         # STEP 20: Prepare Data for Tool Use Count
-        # =================================================================
+        
         logging.info("Step 20: Preparing data for tool use count...")
 
         tmp_pa_c360_4ac_count_pre = pd.merge(
@@ -773,9 +767,9 @@ GROUP BY 1
         )
 
 
-        # =================================================================
+        
         # STEP 21: Create Tool Count Assessment
-        # =================================================================
+        
         logging.info("Step 21: Creating tool count assessment...")
 
         df_agg_count = tmp_pa_c360_4ac_count.copy()
@@ -834,9 +828,9 @@ GROUP BY 1
         )
 
 
-        # =================================================================
+        
         # STEP 22: Combine AC Datasets
-        # =================================================================
+        
         logging.info("Step 22: Combining autocomplete datasets...")
 
         for _df in (pa_c360_autocomplete_tool_use, pa_c360_autocomplete_count_tool):
@@ -862,9 +856,9 @@ GROUP BY 1
         ac_pa_client360_autocomplete = combine_pa_autocomplete.copy()
 
 
-        # =================================================================
+        
         # STEP 23: Append and Save Autocomplete Data
-        # =================================================================
+        
         logging.info("Step 23: Appending and saving autocomplete data...")
 
         autocomplete_path = AC_PATH / PERSISTENT_AC_FILE
@@ -875,9 +869,9 @@ GROUP BY 1
         logging.info(f"Saved persistent file: {autocomplete_path}")
 
 
-        # =================================================================
+        
         # STEP 24: Export Autocomplete to Excel
-        # =================================================================
+        
         logging.info("Step 24: Exporting autocomplete to Excel...")
 
         excel_path = AC_PATH / "pa_client360_autocomplete.xlsx"
@@ -895,9 +889,9 @@ GROUP BY 1
         logging.info(f"Exported autocomplete Excel: {excel_path}")
 
 
-        # =================================================================
+        
         # STEP 25: Create and Export Detail File
-        # =================================================================
+        
         logging.info("Step 25: Creating and exporting detail file...")
 
         df_detail = tmp_pa_c360_4ac_count_pre.copy()
@@ -954,9 +948,9 @@ GROUP BY 1
         logging.info(f"Exported detail file: {detail_csv_path}")
 
 
-        # =================================================================
+        
         # STEP 26: Export Pivot Table
-        # =================================================================
+        
         logging.info("Step 26: Exporting Pivot table...")
 
         pivot_excel_path = AC_PATH / "pa_client360_Pivot.xlsx"
@@ -994,7 +988,6 @@ GROUP BY 1
 
 
 # SQL SERVER LOAD SECTION
-# (Separate notebook cell — loads autocomplete Excel into SQL Server staging)
 
 
 def load_to_sql_server():
@@ -1148,46 +1141,8 @@ def load_to_sql_server():
         logging.info("Database connection closed.")
 
 
-
-# SQL SERVER DETAIL LOAD SECTION
-# Loads pa_client360_detail_{runday}.csv into dbo.PA_CLIENT360_DTL
-#
-# Target table DDL (dbo.PA_CLIENT360_DTL):
-#   [event_month]           varchar(255) NULL
-#   [reporting_date]        date         NULL
-#   [event_week_ending]     date         NULL
-#   [event_date]            date         NULL
-#   [event_timestamp]       datetime     NULL
-#   [opportunity_id]        varchar(255) NULL
-#   [opportunity_type]      varchar(255) NULL
-#   [product_code]          varchar(255) NULL
-#   [product_category_name] varchar(255) NULL
-#   [product_family_name]   varchar(255) NULL
-#   [product_name]          varchar(255) NULL
-#   [oppor_stage_nm]        varchar(255) NULL
-#   [tool_used]             varchar(255) NULL
-#   [tool_nm]               varchar(255) NULL
-#   [PA_result]             varchar(255) NULL
-#   [PA_rationale]          varchar(255) NULL
-#   [PA_rationale_validity] varchar(255) NULL
-#   [employee_id]           varchar(255) NULL
-#   [job_code]              varchar(255) NULL
-#   [position_title]        varchar(255) NULL
-#   [employee_transit]      varchar(255) NULL
-#   [position_start_date]   date         NULL
-
-
 def load_detail_to_sql_server(runday: str = None):
-    """
-    Reads the pa_client360_detail_{runday}.csv produced by Step 25
-    and bulk-inserts into dbo.PA_CLIENT360_DTL on SQL Server via pyodbc.
 
-    Parameters
-    ----------
-    runday : str, optional
-        8-digit run date string (YYYYMMDD).
-        Defaults to the BATCH_DATES[BATCH_ID] end-date if not supplied.
-    """
     import pyodbc
 
     # ----------------------------------------------------------------
