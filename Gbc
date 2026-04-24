@@ -238,8 +238,8 @@ xfail_rep_char = 0 if len(_x2) > 0 else 1
 
 # (3) xfail_ge_2_alnum: have at least 2 alphabet/num
 _x3 = re.sub(r'[^a-zA-Z0-9]', '', _x)
-# NOTE: Replicating SAS logic exactly (lengthn(_x3) > 2)
-xfail_ge_2_alnum = 0 if len(_x3) > 2 else 1
+# SAS: ifn(length(_x3) >= 2, 0, 1) — pass if at least 2 alnums
+xfail_ge_2_alnum = 0 if len(_x3) >= 2 else 1
 
 # Final category
 is_valid = (xfail_chars_gt5 + xfail_rep_char + xfail_ge_2_alnum) == 0
@@ -300,7 +300,6 @@ try:
     DATAOUT_PATH.mkdir(parents=True, exist_ok=True)
     logging.info(f"Ensured runday output directory exists: {DATAOUT_PATH}")
 
-
     # =================================================================
     # STEP 4: Pull Tracking Data
     # =================================================================
@@ -319,7 +318,6 @@ tracking_all = pd.read_sql(sql_tracking_all, conn)
 
 ```
     logging.info(f"Loaded {len(tracking_all)} rows into tracking_all.")
-
 
     # =================================================================
     # STEP 5: Process Tracking Data (in-memory)
@@ -364,7 +362,6 @@ tracking_all = pd.read_sql(sql_tracking_all, conn)
         f"Created tracking_tool_use: {len(tracking_tool_use)} rows"
     )
 
-
     # =================================================================
     # STEP 6: Pull C360 Detail Data (Volatile Table)
     # =================================================================
@@ -398,7 +395,7 @@ WITH DATA PRIMARY INDEX (emp_id, snap_dt) ON COMMIT PRESERVE ROWS;
 SELECT c360.*,
 emp.org_unt_no, emp.hr_posn_titl_en,
 emp.posn_strt_dt, emp.posn_end_dt, emp.occpt_job_cd,
-c360.evnt_dt + (6 - MOD(DAYOFWEEK(c360.evnt_dt) - 1, 7)) AS SnapDate
+c360.evnt_dt + MOD(13 - DAYOFWEEK(c360.evnt_dt), 7) AS SnapDate
 FROM ddwv01.evnt_prod_oppor AS c360
 LEFT JOIN
 (
@@ -436,7 +433,6 @@ PARTITION BY OPPOR_ID ORDER BY EVNT_DT DESC
     logging.info(f"Loaded {len(c360_detail_pre)} rows into c360_detail_pre.")
     # Volatile table is dropped when connection closes
 
-
     # =================================================================
     # STEP 7: Join Tool Info
     # =================================================================
@@ -463,13 +459,11 @@ PARTITION BY OPPOR_ID ORDER BY EVNT_DT DESC
         f"with LOB filled as 'Retail'"
     )
 
-
     # =================================================================
     # STEP 8: PROC FREQ Replication
     # =================================================================
     logging.info("PROC FREQ for c360_detail['LOB']:")
     logging.info(f"\n{c360_detail['LOB'].value_counts(dropna=False)}")
-
 
     # =================================================================
     # STEP 9: Format ($Stagefmt) Definition
@@ -495,7 +489,6 @@ PARTITION BY OPPOR_ID ORDER BY EVNT_DT DESC
             "61.Opportunity Won",
     }
 
-
     # =================================================================
     # STEP 10: Pull AOT Data
     # =================================================================
@@ -518,7 +511,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
 ```
     logging.info(f"Loaded {len(aot_all_oppor)} rows into aot_all_oppor.")
 
-
     # =================================================================
     # STEP 11: Process AOT Data (in-memory)
     # =================================================================
@@ -532,7 +524,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         f"Created aot_all_oppor_unique: "
         f"{len(aot_all_oppor_unique)} rows with column 'aot_oppor_id'."
     )
-
 
     # =================================================================
     # STEP 12: Create c360_detail_link_aot
@@ -558,7 +549,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         f"{len(c360_detail_link_aot)} rows."
     )
 
-
     # =================================================================
     # STEP 13: Create c360_detail_more
     # =================================================================
@@ -582,7 +572,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
     logging.info(
         f"Created c360_detail_more_i0: {len(c360_detail_more_i0)} rows."
     )
-
 
     # =================================================================
     # STEP 14: PA Rationale Validation
@@ -611,7 +600,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
 
     pa_rationale = pd.concat([pa_rationale, validation_results], axis=1)
     logging.info(f"Validated {len(pa_rationale)} rationale entries.")
-
 
     # =================================================================
     # STEP 15: Create C360_detail_more_in
@@ -644,7 +632,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         f"Created C360_detail_more_in: {len(c360_detail_more_in)} rows."
     )
 
-
     # =================================================================
     # STEP 16: Format ($cs_cmt) Definition
     # =================================================================
@@ -672,7 +659,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         'COM19': 'Potential Fail',
     }
 
-
     # =================================================================
     # STEP 17: Deduplicate Data (tmp0)
     # =================================================================
@@ -680,7 +666,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
 
     tmp0 = c360_detail_more_in.sort_values(by='OPPOR_ID').copy()
     tmp0['level_oppor'] = tmp0.groupby('OPPOR_ID').cumcount() + 1
-
 
     # =================================================================
     # STEP 18: Create Base AC Table (tmp_pa_C360_4ac)
@@ -723,7 +708,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
 
     logging.info(f"Created tmp_pa_C360_4ac: {len(tmp_pa_c360_4ac)} rows.")
 
-
     # =================================================================
     # STEP 19: Create AC Assessment (pa_C360_autocomplete_tool_use)
     # =================================================================
@@ -734,7 +718,7 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
     # segment4 mapping
     seg4_map = {
         'Product Appropriateness assessed outside Client 360':
-            'Product Appropriate assessed outside Client 360',
+            'Product Appropriateness assessed outside of Client360',  # SAS: 'of' + no space
         'Not Appropriate - Rationale':
             'Product Not Appropriate',
         'Client declined product appropriateness assessment':
@@ -745,7 +729,7 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
 
     df_agg['segment4'] = df_agg['IS_PROD_APRP_FOR_CLNT'].map(seg4_map).fillna('Missing')
     df_agg['segment5'] = df_agg['prod_not_aprp_rtnl_txt_cat']
-    df_agg['RDE']      = 'PA002_Client360_Completeness_RDE'
+    df_agg['RDE']      = 'PA003_Client360_Completeness_RDE'  # SAS: both AC tables use PA003
     df_agg['segment9'] = ''
 
     group_by_cols = [
@@ -779,7 +763,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         f"{len(pa_c360_autocomplete_tool_use)} rows."
     )
 
-
     # =================================================================
     # STEP 20: Prepare Data for Tool Use Count
     # =================================================================
@@ -802,7 +785,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         f"{len(tmp_pa_c360_4ac_count)} rows."
     )
 
-
     # =================================================================
     # STEP 21: Create Tool Count Assessment
     # =================================================================
@@ -818,7 +800,7 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         'Product Appropriate':
             'Product Appropriate',
         'Product Appropriateness assessed outside Client 360':
-            'Product Appropriateness assessed outside Client 360',
+            'Product Appropriateness assessed outside of Client360',  # SAS: 'of' + no space
     }
 
     df_agg_count['segment9'] = ''
@@ -863,7 +845,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         f"{len(pa_c360_autocomplete_count_tool)} rows."
     )
 
-
     # =================================================================
     # STEP 22: Combine AC Datasets
     # =================================================================
@@ -890,7 +871,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
     )
 
     ac_pa_client360_autocomplete = combine_pa_autocomplete.copy()
-
 
     # =================================================================
     # STEP 23: Append and Save Autocomplete Data
@@ -941,7 +921,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         f"total rows to {autocomplete_path}"
     )
 
-
     # =================================================================
     # STEP 24: Export Autocomplete to Excel
     # =================================================================
@@ -961,7 +940,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
 
     logging.info(f"Exported autocomplete Excel: {excel_path}")
 
-
     # =================================================================
     # STEP 25: Create and Export Detail File
     # =================================================================
@@ -969,8 +947,16 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
 
     df_detail = tmp_pa_c360_4ac_count_pre.copy()
 
+    # PA_result CASE statement — replicates SAS exactly:
+    #   IS_PROD_APRP_FOR_CLNT value                          -> PA_result
+    #   'Product Appropriateness assessed outside Client 360' -> same (kept as-is)
+    #   'Not Appropriate - Rationale'                        -> 'Product Not Appropriate'
+    #   'Client declined product appropriateness assessment'  -> 'Client declined'
+    #   'Product Appropriate'                                -> 'Product Appropriate'
+    #   else                                                 -> 'Missing'
     pa_result_map = {
-        'Product Appropriateness assessed outside Client 360': 'Product Appropriate',
+        'Product Appropriateness assessed outside Client 360':
+            'Product Appropriateness assessed outside Client 360',  # FIX: keep original, not 'Product Appropriate'
         'Not Appropriate - Rationale':                         'Product Not Appropriate',
         'Client declined product appropriateness assessment':  'Client declined',
         'Product Appropriate':                                 'Product Appropriate',
@@ -979,17 +965,21 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
         df_detail['IS_PROD_APRP_FOR_CLNT'].map(pa_result_map).fillna('Missing')
     )
 
+    # FIX: match SAS WHERE clause exactly — filter on PA_result only, NO date filter.
+    # SAS: where calculated PA_result in ("Product Not Appropriate","Missing",
+    #                                     "Product Appropriateness assessed outside Client 360")
+    # The date scope is already enforced by wk_start/wk_end in the Teradata SQL (Step 6).
     filter_cond = df_detail['PA_result'].isin([
         'Product Not Appropriate',
         'Missing',
         'Product Appropriateness assessed outside Client 360',
     ])
 
-    df_detail_filtered = df_detail[
-        filter_cond
-        & (df_detail['EVNT_DT'] >= pd.to_datetime(batch_start))
-        & (df_detail['EVNT_DT'] <= pd.to_datetime(batch_end))
-    ].copy()
+    # Add debug logging to verify row counts match SAS output
+    logging.info("PA_result value counts in detail file:")
+    logging.info(f"PA_result counts: {df_detail['PA_result'].value_counts(dropna=False).to_dict()}")
+
+    df_detail_filtered = df_detail[filter_cond].copy()
 
     pa_client360_detail = pd.DataFrame({
         'event_month':          df_detail_filtered['segment10'],
@@ -1019,7 +1009,6 @@ aot_all_oppor = pd.read_sql(sql_aot_all_oppor, conn)
     detail_csv_path = DATAOUT_PATH / f"pa_client360_detail_{runday}.csv"
     pa_client360_detail.to_csv(detail_csv_path, index=False)
     logging.info(f"Exported detail file: {detail_csv_path}")
-
 
     # =================================================================
     # STEP 26: Export Pivot Table
