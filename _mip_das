@@ -20,24 +20,20 @@ import pandas as pd
 import pyodbc
 
 
+# Configuration — ENV-driven paths (mirrors the SAS libnames / output paths)
 
 
-# PRODUCTION log directory (active in the SAS original)
-LOG_DIR = Path(
-    r"\\maple\data\Toronto\wrkgrp\wrkgrp33\RSD Files\DataIntegrity"
-    r"\Regulatory\COB\controls\production\log"
-)
-# DEV alternative (commented out in the SAS original):
-# LOG_DIR = Path(
-#     r"\\maple\data\Toronto\wrkgrp\wrkgrp33\RSD Files\DataIntegrity"
-#     r"\Regulatory\COB\controls\dev\log"
-# )
+ENV = os.environ.get("ENV", "PROD")          # 'PROD' or anything else => dev
+USER = os.environ.get("USER", getpass.getuser())
 
-DASHBOARD_DIR = Path(r"R:\DataIntegrity\Regulatory\COB\controls\dashboard")
+
+BASE_PATH = os.environ.get("COB_BASE_PATH", "/sas/broc/COB")
 
 # ODBC connection — SAS: Libname sql ODBC DSN="DYOF_Tracker" ...
 ODBC_DSN = "DYOF_Tracker"
 ODBC_UID = "DataIntegrity"
+# SAS sourced &trackp from /sas/broc/cde/common/security/pswd.sas on the SAS
+# server; the Python port reads the same secret from an environment variable.
 ODBC_PWD_ENV_VAR = "DYOF_TRACKER_PWD"
 
 LOGGER = logging.getLogger("cob_mrr_mip_dashboard")
@@ -132,6 +128,30 @@ ORDER BY a.snap_dt
 
 
 
+# Path resolution — ENV switch + makedirs (the COB_MRR_MIP_RS.py pattern)
+
+def configure_paths() -> Tuple[Path, Path]:
+    """Resolve the ENV-specific log/export directories and create them.
+
+    Mirrors the SAS production-vs-dev path switch. Both directories are made
+    with ``parents=True, exist_ok=True`` so a missing folder no longer raises
+    -- this is what previously broke the log FileHandler and the Excel export
+    on the Linux container. Wrapped in a function (rather than run at import)
+    so importing the module for testing has no filesystem side effects.
+
+    Returns:
+        Tuple of (log_dir, export_dir); both are guaranteed to exist on return.
+    """
+    sub = "production" if ENV == "PROD" else "dev"
+    base = Path(BASE_PATH) / sub / "MRRMIP"
+    log_dir = base / "log"
+    export_dir = base / "export"
+    for directory in (log_dir, export_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    return log_dir, export_dir
+
+
+
 # Date helpers — replicate the SAS data _null_ / intnx block
 
 def month_end(anchor: date, months_back: int) -> date:
@@ -181,6 +201,7 @@ def setup_logging(log_dir: Path) -> Path:
         Full path of the log file created.
     """
     # SAS: %sysfunc(today(),yymmddn8.)_%sysfunc(compress(%sysfunc(time(),time.),:))
+    log_dir.mkdir(parents=True, exist_ok=True)  # belt-and-suspenders vs FileHandler error
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"MRR_MIP_Dashboard_{stamp}.log"
     logging.basicConfig(
@@ -310,13 +331,16 @@ def main() -> int:
     Returns:
         0 on success (mirrors &syscc = 0); non-zero exit is raised on failure.
     """
-    log_path = setup_logging(LOG_DIR)
+    log_dir, export_dir = configure_paths()
+    log_path = setup_logging(log_dir)
     LOGGER.info(
         ">>>>>>>>>> This program is starting running at %s by %s <<<<<<<<<<",
         datetime.now().strftime("%d%b%Y:%H:%M:%S").upper(),
-        getpass.getuser(),
+        USER,
     )
-    LOGGER.info("Log file: %s", log_path)
+    LOGGER.info(">>>>>>>>>> Prod/Dev? - %s <<<<<<<<<<", ENV)
+    LOGGER.info("Log file:   %s", log_path)
+    LOGGER.info("Export dir: %s", export_dir)
 
     pwd = os.environ.get(ODBC_PWD_ENV_VAR, "")
     if not pwd:
@@ -361,7 +385,7 @@ def main() -> int:
     details2["AR_ID"] = details2["AR_ID"].map(strip_leading_zeros)
     export_to_excel(
         details2,
-        DASHBOARD_DIR / f"COB_Control_dashboard_{pre_mon_end3}.xlsx",
+        export_dir / f"COB_Control_dashboard_{pre_mon_end3}.xlsx",
         sheet_name="ReviewResult",
     )
 
@@ -375,7 +399,7 @@ def main() -> int:
     # SAS proc export without SHEET= names the sheet after the data set.
     export_to_excel(
         error,
-        DASHBOARD_DIR / f"MRR_Fail_Detail_{pre_mon_end4}.xlsx",
+        export_dir / f"MRR_Fail_Detail_{pre_mon_end4}.xlsx",
         sheet_name="Error",
     )
 
