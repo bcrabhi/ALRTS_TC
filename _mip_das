@@ -1,0 +1,390 @@
+"""
+
+PROGRAM     : cob_mrr_mip_dashboard.py
+
+"""
+
+from __future__ import annotations
+
+import calendar
+import getpass
+import logging
+import os
+import re
+import sys
+from datetime import date, datetime
+from pathlib import Path
+from typing import Dict, Tuple
+
+import pandas as pd
+import pyodbc
+
+
+
+
+# PRODUCTION log directory (active in the SAS original)
+LOG_DIR = Path(
+    r"\\maple\data\Toronto\wrkgrp\wrkgrp33\RSD Files\DataIntegrity"
+    r"\Regulatory\COB\controls\production\log"
+)
+# DEV alternative (commented out in the SAS original):
+# LOG_DIR = Path(
+#     r"\\maple\data\Toronto\wrkgrp\wrkgrp33\RSD Files\DataIntegrity"
+#     r"\Regulatory\COB\controls\dev\log"
+# )
+
+DASHBOARD_DIR = Path(r"R:\DataIntegrity\Regulatory\COB\controls\dashboard")
+
+# ODBC connection — SAS: Libname sql ODBC DSN="DYOF_Tracker" ...
+ODBC_DSN = "DYOF_Tracker"
+ODBC_UID = "DataIntegrity"
+ODBC_PWD_ENV_VAR = "DYOF_TRACKER_PWD"
+
+LOGGER = logging.getLogger("cob_mrr_mip_dashboard")
+
+
+# ActionTaken decode — identical to the CASE expression used twice in SAS
+
+ACTION_TAKEN_MAP: Dict[int, str] = {
+    0: "Complete - Acceptable Variance",
+    1: "Complete - No Error",
+    2: "Complete - Error Found and Sent to Service Partner",
+    3: "Complete - Error Found and Partially Corrected by QAO",
+    4: "Complete - Error Found and Corrected by QAO",
+    5: "Complete - False Positive",
+    6: "Complete - Duplicate",
+    7: "Complete - Unable to assess",
+    8: "Complete - Dummy Profile",
+    9: "Exception - National Office Post Fulfillment",
+    10: "Exception - Prior to Fulfillment",
+    11: "Pending",
+    12: "Sent to Service Partner",
+}
+ACTION_TAKEN_DEFAULT = "Unknown"  # SAS: else 'Unknown' (also covers NULL)
+
+
+# SQL — same joins / filters as the three PROC SQL steps
+
+SAMPLE_SQL = """
+SELECT COB_MRRMIP_MR.snap_dt,
+       COUNT(*) AS [count]
+FROM dbo.COB_MRRMIP_MR AS COB_MRRMIP_MR
+INNER JOIN dbo.tracker_report AS tracker_report
+        ON COB_MRRMIP_MR.reportid = tracker_report.reportid
+WHERE exclude = 0
+GROUP BY COB_MRRMIP_MR.snap_dt
+"""
+
+# ActionTaken is selected as the raw code here; the CASE decode is applied in
+# pandas with ACTION_TAKEN_MAP and the result re-aggregated, which is exactly
+# equivalent to the SAS "GROUP BY snap_dt, CDEName, ActionTaken" on the
+# decoded label. The unused OAct/ORes/ORoot joins are kept so any row
+# fan-out behaves identically to the SAS query.
+ACTION_TAKEN_SQL = """
+SELECT a.snap_dt,
+       cde.CDEName,
+       b.ActionTaken,
+       COUNT(*) AS [count]
+FROM dbo.COB_MRRMIP_MR AS a
+INNER JOIN dbo.tracker_report AS tracker_report
+        ON a.reportid = tracker_report.reportid
+LEFT JOIN dbo.cdetracker AS b
+       ON a.reportid = b.ReportId
+LEFT JOIN dbo.[Option] AS ORes
+       ON ORes.OptionID = b.ResolutionOptionId
+LEFT JOIN dbo.[Option] AS ORoot
+       ON ORoot.OptionID = b.RootCauseOptionId
+LEFT JOIN dbo.[Option] AS OAct
+       ON OAct.OptionID = b.ActionTaken
+LEFT JOIN dbo.CDE AS cde
+       ON cde.CDEId = b.CDEId
+WHERE a.snap_dt >= ?
+  AND exclude = 0
+GROUP BY a.snap_dt, cde.CDEName, b.ActionTaken
+"""
+
+DETAILS_SQL = """
+SELECT a.snap_dt AS Snap_Date,
+       a.ar_id AS AR_ID,
+       a.ip_id AS SRF,
+       a.Activation_date,
+       b.ActionTaken,
+       ORes.[value] AS Resolution,
+       ORoot.[value] AS Rootcause,
+       b.comments
+FROM dbo.COB_MRRMIP_MR AS a
+INNER JOIN dbo.tracker_report AS tracker_report
+        ON a.reportid = tracker_report.reportid
+LEFT JOIN dbo.cdetracker AS b
+       ON a.reportid = b.ReportId
+LEFT JOIN dbo.[Option] AS ORes
+       ON ORes.OptionID = b.ResolutionOptionId
+LEFT JOIN dbo.[Option] AS ORoot
+       ON ORoot.OptionID = b.RootCauseOptionId
+LEFT JOIN dbo.[Option] AS OAct
+       ON OAct.OptionID = b.ActionTaken
+LEFT JOIN dbo.CDE AS cde
+       ON cde.CDEId = b.CDEId
+WHERE a.snap_dt >= ?
+  AND exclude = 0
+ORDER BY a.snap_dt
+"""
+
+
+
+# Date helpers — replicate the SAS data _null_ / intnx block
+
+def month_end(anchor: date, months_back: int) -> date:
+    """Replicate SAS ``intnx('month', anchor, -months_back, 'E')``.
+
+    Args:
+        anchor: Reference date (SAS used &sysdate9, i.e. the run date).
+        months_back: Number of whole months to step back.
+
+    Returns:
+        The last calendar day of the resulting month.
+    """
+    months = anchor.year * 12 + (anchor.month - 1) - months_back
+    year, month = divmod(months, 12)
+    month += 1
+    return date(year, month, calendar.monthrange(year, month)[1])
+
+
+def get_run_dates(run_date: date) -> Tuple[date, str, str, date]:
+    """Build the four macro-variable equivalents from the SAS data _null_ step.
+
+    Args:
+        run_date: The job run date (SAS &sysdate9).
+
+    Returns:
+        Tuple of (pre_mon_end, pre_mon_end3 'YYYYMM', pre_mon_end4 'YYYYMMDD',
+        last_12_month). pre_mon_end3/pre_mon_end4 are the YYMMn6./YYMMDDn8.
+        renderings of the same previous-month-end date.
+    """
+    pre_mon_end = month_end(run_date, 1)
+    last_12_month = month_end(run_date, 12)
+    pre_mon_end3 = pre_mon_end.strftime("%Y%m")    # YYMMn6.
+    pre_mon_end4 = pre_mon_end.strftime("%Y%m%d")  # YYMMDDn8.
+    return pre_mon_end, pre_mon_end3, pre_mon_end4, last_12_month
+
+
+
+# Logging — replicates proc printto log="...MRR_MIP_Dashboard_<ts>.log" new
+
+def setup_logging(log_dir: Path) -> Path:
+    """Send the run log to a timestamped file, like the SAS proc printto.
+
+    Args:
+        log_dir: Directory that receives the log file.
+
+    Returns:
+        Full path of the log file created.
+    """
+    # SAS: %sysfunc(today(),yymmddn8.)_%sysfunc(compress(%sysfunc(time(),time.),:))
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"MRR_MIP_Dashboard_{stamp}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    return log_path
+
+
+
+# Transformations
+
+def decode_action_taken(code: object) -> str:
+    """Apply the SAS CASE decode to a raw ActionTaken code.
+
+    Args:
+        code: Raw ActionTaken value (int, float, str digits, or NULL/NaN).
+
+    Returns:
+        Decoded label, or 'Unknown' for NULL / unrecognised codes (matching
+        the SAS ``else 'Unknown'`` branch, which also catches NULLs).
+    """
+    if pd.isna(code):
+        return ACTION_TAKEN_DEFAULT
+    try:
+        return ACTION_TAKEN_MAP.get(int(code), ACTION_TAKEN_DEFAULT)
+    except (TypeError, ValueError):
+        return ACTION_TAKEN_DEFAULT
+
+
+def strip_leading_zeros(value: object) -> object:
+    """Replicate ``AR_ID = prxchange('s/^(0*)/ /', -1, AR_ID)``.
+
+    The SAS regex replaces the run of leading zeros with a single space; when
+    there are no leading zeros it still matches the empty string at position 0
+    and prepends a space. Missing values pass through untouched.
+
+    Args:
+        value: Original AR_ID value.
+
+    Returns:
+        Transformed AR_ID, or the original value when missing.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return value
+    return re.sub(r"^(0*)", " ", str(value), count=1)
+
+
+def build_action_taken_summary(raw: pd.DataFrame) -> pd.DataFrame:
+    """Decode ActionTaken and aggregate to the SAS Action_Taken grain.
+
+    Args:
+        raw: Output of ACTION_TAKEN_SQL (counts by raw ActionTaken code).
+
+    Returns:
+        DataFrame with columns snap_dt, CDEName, ActionTaken (decoded label),
+        count — matching the SAS Action_Taken table.
+    """
+    out = raw.copy()
+    out["ActionTaken"] = out["ActionTaken"].map(decode_action_taken)
+    return (
+        out.groupby(["snap_dt", "CDEName", "ActionTaken"], dropna=False)["count"]
+        .sum()
+        .reset_index()
+    )
+
+
+def build_details(raw: pd.DataFrame) -> pd.DataFrame:
+    """Decode ActionTaken into Action_Taken and order columns as in SAS.
+
+    Args:
+        raw: Output of DETAILS_SQL.
+
+    Returns:
+        DataFrame matching the SAS ``Details`` table (column order included).
+    """
+    out = raw.copy()
+    out["Action_Taken"] = out["ActionTaken"].map(decode_action_taken)
+    return out[
+        [
+            "Snap_Date",
+            "AR_ID",
+            "SRF",
+            "Activation_date",
+            "Action_Taken",
+            "Resolution",
+            "Rootcause",
+            "comments",
+        ]
+    ]
+
+
+
+# Export — replicates proc export dbms=xlsx replace
+
+def export_to_excel(df: pd.DataFrame, path: Path, sheet_name: str) -> None:
+    """Write a DataFrame to .xlsx, dates displayed as MMDDYY10. (mm/dd/yyyy).
+
+    Args:
+        df: Data to export.
+        path: Destination .xlsx path (replaced if it exists).
+        sheet_name: Worksheet name.
+
+    Raises:
+        OSError: If the destination is not writable.
+    """
+    with pd.ExcelWriter(
+        path,
+        engine="xlsxwriter",
+        date_format="mm/dd/yyyy",
+        datetime_format="mm/dd/yyyy",
+    ) as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+    LOGGER.info("Exported %d rows to %s [sheet=%s]", len(df), path, sheet_name)
+
+
+
+# Main
+
+def main() -> int:
+    """Run the COB MRR/MIP dashboard extract end to end.
+
+    Returns:
+        0 on success (mirrors &syscc = 0); non-zero exit is raised on failure.
+    """
+    log_path = setup_logging(LOG_DIR)
+    LOGGER.info(
+        ">>>>>>>>>> This program is starting running at %s by %s <<<<<<<<<<",
+        datetime.now().strftime("%d%b%Y:%H:%M:%S").upper(),
+        getpass.getuser(),
+    )
+    LOGGER.info("Log file: %s", log_path)
+
+    pwd = os.environ.get(ODBC_PWD_ENV_VAR, "")
+    if not pwd:
+        LOGGER.error(
+            "Environment variable %s is not set (replaces SAS pswd.sas/&trackp).",
+            ODBC_PWD_ENV_VAR,
+        )
+        return 1
+
+    run_date = date.today()  # SAS &sysdate9
+    pre_mon_end, pre_mon_end3, pre_mon_end4, last_12_month = get_run_dates(run_date)
+    LOGGER.info("pre_mon_end   = %s", pre_mon_end.strftime("%d%b%Y").upper())
+    LOGGER.info("pre_mon_end3  = %s", pre_mon_end3)
+    LOGGER.info("pre_mon_end4  = %s", pre_mon_end4)
+    LOGGER.info("last_12_month = %s", last_12_month.strftime("%d%b%Y").upper())
+
+    conn_str = f"DSN={ODBC_DSN};UID={ODBC_UID};PWD={pwd}"
+
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            LOGGER.info("Step 1 - sample: monthly sample counts (exclude = 0)")
+            sample = pd.read_sql(SAMPLE_SQL, conn)
+            LOGGER.info("sample: %d rows", len(sample))
+
+            LOGGER.info("Step 2 - Action_Taken: counts by snap_dt / CDE / action")
+            action_raw = pd.read_sql(
+                ACTION_TAKEN_SQL, conn, params=[last_12_month]
+            )
+            action_taken = build_action_taken_summary(action_raw)
+            LOGGER.info("Action_Taken: %d rows", len(action_taken))
+
+            LOGGER.info("Step 3 - Details: review-level detail, last 12 months")
+            details_raw = pd.read_sql(DETAILS_SQL, conn, params=[last_12_month])
+            details = build_details(details_raw)
+            LOGGER.info("Details: %d rows", len(details))
+    except pyodbc.Error as exc:
+        LOGGER.error("Database step failed: %s", exc)
+        raise
+
+    # Details2: strip leading zeros from AR_ID (SAS prxchange), then export.
+    details2 = details.copy()
+    details2["AR_ID"] = details2["AR_ID"].map(strip_leading_zeros)
+    export_to_excel(
+        details2,
+        DASHBOARD_DIR / f"COB_Control_dashboard_{pre_mon_end3}.xlsx",
+        sheet_name="ReviewResult",
+    )
+
+    # Error: 'Error Found' records for the previous month end. NOTE: filtered
+    # from Details (pre-AR_ID transform), exactly as in the SAS program, so
+    # AR_ID retains its leading zeros in this export.
+    error = details[
+        details["Action_Taken"].str.contains("Error Found", regex=False, na=False)
+        & (pd.to_datetime(details["Snap_Date"]) == pd.Timestamp(pre_mon_end))
+    ]
+    # SAS proc export without SHEET= names the sheet after the data set.
+    export_to_excel(
+        error,
+        DASHBOARD_DIR / f"MRR_Fail_Detail_{pre_mon_end4}.xlsx",
+        sheet_name="Error",
+    )
+
+    LOGGER.info(
+        ">>>>>>>>>> Program completed at %s <<<<<<<<<<",
+        datetime.now().strftime("%d%b%Y:%H:%M:%S").upper(),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
