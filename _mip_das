@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import calendar
 import getpass
+import json
 import logging
 import os
 import re
 import sys
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import pyodbc
@@ -26,15 +27,72 @@ import pyodbc
 ENV = os.environ.get("ENV", "PROD")          # 'PROD' or anything else => dev
 USER = os.environ.get("USER", getpass.getuser())
 
+# BASE_PATH mirrors the SAS libname root (/sas/broc/COB). The default is the
+# RELATIVE "sas/broc/COB" (matching COB_MRR_MIP_RS.py) so it resolves under the
+# current working directory on the container, which is writable. Set an
+# ABSOLUTE COB_BASE_PATH for production, e.g. the real mount /sas/broc/COB, or
+# any writable location such as $HOME/cob_mrrmip.
+#   NOTE: an absolute default like /sas/broc/COB fails on the dev container —
+#   mkdir(parents=True) walks up to /sas, which jovyan cannot create
+#   (PermissionError [Errno 13]). Keep it relative or override the env var.
+BASE_PATH = os.environ.get("COB_BASE_PATH", "sas/broc/COB")
 
-BASE_PATH = os.environ.get("COB_BASE_PATH", "/sas/broc/COB")
+# ODBC connection. SAS used a Windows DSN: Libname sql ODBC DSN="DYOF_Tracker"
+# schema=dbo. That DSN does not exist on the Linux container. Connection
+# details are now read from a JSON config file (sql.json) instead of env vars.
+#
+# Expected sql.json (driver-based connection, the mode confirmed working on the
+# container — "ODBC Driver 18 for SQL Server" is installed):
+#     {
+#         "driver":   "ODBC Driver 18 for SQL Server",
+#         "host":     "your_sqlserver_host,1433",
+#         "database": "DYOF_Tracker",
+#         "uid":      "DataIntegrity",
+#         "pwd":      "your_password"
+#     }
+# Alternatively the file may carry a ready-made "conn" string, or a "dsn" name.
+# Key names are matched case-insensitively and accept common aliases (see the
+# CONFIG_ALIASES map below), so an existing sql.json with slightly different
+# keys (server/password/user/db) will still work.
+#
+# Path search order: the SQL_CONFIG env var, else sql.json next to this script,
+# else sql.json in the current working directory.
+SQL_CONFIG_ENV_VAR = "SQL_CONFIG"
+SQL_CONFIG_FILENAME = "sql.json"
 
-# ODBC connection — SAS: Libname sql ODBC DSN="DYOF_Tracker" ...
-ODBC_DSN = "DYOF_Tracker"
-ODBC_UID = "DataIntegrity"
-# SAS sourced &trackp from /sas/broc/cde/common/security/pswd.sas on the SAS
-# server; the Python port reads the same secret from an environment variable.
-ODBC_PWD_ENV_VAR = "DYOF_TRACKER_PWD"
+# Default driver if sql.json does not specify one (Driver 18 confirmed present).
+DEFAULT_ODBC_DRIVER = "ODBC Driver 18 for SQL Server"
+
+# Canonical field -> accepted aliases (all compared lower-cased).
+CONFIG_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "driver": ("driver",),
+    "host": ("host", "server", "hostname"),
+    "port": ("port",),
+    "database": ("database", "db", "initial catalog"),
+    "uid": ("uid", "user", "username", "userid"),
+    "pwd": ("pwd", "password", "passwd", "pass"),
+    "dsn": ("dsn",),
+    "conn": ("conn", "connection_string", "connectionstring"),
+}
+
+# Future state: the shared connection registry lives in the utils repo
+# (cob_utils.connections), the libname.scon analog, with credentials pulled
+# from the vault via cob_utils.secrets (the pswd.sas analog). When the package
+# is importable it is the source of truth; otherwise the job falls back to the
+# local sql.json so it still runs before cob_utils is deployed.
+try:
+    from cob_utils.connections import get_connection_string as _utils_conn_string
+except ImportError:
+    _utils_conn_string = None
+
+# Logical connection name to look up in the cob_utils registry.
+TRACKER_CONNECTION_NAME = "DYOF_Tracker"
+
+# Where resolve_connection() gets the connection from. Default 'sql_json' (the
+# current state); set COB_CONN_SOURCE=cob_utils to cut over to the shared
+# registry + CyberArk vault once it is deployed; 'auto' prefers cob_utils when
+# importable and falls back to sql.json.
+CONNECTION_SOURCE = os.environ.get("COB_CONN_SOURCE", "sql_json").lower()
 
 LOGGER = logging.getLogger("cob_mrr_mip_dashboard")
 
@@ -132,23 +190,229 @@ ORDER BY a.snap_dt
 
 def configure_paths() -> Tuple[Path, Path]:
     """Resolve the ENV-specific log/export directories and create them.
-
-    Mirrors the SAS production-vs-dev path switch. Both directories are made
-    with ``parents=True, exist_ok=True`` so a missing folder no longer raises
-    -- this is what previously broke the log FileHandler and the Excel export
-    on the Linux container. Wrapped in a function (rather than run at import)
-    so importing the module for testing has no filesystem side effects.
-
-    Returns:
-        Tuple of (log_dir, export_dir); both are guaranteed to exist on return.
     """
     sub = "production" if ENV == "PROD" else "dev"
     base = Path(BASE_PATH) / sub / "MRRMIP"
     log_dir = base / "log"
     export_dir = base / "export"
     for directory in (log_dir, export_dir):
-        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # e.g. PermissionError when an absolute BASE_PATH like /sas/broc/COB
+            # is not creatable on the container. Fail with one clear line
+            # instead of a recursive pathlib traceback.
+            raise RuntimeError(
+                f"Cannot create {directory} (BASE_PATH={BASE_PATH!r}, ENV={ENV}): "
+                f"{exc}. Set COB_BASE_PATH to a writable location, e.g. "
+                f"`export COB_BASE_PATH=$HOME/cob_mrrmip`."
+            ) from exc
     return log_dir, export_dir
+
+
+
+# Connection — replaces the SAS Windows DSN; portable across environments
+
+def mask_pwd(conn_str: str) -> str:
+    """Return a connection string with the PWD value hidden, for logging.
+
+    Args:
+        conn_str: An ODBC connection string that may contain ``PWD=...``.
+
+    Returns:
+        The same string with the password replaced by ``***``.
+    """
+    return re.sub(r"(PWD=)[^;]*", r"\1***", conn_str, flags=re.IGNORECASE)
+
+
+def _find_sql_config() -> Path:
+    """Locate sql.json: SQL_CONFIG env var, then beside the script, then cwd.
+
+    Returns:
+        Path to the first sql.json found.
+
+    Raises:
+        RuntimeError: If no config file can be located in any candidate spot.
+    """
+    candidates = []
+    env_path = os.environ.get(SQL_CONFIG_ENV_VAR)
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path(__file__).resolve().parent / SQL_CONFIG_FILENAME)
+    candidates.append(Path.cwd() / SQL_CONFIG_FILENAME)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    searched = ", ".join(str(c) for c in candidates)
+    raise RuntimeError(
+        f"Could not find {SQL_CONFIG_FILENAME}. Looked in: {searched}. "
+        f"Create it or point {SQL_CONFIG_ENV_VAR} at its full path."
+    )
+
+
+def load_sql_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read and normalise the connection settings from sql.json.
+
+    Keys are matched case-insensitively and via CONFIG_ALIASES, so variants
+    like server/password/user/db are accepted. The returned dict uses the
+    canonical key names (driver, host, port, database, uid, pwd, dsn, conn).
+
+    Args:
+        path: Explicit path to the JSON file. If None, _find_sql_config() is
+            used to locate it.
+
+    Returns:
+        Normalised configuration dict (only the keys present in the file).
+
+    Raises:
+        RuntimeError: If the file is missing, not valid JSON, or not an object.
+    """
+    cfg_path = path or _find_sql_config()
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{SQL_CONFIG_FILENAME} not found at {cfg_path}.") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{cfg_path} is not valid JSON: {exc}.") from exc
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"{cfg_path} must contain a JSON object, got {type(raw).__name__}.")
+
+    # Lower-case the incoming keys once, then map each canonical field.
+    lowered = {str(k).lower(): v for k, v in raw.items()}
+    normalised: Dict[str, Any] = {}
+    for canonical, aliases in CONFIG_ALIASES.items():
+        for alias in aliases:
+            if alias in lowered and lowered[alias] not in (None, ""):
+                normalised[canonical] = lowered[alias]
+                break
+    normalised["_source"] = str(cfg_path)
+    return normalised
+
+
+def build_connection_string(cfg: Dict[str, Any]) -> Tuple[str, str]:
+    """Build the ODBC connection string from a normalised sql.json config.
+
+    Precedence: a ready-made ``conn`` string > a ``dsn`` name > a DSN-less
+    driver connection assembled from driver/host/port/database/uid/pwd.
+
+    Args:
+        cfg: Normalised config dict from load_sql_config().
+
+    Returns:
+        Tuple of (connection_string, mode_label) for logging.
+
+    Raises:
+        RuntimeError: If required fields for the chosen mode are missing.
+    """
+    pwd = cfg.get("pwd", "")
+
+    # Mode 1 — full connection string provided verbatim (allow ${PWD} subst).
+    if cfg.get("conn"):
+        return str(cfg["conn"]).replace("${PWD}", pwd), f"conn string ({cfg['_source']})"
+
+    # Mode 2 — named DSN (only if the container actually defines it).
+    if cfg.get("dsn"):
+        uid = cfg.get("uid", "")
+        return f"DSN={cfg['dsn']};UID={uid};PWD={pwd}", f"DSN={cfg['dsn']}"
+
+    # Mode 3 — DSN-less driver connection (the expected/default mode).
+    missing = [f for f in ("host", "uid", "pwd", "database") if not cfg.get(f)]
+    if missing:
+        raise RuntimeError(
+            f"{cfg.get('_source', SQL_CONFIG_FILENAME)} is missing required "
+            f"field(s): {', '.join(missing)}. Provide host, database, uid and "
+            f"pwd (or a 'conn'/'dsn' entry)."
+        )
+    host = str(cfg["host"])
+    if cfg.get("port") and "," not in host and "\\" not in host:
+        host = f"{host},{cfg['port']}"  # SQL Server uses host,port (comma)
+    driver = cfg.get("driver", DEFAULT_ODBC_DRIVER)
+    parts = [
+        f"DRIVER={{{driver}}}",
+        f"SERVER={host}",
+        f"DATABASE={cfg['database']}",
+        f"UID={cfg['uid']}",
+        f"PWD={pwd}",
+        "TrustServerCertificate=yes",  # needed for Driver 18 (Encrypt=yes default)
+    ]
+    return ";".join(parts), "driver (DSN-less)"
+
+
+def _resolve_from_sql_json() -> Tuple[str, str]:
+    """Resolve the connection from the local sql.json file (current state).
+
+    Returns:
+        Tuple of (connection_string, mode_label).
+
+    Raises:
+        RuntimeError: If sql.json is missing/invalid or lacks required fields.
+    """
+    sql_cfg = load_sql_config()
+    LOGGER.info("Loaded connection settings from %s", sql_cfg["_source"])
+    return build_connection_string(sql_cfg)
+
+
+def _resolve_from_cob_utils() -> Tuple[str, str]:
+    """Resolve the connection from the shared cob_utils registry (future state).
+
+    Returns:
+        Tuple of (connection_string, mode_label).
+
+    Raises:
+        RuntimeError: If the cob_utils package is not importable, or it cannot
+            resolve the connection (unknown name or vault/secret error).
+    """
+    if _utils_conn_string is None:
+        raise RuntimeError(
+            "COB_CONN_SOURCE=cob_utils but the cob_utils package is not "
+            "importable. Install the utils package, or use "
+            "COB_CONN_SOURCE=sql_json for now."
+        )
+    try:
+        conn = _utils_conn_string(TRACKER_CONNECTION_NAME)
+    except Exception as exc:
+        # cob_utils raises its own types (SecretError, UnknownConnection...)
+        # which we cannot import unconditionally; wrap at this boundary.
+        raise RuntimeError(
+            f"cob_utils could not resolve connection "
+            f"{TRACKER_CONNECTION_NAME!r}: {exc}"
+        ) from exc
+    return conn, f"cob_utils registry [{TRACKER_CONNECTION_NAME}]"
+
+
+def resolve_connection() -> Tuple[str, str]:
+    """Resolve the tracker ODBC connection string and a mode label.
+
+    The source is chosen explicitly by COB_CONN_SOURCE so adoption of the
+    shared registry is a deliberate switch, not an accident of import path:
+
+        'sql_json' (default) : the local sql.json file -- the current state.
+        'cob_utils'          : the shared registry + CyberArk vault -- the
+                               future state. Set this per environment to cut
+                               over, then make it the default here.
+        'auto'               : use cob_utils if importable, else sql.json.
+
+    Returns:
+        Tuple of (connection_string, mode_label) for logging.
+
+    Raises:
+        RuntimeError: If COB_CONN_SOURCE is unknown, or the selected source
+            cannot produce a connection string.
+    """
+    LOGGER.info("Connection source: %s", CONNECTION_SOURCE)
+    if CONNECTION_SOURCE == "sql_json":
+        return _resolve_from_sql_json()
+    if CONNECTION_SOURCE == "cob_utils":
+        return _resolve_from_cob_utils()
+    if CONNECTION_SOURCE == "auto":
+        if _utils_conn_string is not None:
+            return _resolve_from_cob_utils()
+        return _resolve_from_sql_json()
+    raise RuntimeError(
+        f"Unknown COB_CONN_SOURCE={CONNECTION_SOURCE!r} "
+        f"(expected 'sql_json', 'cob_utils', or 'auto')."
+    )
 
 
 
@@ -331,7 +595,12 @@ def main() -> int:
     Returns:
         0 on success (mirrors &syscc = 0); non-zero exit is raised on failure.
     """
-    log_dir, export_dir = configure_paths()
+    try:
+        log_dir, export_dir = configure_paths()
+    except RuntimeError as exc:
+        # Logging isn't set up yet (no log dir), so report to stderr and exit.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     log_path = setup_logging(log_dir)
     LOGGER.info(
         ">>>>>>>>>> This program is starting running at %s by %s <<<<<<<<<<",
@@ -342,14 +611,6 @@ def main() -> int:
     LOGGER.info("Log file:   %s", log_path)
     LOGGER.info("Export dir: %s", export_dir)
 
-    pwd = os.environ.get(ODBC_PWD_ENV_VAR, "")
-    if not pwd:
-        LOGGER.error(
-            "Environment variable %s is not set (replaces SAS pswd.sas/&trackp).",
-            ODBC_PWD_ENV_VAR,
-        )
-        return 1
-
     run_date = date.today()  # SAS &sysdate9
     pre_mon_end, pre_mon_end3, pre_mon_end4, last_12_month = get_run_dates(run_date)
     LOGGER.info("pre_mon_end   = %s", pre_mon_end.strftime("%d%b%Y").upper())
@@ -357,7 +618,13 @@ def main() -> int:
     LOGGER.info("pre_mon_end4  = %s", pre_mon_end4)
     LOGGER.info("last_12_month = %s", last_12_month.strftime("%d%b%Y").upper())
 
-    conn_str = f"DSN={ODBC_DSN};UID={ODBC_UID};PWD={pwd}"
+    try:
+        conn_str, mode = resolve_connection()
+    except RuntimeError as exc:
+        LOGGER.error("%s", exc)
+        return 1
+    LOGGER.info("Connecting to tracker via %s", mode)
+    LOGGER.info("Connection string: %s", mask_pwd(conn_str))
 
     try:
         with pyodbc.connect(conn_str) as conn:
