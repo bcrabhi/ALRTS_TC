@@ -1,0 +1,282 @@
+"""
+build_migration_manifest.py
+
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Dict, List, Tuple
+
+import pandas as pd
+
+
+
+# CONFIG — edit these for your environment
+
+EXCEL_FILE = r"C:\Users\360814750\Documents\IFRS9_REG_Data_Log_File_List.xlsx"
+MANIFEST_OUT = r"C:\Users\360814750\Downloads\migration_manifest_v2.csv"
+PLAN_OUT = r"C:\Users\360814750\Downloads\migration_plan_summary.csv"
+
+# Inventory sheets to read. Add an archive sheet here if the SAS scan produced
+# one (e.g. "broc_cde_archive": "broc_cde_archive").
+INVENTORY_SHEETS: List[str] = [
+    "broc_cde_data",
+    "RSD_REG_data",
+    "broc_cde_log_lst",
+    "RSD_REG_log_lst",
+]
+
+# Plan/summary date window (inclusive). Set to None to include all dates.
+# Arkar's planning sheet uses 2023-2026; matching it makes the counts reconcile.
+PLAN_YEAR_MIN = 2023
+PLAN_YEAR_MAX = 2026
+
+# Expected workbook columns (used for a friendly error if the format drifts).
+REQUIRED_COLUMNS = {"Permission", "User", "Group", "Size_KB", "File_Date", "File_Name"}
+
+
+
+# CLASSIFICATION
+
+def classify(path: str) -> Tuple[str, str, str]:
+    """Map a file path to (file_type, category, migrate_flag) by extension.
+
+    Args:
+        path: Full file path from the inventory (the File_Name column).
+
+    Returns:
+        Tuple of (file_type, category, migrate). migrate is 'Y' for files we
+        will move, 'TBD' for archives whose fate is undecided, 'N' otherwise.
+    """
+    p = path.lower().strip()
+    if p.endswith(".sas7bdat"):
+        return ("sas7bdat", "raw_data", "Y")
+    if p.endswith((".xls", ".xlsx")):
+        return ("excel", "excel", "Y")
+    if p.endswith(".log"):
+        return ("log", "log", "Y")
+    if p.endswith(".lst"):
+        return ("lst", "list", "Y")
+    if p.endswith(".zip"):
+        return ("zip", "archive", "TBD")
+    if p.endswith((".bak", ".bkp", ".bk")):
+        return ("bak", "backup", "TBD")
+    return ("other", "other", "N")
+
+
+def derive_s3_prefix(remote_path: str) -> str:
+    """Derive the S3 prefix from a SAS path (same rule as the original builder).
+
+    /sas/broc/cde/AF/output/x.sas7bdat -> broc/cde/AF/output/
+
+    Args:
+        remote_path: Full SAS file path.
+
+    Returns:
+        S3 prefix string: '/sas/' stripped, filename dropped, trailing slash.
+    """
+    no_root = remote_path.replace("/sas/", "", 1)
+    # rsplit drops the filename; if there's no slash, fall back to the whole str
+    folder = no_root.rsplit("/", 1)[0] if "/" in no_root else no_root
+    return folder + "/"
+
+
+def derive_dir(remote_path: str) -> str:
+    """Top-level source tree for grouping in the plan (/sas/broc or /sas/RSD)."""
+    if remote_path.startswith("/sas/broc"):
+        return "/sas/broc"
+    if remote_path.startswith("/sas/RSD"):
+        return "/sas/RSD"
+    return "other"
+
+
+
+# MANIFEST BUILD
+
+def build_manifest(excel_file: str, sheets: List[str]) -> pd.DataFrame:
+    """Read all inventory sheets and build the complete file-level manifest.
+
+    Args:
+        excel_file: Path to the inventory workbook.
+        sheets: Sheet names to read.
+
+    Returns:
+        A DataFrame with one row per file and all manifest columns. Nothing is
+        filtered out here — filtering is a downstream concern.
+
+    Raises:
+        FileNotFoundError: If the workbook does not exist.
+        ValueError: If a sheet is missing required columns.
+    """
+    if not os.path.exists(excel_file):
+        raise FileNotFoundError(f"Inventory workbook not found: {excel_file}")
+
+    records: List[Dict[str, object]] = []
+
+    for sheet_name in sheets:
+        try:
+            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+        except ValueError as e:
+            # Sheet not present — warn and skip rather than fail the whole run.
+            print(f"  ! Sheet '{sheet_name}' not found, skipping ({e})")
+            continue
+
+        missing = REQUIRED_COLUMNS - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"Sheet '{sheet_name}' is missing columns: {sorted(missing)}. "
+                f"Found: {list(df.columns)}"
+            )
+
+        for _, row in df.iterrows():
+            remote_path = str(row["File_Name"]).strip()
+            if not remote_path or remote_path.lower() == "nan":
+                continue  # skip blank rows
+
+            file_type, category, migrate = classify(remote_path)
+
+            records.append(
+                {
+                    "remote_path": remote_path,
+                    "s3_prefix": derive_s3_prefix(remote_path),
+                    "dir": derive_dir(remote_path),
+                    "size_kb": row["Size_KB"],
+                    "file_date": row["File_Date"],
+                    "file_type": file_type,
+                    "category": category,
+                    "migrate": migrate,
+                    "source_sheet": sheet_name,
+                    "permission": row["Permission"],
+                    "owner": row["User"],
+                    "group": row["Group"],
+                    "status": "pending",
+                    "started_at": "",
+                    "completed_at": "",
+                    "error": "",
+                    "validation_status": "",
+                    "validated_at": "",
+                }
+            )
+
+    return pd.DataFrame(records)
+
+
+
+# PLAN / SUMMARY
+
+def build_plan(
+    manifest: pd.DataFrame,
+    year_min: int | None,
+    year_max: int | None,
+    migrate_only: bool = True,
+) -> pd.DataFrame:
+    """Aggregate the manifest into a Migration Plan / Summary.
+
+    Grouped by dir / year / month, matching the planning spreadsheet's
+    summary_list layout (Dir | Year | Month | NumOfFile | Total_Size_KB).
+
+    Args:
+        manifest: The full file-level manifest.
+        year_min: Inclusive lower bound on file year (None = no lower bound).
+        year_max: Inclusive upper bound on file year (None = no upper bound).
+        migrate_only: If True, count only rows flagged migrate='Y'.
+
+    Returns:
+        Aggregated DataFrame sorted by dir, year, month.
+    """
+    df = manifest.copy()
+
+    # Parse dates; rows with unparseable dates are kept but get NaT and are
+    # excluded from the windowed plan (they still live in the manifest).
+    df["_date"] = pd.to_datetime(df["file_date"], errors="coerce")
+    df["Year"] = df["_date"].dt.year
+    df["Month"] = df["_date"].dt.month
+
+    if migrate_only:
+        df = df[df["migrate"] == "Y"]
+
+    df = df.dropna(subset=["Year", "Month"])
+    if year_min is not None:
+        df = df[df["Year"] >= year_min]
+    if year_max is not None:
+        df = df[df["Year"] <= year_max]
+
+    plan = (
+        df.groupby(["dir", "Year", "Month"])
+        .agg(NumOfFile=("remote_path", "count"), Total_Size_KB=("size_kb", "sum"))
+        .reset_index()
+        .rename(columns={"dir": "Dir"})
+        .sort_values(["Dir", "Year", "Month"])
+        .reset_index(drop=True)
+    )
+    plan["Year"] = plan["Year"].astype(int)
+    plan["Month"] = plan["Month"].astype(int)
+    return plan
+
+
+
+# REPORTING
+
+def print_summary(manifest: pd.DataFrame) -> None:
+    """Print a category breakdown and migrate-eligible totals."""
+    bar = "=" * 64
+    print(f"\n{bar}")
+    print("MANIFEST SUMMARY")
+    print(bar)
+    print(f"Total files inventoried: {len(manifest):,}")
+
+    print("\nBy category:")
+    by_cat = (
+        manifest.groupby(["category", "migrate"])
+        .agg(files=("remote_path", "count"), size_kb=("size_kb", "sum"))
+        .reset_index()
+    )
+    for _, r in by_cat.iterrows():
+        size_tb = r["size_kb"] / 1024 / 1024 / 1024
+        print(
+            f"  {r['category']:<10} migrate={r['migrate']:<4} "
+            f"{int(r['files']):>8,} files  ({size_tb:6.2f} TB)"
+        )
+
+    eligible = manifest[manifest["migrate"] == "Y"]
+    tbd = manifest[manifest["migrate"] == "TBD"]
+    elig_tb = eligible["size_kb"].sum() / 1024 / 1024 / 1024
+    tbd_tb = tbd["size_kb"].sum() / 1024 / 1024 / 1024
+    print(f"\n  MIGRATE NOW (Y):  {len(eligible):>8,} files  ({elig_tb:6.2f} TB)")
+    print(f"  UNDECIDED (TBD):  {len(tbd):>8,} files  ({tbd_tb:6.2f} TB)")
+    print(bar)
+    print(
+        "\nNOTE: Counts reflect files readable by the SAS scan. Permission-denied\n"
+        "folders are excluded — document the *_deny.txt counts as the known gap."
+    )
+
+
+
+# MAIN
+
+def main() -> None:
+    """Build the manifest and plan, write both, and print a summary."""
+    print(f"Reading inventory: {EXCEL_FILE}")
+    manifest = build_manifest(EXCEL_FILE, INVENTORY_SHEETS)
+
+    manifest.to_csv(MANIFEST_OUT, index=False)
+    print(f"Wrote manifest ({len(manifest):,} rows): {MANIFEST_OUT}")
+
+    plan = build_plan(manifest, PLAN_YEAR_MIN, PLAN_YEAR_MAX, migrate_only=True)
+    plan.to_csv(PLAN_OUT, index=False)
+    window = f"{PLAN_YEAR_MIN}-{PLAN_YEAR_MAX}" if PLAN_YEAR_MIN else "all dates"
+    print(f"Wrote plan ({len(plan):,} rows, window {window}): {PLAN_OUT}")
+
+    print_summary(manifest)
+
+    # Quick reconciliation aid for the Arkar 13,714-style comparison:
+    migrate_windowed = plan["NumOfFile"].sum()
+    print(
+        f"\nFiles in plan window ({window}, migrate=Y): {migrate_windowed:,}"
+        "\n  -> compare this to the planning spreadsheet's file count."
+    )
+
+
+if __name__ == "__main__":
+    main()
