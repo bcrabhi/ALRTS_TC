@@ -22,7 +22,9 @@ import pyodbc
 
 # Configuration — ENV-driven paths (mirrors the SAS libnames / output paths)
 
-
+# The SAS original wrote to Windows paths (\\maple\...\log and R:\...). Those
+# do not exist on the Linux/JupyterHub container, so the log FileHandler and
+# the Excel export failed before doing any work. Resolve Unix paths from an
 # ENV switch instead and create the directories up front (see configure_paths).
 ENV = os.environ.get("ENV", "PROD")          # 'PROD' or anything else => dev
 USER = os.environ.get("USER", getpass.getuser())
@@ -30,7 +32,8 @@ USER = os.environ.get("USER", getpass.getuser())
 
 BASE_PATH = os.environ.get("COB_BASE_PATH", "sas/broc/COB")
 
-
+# Path search order: the SQL_CONFIG env var, else sql.json next to this script,
+# else sql.json in the current working directory.
 SQL_CONFIG_ENV_VAR = "SQL_CONFIG"
 SQL_CONFIG_FILENAME = "sql.json"
 
@@ -47,6 +50,11 @@ CONFIG_ALIASES: Dict[str, Tuple[str, ...]] = {
     "pwd": ("pwd", "password", "passwd", "pass"),
     "dsn": ("dsn",),
     "conn": ("conn", "connection_string", "connectionstring"),
+    # Connection-security knobs that mirror the SSMS "Connection Security" box.
+    "encrypt": ("encrypt", "encryption"),
+    "trust_server_certificate": (
+        "trust_server_certificate", "trustservercertificate", "trust", "trust_cert",
+    ),
 }
 
 
@@ -58,7 +66,10 @@ except ImportError:
 # Logical connection name to look up in the cob_utils registry.
 TRACKER_CONNECTION_NAME = "DYOF_Tracker"
 
-
+# Where resolve_connection() gets the connection from. Default 'sql_json' (the
+# current state); set COB_CONN_SOURCE=cob_utils to cut over to the shared
+# registry + CyberArk vault once it is deployed; 'auto' prefers cob_utils when
+# importable and falls back to sql.json.
 CONNECTION_SOURCE = os.environ.get("COB_CONN_SOURCE", "sql_json").lower()
 
 LOGGER = logging.getLogger("cob_mrr_mip_dashboard")
@@ -185,22 +196,71 @@ def configure_paths() -> Tuple[Path, Path]:
 
 # Connection — replaces the SAS Windows DSN; portable across environments
 
-def _odbc_quote(value: str) -> str:
+def _norm_yes_no(value: Any) -> str:
+    """Normalise a truthy/SSMS-style value to the ODBC 'yes'/'no' literal.
 
+    Accepts: yes/no, true/false, 1/0, on/off, and SSMS's 'Mandatory'/'Optional'/
+    'Strict'. 'Mandatory' and 'Strict' mean encryption on; 'Optional' means off.
+
+    Args:
+        value: A bool, int, or string from config.
+
+    Returns:
+        'yes' or 'no'.
+    """
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    text = str(value).strip().lower()
+    if text in ("yes", "true", "1", "on", "mandatory", "strict"):
+        return "yes"
+    return "no"
+
+
+def _odbc_quote(value: str) -> str:
+    """Brace-quote an ODBC value that contains connection-string specials.
+
+    ODBC uses ';' as a delimiter, so a password (or uid) containing ';', '{',
+    '}', or leading/trailing spaces would silently truncate or corrupt the
+    connection string. Such values must be wrapped in braces with any inner
+    '}' doubled. Plain values are returned unchanged.
+
+    Args:
+        value: The raw UID/PWD value.
+
+    Returns:
+        The value, brace-quoted only if it needs it.
+    """
     if value and (any(c in value for c in ";{}") or value != value.strip()):
         return "{" + value.replace("}", "}}") + "}"
     return value
 
 
 def mask_pwd(conn_str: str) -> str:
+    """Return a connection string with the PWD value hidden, for logging.
 
+    Handles both plain (``PWD=secret``) and brace-quoted (``PWD={se;cret}``)
+    values so a password containing ';' is never partially revealed.
+
+    Args:
+        conn_str: An ODBC connection string that may contain ``PWD=...``.
+
+    Returns:
+        The same string with the password replaced by ``***``.
+    """
     return re.sub(
         r"(PWD=)(\{(?:[^}]|\}\})*\}|[^;]*)", r"\1***", conn_str, flags=re.IGNORECASE
     )
 
 
 def _find_sql_config() -> Path:
+    """Locate sql.json: SQL_CONFIG env var, then beside the script, then cwd.
 
+    Returns:
+        Path to the first sql.json found.
+
+    Raises:
+        RuntimeError: If no config file can be located in any candidate spot.
+    """
     candidates = []
     env_path = os.environ.get(SQL_CONFIG_ENV_VAR)
     if env_path:
@@ -219,7 +279,22 @@ def _find_sql_config() -> Path:
 
 
 def load_sql_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read and normalise the connection settings from sql.json.
 
+    Keys are matched case-insensitively and via CONFIG_ALIASES, so variants
+    like server/password/user/db are accepted. The returned dict uses the
+    canonical key names (driver, host, port, database, uid, pwd, dsn, conn).
+
+    Args:
+        path: Explicit path to the JSON file. If None, _find_sql_config() is
+            used to locate it.
+
+    Returns:
+        Normalised configuration dict (only the keys present in the file).
+
+    Raises:
+        RuntimeError: If the file is missing, not valid JSON, or not an object.
+    """
     cfg_path = path or _find_sql_config()
     try:
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -243,7 +318,20 @@ def load_sql_config(path: Optional[Path] = None) -> Dict[str, Any]:
 
 
 def build_connection_string(cfg: Dict[str, Any]) -> Tuple[str, str]:
+    """Build the ODBC connection string from a normalised sql.json config.
 
+    Precedence: a ready-made ``conn`` string > a ``dsn`` name > a DSN-less
+    driver connection assembled from driver/host/port/database/uid/pwd.
+
+    Args:
+        cfg: Normalised config dict from load_sql_config().
+
+    Returns:
+        Tuple of (connection_string, mode_label) for logging.
+
+    Raises:
+        RuntimeError: If required fields for the chosen mode are missing.
+    """
     pwd = cfg.get("pwd", "")
 
     # Mode 1 — full connection string provided verbatim (allow ${PWD} subst).
@@ -271,26 +359,47 @@ def build_connection_string(cfg: Dict[str, Any]) -> Tuple[str, str]:
     if cfg.get("port") and "," not in host and "\\" not in host:
         host = f"{host},{cfg['port']}"  # SQL Server uses host,port (comma)
     driver = cfg.get("driver", DEFAULT_ODBC_DRIVER)
+    # Mirror the SSMS "Connection Security" box: Encryption=Mandatory and
+    # Trust server certificate=checked map to Encrypt=yes / TSC=yes. Both
+    # default that way and are overridable from sql.json.
+    encrypt = _norm_yes_no(cfg.get("encrypt", "yes"))
+    trust = _norm_yes_no(cfg.get("trust_server_certificate", "yes"))
     parts = [
         f"DRIVER={{{driver}}}",
         f"SERVER={host}",
         f"DATABASE={cfg['database']}",
         f"UID={_odbc_quote(str(cfg['uid']))}",
         f"PWD={_odbc_quote(str(pwd))}",
-        "TrustServerCertificate=yes",  # needed for Driver 18 (Encrypt=yes default)
+        f"Encrypt={encrypt}",
+        f"TrustServerCertificate={trust}",
     ]
     return ";".join(parts), "driver (DSN-less)"
 
 
 def _resolve_from_sql_json() -> Tuple[str, str]:
+    """Resolve the connection from the local sql.json file (current state).
 
+    Returns:
+        Tuple of (connection_string, mode_label).
+
+    Raises:
+        RuntimeError: If sql.json is missing/invalid or lacks required fields.
+    """
     sql_cfg = load_sql_config()
     LOGGER.info("Loaded connection settings from %s", sql_cfg["_source"])
     return build_connection_string(sql_cfg)
 
 
 def _resolve_from_cob_utils() -> Tuple[str, str]:
+    """Resolve the connection from the shared cob_utils registry (future state).
 
+    Returns:
+        Tuple of (connection_string, mode_label).
+
+    Raises:
+        RuntimeError: If the cob_utils package is not importable, or it cannot
+            resolve the connection (unknown name or vault/secret error).
+    """
     if _utils_conn_string is None:
         raise RuntimeError(
             "COB_CONN_SOURCE=cob_utils but the cob_utils package is not "
@@ -310,7 +419,24 @@ def _resolve_from_cob_utils() -> Tuple[str, str]:
 
 
 def resolve_connection() -> Tuple[str, str]:
+    """Resolve the tracker ODBC connection string and a mode label.
 
+    The source is chosen explicitly by COB_CONN_SOURCE so adoption of the
+    shared registry is a deliberate switch, not an accident of import path:
+
+        'sql_json' (default) : the local sql.json file -- the current state.
+        'cob_utils'          : the shared registry + CyberArk vault -- the
+                               future state. Set this per environment to cut
+                               over, then make it the default here.
+        'auto'               : use cob_utils if importable, else sql.json.
+
+    Returns:
+        Tuple of (connection_string, mode_label) for logging.
+
+    Raises:
+        RuntimeError: If COB_CONN_SOURCE is unknown, or the selected source
+            cannot produce a connection string.
+    """
     LOGGER.info("Connection source: %s", CONNECTION_SOURCE)
     if CONNECTION_SOURCE == "sql_json":
         return _resolve_from_sql_json()
@@ -346,7 +472,16 @@ def month_end(anchor: date, months_back: int) -> date:
 
 
 def get_run_dates(run_date: date) -> Tuple[date, str, str, date]:
+    """Build the four macro-variable equivalents from the SAS data _null_ step.
 
+    Args:
+        run_date: The job run date (SAS &sysdate9).
+
+    Returns:
+        Tuple of (pre_mon_end, pre_mon_end3 'YYYYMM', pre_mon_end4 'YYYYMMDD',
+        last_12_month). pre_mon_end3/pre_mon_end4 are the YYMMn6./YYMMDDn8.
+        renderings of the same previous-month-end date.
+    """
     pre_mon_end = month_end(run_date, 1)
     last_12_month = month_end(run_date, 12)
     pre_mon_end3 = pre_mon_end.strftime("%Y%m")    # YYMMn6.
@@ -358,7 +493,14 @@ def get_run_dates(run_date: date) -> Tuple[date, str, str, date]:
 # Logging — replicates proc printto log="...MRR_MIP_Dashboard_<ts>.log" new
 
 def setup_logging(log_dir: Path) -> Path:
+    """Send the run log to a timestamped file, like the SAS proc printto.
 
+    Args:
+        log_dir: Directory that receives the log file.
+
+    Returns:
+        Full path of the log file created.
+    """
     # SAS: %sysfunc(today(),yymmddn8.)_%sysfunc(compress(%sysfunc(time(),time.),:))
     log_dir.mkdir(parents=True, exist_ok=True)  # belt-and-suspenders vs FileHandler error
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -378,7 +520,15 @@ def setup_logging(log_dir: Path) -> Path:
 # Transformations
 
 def decode_action_taken(code: object) -> str:
+    """Apply the SAS CASE decode to a raw ActionTaken code.
 
+    Args:
+        code: Raw ActionTaken value (int, float, str digits, or NULL/NaN).
+
+    Returns:
+        Decoded label, or 'Unknown' for NULL / unrecognised codes (matching
+        the SAS ``else 'Unknown'`` branch, which also catches NULLs).
+    """
     if pd.isna(code):
         return ACTION_TAKEN_DEFAULT
     try:
@@ -388,14 +538,33 @@ def decode_action_taken(code: object) -> str:
 
 
 def strip_leading_zeros(value: object) -> object:
+    """Replicate ``AR_ID = prxchange('s/^(0*)/ /', -1, AR_ID)``.
 
+    The SAS regex replaces the run of leading zeros with a single space; when
+    there are no leading zeros it still matches the empty string at position 0
+    and prepends a space. Missing values pass through untouched.
+
+    Args:
+        value: Original AR_ID value.
+
+    Returns:
+        Transformed AR_ID, or the original value when missing.
+    """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return value
     return re.sub(r"^(0*)", " ", str(value), count=1)
 
 
 def build_action_taken_summary(raw: pd.DataFrame) -> pd.DataFrame:
+    """Decode ActionTaken and aggregate to the SAS Action_Taken grain.
 
+    Args:
+        raw: Output of ACTION_TAKEN_SQL (counts by raw ActionTaken code).
+
+    Returns:
+        DataFrame with columns snap_dt, CDEName, ActionTaken (decoded label),
+        count — matching the SAS Action_Taken table.
+    """
     out = raw.copy()
     out["ActionTaken"] = out["ActionTaken"].map(decode_action_taken)
     return (
@@ -406,7 +575,14 @@ def build_action_taken_summary(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_details(raw: pd.DataFrame) -> pd.DataFrame:
+    """Decode ActionTaken into Action_Taken and order columns as in SAS.
 
+    Args:
+        raw: Output of DETAILS_SQL.
+
+    Returns:
+        DataFrame matching the SAS ``Details`` table (column order included).
+    """
     out = raw.copy()
     out["Action_Taken"] = out["ActionTaken"].map(decode_action_taken)
     return out[
@@ -427,6 +603,16 @@ def build_details(raw: pd.DataFrame) -> pd.DataFrame:
 # Export — replicates proc export dbms=xlsx replace
 
 def export_to_excel(df: pd.DataFrame, path: Path, sheet_name: str) -> None:
+    """Write a DataFrame to .xlsx, dates displayed as MMDDYY10. (mm/dd/yyyy).
+
+    Args:
+        df: Data to export.
+        path: Destination .xlsx path (replaced if it exists).
+        sheet_name: Worksheet name.
+
+    Raises:
+        OSError: If the destination is not writable.
+    """
     with pd.ExcelWriter(
         path,
         engine="xlsxwriter",
@@ -441,7 +627,11 @@ def export_to_excel(df: pd.DataFrame, path: Path, sheet_name: str) -> None:
 # Main
 
 def main() -> int:
+    """Run the COB MRR/MIP dashboard extract end to end.
 
+    Returns:
+        0 on success (mirrors &syscc = 0); non-zero exit is raised on failure.
+    """
     try:
         log_dir, export_dir = configure_paths()
     except RuntimeError as exc:
@@ -503,7 +693,9 @@ def main() -> int:
         sheet_name="ReviewResult",
     )
 
-
+    # Error: 'Error Found' records for the previous month end. NOTE: filtered
+    # from Details (pre-AR_ID transform), exactly as in the SAS program, so
+    # AR_ID retains its leading zeros in this export.
     error = details[
         details["Action_Taken"].str.contains("Error Found", regex=False, na=False)
         & (pd.to_datetime(details["Snap_Date"]) == pd.Timestamp(pre_mon_end))
