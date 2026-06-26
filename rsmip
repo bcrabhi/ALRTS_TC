@@ -1,0 +1,875 @@
+"""
+PROGRAM : cob_mrr_mip_rs.py
+
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import getpass
+import logging
+import os
+import sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+import pyodbc
+import teradatasql
+
+
+
+# CONFIGURATION & PATHS
+
+
+ENV = os.environ.get("ENV", "PROD")
+USER = os.environ.get("USER", getpass.getuser())
+BASE_PATH = os.environ.get("COB_BASE_PATH", "sas/broc/COB")
+VAULT_SECRETS_PATH = os.environ.get(
+    "VAULT_SECRETS_PATH", "rbc_vault2/secrets/vault.secrets.env"
+)
+
+SAMPLE_SIZE = 25
+
+
+SAMPLE_OUTPUT_COLUMNS: List[str] = [
+    "IP_ID", "AR_ID", "AR_ID_FAC", "APPL_PROD_ID", "STATUS", "ACTIVATION_DATE",
+    "ISSUE_DT", "SNAP_DT", "TRANSIT", "ACCOUNT_NUM", "LOAN_SEG", "ADVANCED_IND",
+    "BUILDERS_MORTG_IND", "PLAN_DTL_CD_MGEN", "LN_PROD_CD", "LN_DESC", "CR_PLN_TYP",
+    "DW_SRVC_ID", "MTG_TYPE", "HELOC_IND", "PAYMENT_FREQUENCY", "REGULAR_PAYMENT_AMOUNT",
+    "BALANCE", "AMORT_TRM_IN_MTH", "AMORT_TERM_IN_MTH_MTG", "INT_BASE_RATE",
+    "INTEREST_RT_ADDITION", "TRM_IN_MTH", "BSC", "PROD_APP_COMPLETION_DT_CAP",
+    "ISS_RENW_DT_MTG", "PRINCIPAL_BAL_INCREASE", "APPL_FOR_PURPS_TYP", "CR_APP_ID",
+    "ORGNL_CASPER_PROD_APP_ID",
+]
+
+LOGGER = logging.getLogger("cob_mrr_mip_rs")
+
+
+
+# PATH RESOLUTION / LOGGING
+
+
+def configure_paths() -> Tuple[Path, Path]:
+    """Resolve ENV-specific log/export directories and create them."""
+    sub = "production" if ENV == "PROD" else "dev"
+    base = Path(BASE_PATH) / sub / "MRRMIP"
+    log_dir = base / "log"
+    export_dir = base / "export"
+
+    for directory in (log_dir, export_dir):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot create {directory} (BASE_PATH={BASE_PATH!r}, ENV={ENV}): {exc}"
+            ) from exc
+
+    return log_dir, export_dir
+
+
+def setup_logging(log_dir: Path) -> Path:
+    """Send run log to a timestamped file and stdout."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"MRRMIP_{stamp}.log"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    return log_path
+
+
+
+# VAULT SECRETS
+
+
+def load_vault_secrets(vault_path: Optional[str] = None) -> Dict[str, str]:
+    """Load credentials from vault.secrets.env."""
+    path = vault_path or VAULT_SECRETS_PATH
+    vault_file = Path(path)
+
+    if not vault_file.exists():
+        raise RuntimeError(
+            f"Vault secrets file not found: {vault_file}. "
+            f"Set VAULT_SECRETS_PATH env var or create the file."
+        )
+
+    secrets: Dict[str, str] = {}
+    try:
+        with open(vault_file, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    secrets[key.strip()] = value.strip()
+    except IOError as exc:
+        raise RuntimeError(f"Cannot read vault secrets file: {exc}") from exc
+
+    if not secrets:
+        raise RuntimeError(f"No secrets found in {vault_file}")
+
+    LOGGER.info("Loaded %d secrets from vault", len(secrets))
+    return secrets
+
+
+def get_required_secret(
+    secrets: Dict[str, str], key: str, default: Optional[str] = None
+) -> str:
+    """Return a required secret or raise."""
+    value = secrets.get(key, default)
+    if not value:
+        raise RuntimeError(f"Missing required secret: {key}")
+    return value
+
+
+
+# CONNECTIONS
+
+
+def get_teradata_connection(secrets: Dict[str, str]):
+    """Create a direct Teradata connection using teradatasql."""
+    LOGGER.info("Creating Teradata connection (teradatasql)...")
+    try:
+        host = get_required_secret(secrets, "TERADATA_HOST")
+        user = get_required_secret(secrets, "TERADATA_USER")
+        password = get_required_secret(secrets, "TERADATA_PASSWORD")
+        logmech = secrets.get("TERADATA_LOGMECH", "LDAP")
+
+        LOGGER.info(
+            "Teradata connection: host=%s, user=%s, logmech=%s", host, user, logmech
+        )
+        conn = teradatasql.connect(
+            host=host, user=user, password=password, logmech=logmech
+        )
+        LOGGER.info("Connected to Teradata")
+        return conn
+    except Exception as exc:
+        raise RuntimeError(f"Teradata connection failed: {exc}") from exc
+
+
+def get_sql_server_connection(secrets: Dict[str, str]):
+    """Create a SQL Server connection using pyodbc."""
+    LOGGER.info("Creating SQL Server connection...")
+    try:
+        host = get_required_secret(secrets, "SQL_SERVER_HOST")
+        user = get_required_secret(secrets, "SQL_SERVER_USER")
+        password = get_required_secret(secrets, "SQL_SERVER_PASSWORD")
+        database = get_required_secret(secrets, "SQL_SERVER_DATABASE")
+        driver = secrets.get("SQL_SERVER_DRIVER", "ODBC Driver 18 for SQL Server")
+
+        conn_str = (
+            f"DRIVER={{{driver}}};"
+            f"SERVER={host};"
+            f"DATABASE={database};"
+            f"UID={user};"
+            f"PWD={password};"
+            f"Encrypt=yes;"
+            f"TrustServerCertificate=yes"
+        )
+        LOGGER.info(
+            "SQL Server connection: host=%s, user=%s, database=%s", host, user, database
+        )
+        conn = pyodbc.connect(conn_str)
+        LOGGER.info("Connected to SQL Server")
+        return conn
+    except Exception as exc:
+        raise RuntimeError(f"SQL Server connection failed: {exc}") from exc
+
+
+
+# DATE HELPERS  (must match SAS intnx exactly)
+
+
+def month_end(anchor: date, months_back: int) -> date:
+    """Replicate SAS intnx('month', anchor, -months_back, 'E')."""
+    months = anchor.year * 12 + (anchor.month - 1) - months_back
+    year, month = divmod(months, 12)
+    month += 1
+    return date(year, month, calendar.monthrange(year, month)[1])
+
+
+def month_start(anchor: date, months_back: int) -> date:
+    """Replicate SAS intnx('month', anchor, -months_back, 'B')."""
+    months = anchor.year * 12 + (anchor.month - 1) - months_back
+    year, month = divmod(months, 12)
+    month += 1
+    return date(year, month, 1)
+
+
+def get_run_dates(run_date: date) -> Tuple[date, date, str, date]:
+    """Build the SAS macro-variable equivalents (dt, dt2, label, ms).
+
+    SAS: todayd = intnx('month', today(), 0, 'B') + 14
+         prd_end  = intnx('month', todayd, -1, 'E')
+         prd_end2 = intnx('month', todayd, -2, 'E')
+         prd_st   = intnx('month', todayd, -1, 'B')
+         label    = put(prd_end, YYMMn6.)
+    """
+    current_month_start = date(run_date.year, run_date.month, 1)
+    todayd = current_month_start + timedelta(days=14)
+
+    prd_end = month_end(todayd, 1)
+    prd_end2 = month_end(todayd, 2)
+    prd_st = month_start(todayd, 1)
+    label = prd_end.strftime("%Y%m")
+
+    return prd_end, prd_end2, label, prd_st
+
+
+
+# TERADATA EXTRACTION
+
+
+def build_extract_sql(dt: date, dt2: date, ms: date) -> str:
+    """Build the base-population extract SQL, faithful to the SAS PROC SQL.
+
+    Column set is restricted to what the SAS base table produced. The extra
+    cr_app_mortg_prod (alias c) columns and CAP dates that crept into an
+    earlier conversion are intentionally omitted — they were not in the SAS
+    sample projection.
+    """
+    dt_str = dt.strftime("%Y-%m-%d")
+    dt2_str = dt2.strftime("%Y-%m-%d")
+    ms_str = ms.strftime("%Y-%m-%d")
+
+    return f"""
+SELECT DISTINCT
+    L.IP_ID,
+    MGEN.AR_ID,
+    L.AR_ID_FAC,
+    L.STATUS,
+    MGEN.ACT_DT AS Activation_date,
+    L.ISSUE_DT,
+    L.BUILDERS_MORTG_IND,
+    MGEN.PLN_DTL_CD AS Plan_dtl_cd_MGEN,
+    b.APPL_FOR_PURPS_TYP,
+    D.adv_ind AS Advanced_ind,
+    CASE WHEN D.RT_TP = 1 THEN 'Fixed'
+         WHEN D.RT_TP = 2 THEN 'Variable'
+         ELSE 'Unknown' END AS Rate_type,
+    CASE WHEN L.APPL_PROD_ID <> 0 THEN 'N' ELSE 'Y' END AS MANUAL_OPEN,
+    L.APPL_PROD_ID,
+    SUBSTR(MGEN.AR_ID,5,5)  AS TRANSIT,
+    SUBSTR(MGEN.AR_ID,10,8) AS ACCOUNT_NUM,
+    SUBSTR(MGEN.AR_ID,18,3) AS LOAN_SEG,
+    MGEN.SNAP_DT,
+    L.LN_PROD_CD,
+    L.PLN_PRMRY_IND,
+    L.LN_DESC,
+    L.CR_PLN_TYP,
+    MGEN.DW_SRVC_ID,
+    CASE WHEN SUBSTR(L.LN_PROD_CD,1,3)='MPR' THEN 'NON-HLP_MTG'
+         WHEN SUBSTR(L.LN_PROD_CD,1,3)='HPR' AND L.LN_PROD_CD NOT IN ('HPRCSR','HPRCUR') THEN 'HLP_MTG'
+         WHEN TRIM(L.LN_PROD_CD) IN ('HPRCSR','HPRCUR') THEN 'HLP_RCL'
+         WHEN TRIM(L.LN_PROD_CD) IN ('LPRCSR') THEN 'RCLSEC' END AS MTG_TYPE,
+    (CASE WHEN TRIM(L.LN_PROD_CD) IN ('LPRCSR','HPRCSR') THEN 'Y' ELSE 'N' END) AS HELOC_IND,
+    (CASE WHEN SUBSTR(MGEN.ar_id,5,5) IN ('03776','03792','03801')
+          THEN 'Testing_Transit' ELSE 'Non-Testing_Transit' END) AS Transit_type,
+    (CASE WHEN L.PYMT_FREQ = '01' THEN 'Not specified '
+          WHEN L.PYMT_FREQ = '02' THEN 'Irregular'
+          WHEN L.PYMT_FREQ = '03' THEN 'Semi-monthly'
+          WHEN L.PYMT_FREQ = '04' THEN 'Monthly'
+          WHEN L.PYMT_FREQ = '05' THEN 'Bi-weekly'
+          WHEN L.PYMT_FREQ = '06' THEN 'Quarterly'
+          WHEN L.PYMT_FREQ = '07' THEN 'Semi annually'
+          WHEN L.PYMT_FREQ = '08' THEN 'Annually'
+          WHEN L.PYMT_FREQ = '09' THEN 'Weekly'
+          WHEN L.PYMT_FREQ = '10' THEN 'Daily'
+          WHEN L.PYMT_FREQ = '11' THEN 'Bi-monthly'
+          WHEN L.PYMT_FREQ = '12' THEN 'Tri-annually'
+          WHEN L.PYMT_FREQ = '13' THEN 'Maturity'
+          WHEN L.PYMT_FREQ = '19' THEN 'N/A'
+          WHEN L.PYMT_FREQ = '21' THEN 'Weekly-48'
+          WHEN L.PYMT_FREQ = '22' THEN 'Bi-Weekly-24' END) AS payment_frequency,
+    L.REGLR_PYMT_AMT AS regular_payment_amount,
+    ABS(L.BAL) AS BALANCE,
+    L.AMORT_TRM_IN_MTH,
+    MTG.AMORT_TERM_IN_MTH AS AMORT_TERM_IN_MTH_MTG,
+    L.INT_BASE_RATE,
+    L.INT_RT_ADDN AS interest_rt_addition,
+    L.TRM_IN_MTH,
+    CL.BSC,
+    MTG.AMORT_CHGD_IND,
+    MTG.ISS_RENW_DT AS ISS_RENW_DT_MTG,
+    MGEN.PRNCPL_BAL_INC AS principal_bal_increase,
+    (CASE WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('MPR') AND zeroifnull(L.appl_prod_id)>0 THEN L.appl_prod_id
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('MPR') AND zeroifnull(L.appl_prod_id)=0 AND L_TEMP.count_hlp_mtg>0 THEN LIT_FIX.max_pln_id
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('MPR') AND zeroifnull(L.appl_prod_id)=0 AND L_TEMP.count_hlp_mtg<=0 THEN LIT_FIX.max_prod_id
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('HPR') AND L.appl_prod_id>=700000000000 AND L.app_pln_id>=600000000000 THEN L.app_pln_id+100000000000
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('HPR') AND L.appl_prod_id>=700000000000 AND L.app_pln_id>=300000000000 THEN L.app_pln_id+400000000000
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('HPR') AND L.appl_prod_id>=700000000000 AND L.app_pln_id>=200000000000 THEN L.app_pln_id+500000000000
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('HPR') AND zeroifnull(L.appl_prod_id)>0 THEN L.app_pln_id
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('HPR') AND zeroifnull(L.appl_prod_id)=0 AND zeroifnull(L.app_pln_id)=0 AND zeroifnull(LIT_FIX.max_pln_id)=0 THEN LIT_FIX.max_prod_id
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('HPR') AND zeroifnull(L.appl_prod_id)=0 AND zeroifnull(L.app_pln_id)=0 AND zeroifnull(LIT_FIX.max_pln_id)>0 THEN LIT_FIX.max_pln_id
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('HPR') AND zeroifnull(L.appl_prod_id)=0 AND zeroifnull(L.app_pln_id)>0 THEN L.app_pln_id
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('LPR') AND L.appl_prod_id>0 THEN L.appl_prod_id
+          WHEN SUBSTR(L.ln_prod_cd,1,3) IN ('LPR') AND L.appl_prod_id<=0 THEN LIT_FIX.max_prod_id
+     END) AS APP_LINK,
+    b.cr_app_id,
+    mgen.aprsl_dt AS appraisal_dt_mgen,
+    cart1.REQ_SUB_TYP_CD,
+    prev_seg.prev_seg_count,
+    curr_seg.curr_seg_count,
+    (CASE WHEN (curr_seg_count > prev_seg_count AND prev_seg_count > 0) THEN 'REALLOCATION'
+          ELSE 'NOT_REALLOCATION' END) AS reallocation_ind_final,
+    b.orgnl_casper_prod_app_id,
+    b.PROD_APP_COMPL_DT AS Prod_app_completion_dt_cap,
+    RANK() OVER (PARTITION BY MGEN.AR_ID ORDER BY L.IP_ID ASC) AS EARLIEST
+FROM DDWV01.MORTG_GENERAL AS MGEN
+    LEFT JOIN DDWV01.LOAN_INFO_TACT AS L
+        ON MGEN.AR_ID = L.AR_ID AND MGEN.SNAP_DT = L.SNAP_DT
+    LEFT JOIN DDWV01.MORT_COND AS D
+        ON MGEN.AR_ID = D.AR_ID AND MGEN.SNAP_DT = D.SNAP_DT
+    LEFT JOIN DG6V19.MORTG_HIST AS MTG
+        ON MGEN.AR_ID = MTG.AR_ID AND MTG.MTH_END_DT = '{dt_str}'
+    LEFT JOIN DDWV01.CLNT_INFO_TACT AS CL
+        ON L.IP_ID = CL.IP_ID AND CL.SNAP_DT = '{dt_str}'
+    LEFT JOIN (
+        SELECT LOAN_INFO_TACT.AR_ID,
+               LOAN_INFO_TACT.IP_ID,
+               SUM(CASE WHEN SUBSTR(LOAN_INFO_TACT.LN_PROD_CD,1,3)='MPR' THEN 1 ELSE 0 END) AS COUNT_NONHLP_MTG,
+               SUM(CASE WHEN SUBSTR(LOAN_INFO_TACT.LN_PROD_CD,1,3)='HPR' AND LOAN_INFO_TACT.LN_PROD_CD NOT IN ('HPRCSR','HPRCUR') THEN 1 ELSE 0 END) AS COUNT_HLP_MTG,
+               SUM(CASE WHEN LOAN_INFO_TACT.LN_PROD_CD IN ('HPRCSR','HPRCUR') THEN 1 ELSE 0 END) AS COUNT_HLPRCL,
+               SUM(CASE WHEN LOAN_INFO_TACT.LN_PROD_CD IN ('LPRCSR') THEN 1 ELSE 0 END) AS COUNT_RCLSEC,
+               SUM(CASE WHEN SUBSTR(LOAN_INFO_TACT.LN_PROD_CD,1,3)='MPR' THEN ABS(BAL) ELSE 0 END) AS SUM_NONHLP_MTG,
+               SUM(CASE WHEN SUBSTR(LOAN_INFO_TACT.LN_PROD_CD,1,3)='HPR' AND LOAN_INFO_TACT.LN_PROD_CD NOT IN ('HPRCSR','HPRCUR') THEN ABS(BAL) ELSE 0 END) AS SUM_HLP_MTG,
+               SUM(CASE WHEN LOAN_INFO_TACT.LN_PROD_CD IN ('HPRCSR','HPRCUR') THEN ABS(BAL) ELSE 0 END) AS SUM_HLPRCL,
+               SUM(CASE WHEN LOAN_INFO_TACT.LN_PROD_CD IN ('LPRCSR') THEN ABS(BAL) ELSE 0 END) AS SUM_RCLSEC
+        FROM DDWV01.LOAN_INFO_TACT AS LOAN_INFO_TACT
+        WHERE LOAN_INFO_TACT.SNAP_DT = '{dt_str}'
+          AND LOAN_INFO_TACT.STATUS IN ('02','03','04','05')
+          AND LOAN_INFO_TACT.DW_SRVC_ID IN (20,21)
+        GROUP BY LOAN_INFO_TACT.AR_ID, LOAN_INFO_TACT.IP_ID
+    ) AS L_TEMP
+        ON L.AR_ID = L_TEMP.AR_ID AND L.IP_ID = L_TEMP.IP_ID
+    LEFT JOIN (
+        SELECT AR_ID,
+               IP_ID,
+               MAX(APPL_PROD_ID) AS MAX_PROD_ID,
+               (CASE WHEN MAX(APPL_PROD_ID)>=700000000000 AND MAX(APP_PLN_ID)>=600000000000 THEN MAX(APP_PLN_ID)+100000000000
+                     WHEN MAX(APPL_PROD_ID)>=700000000000 AND MAX(APP_PLN_ID)>=300000000000 THEN MAX(APP_PLN_ID)+400000000000
+                     WHEN MAX(APPL_PROD_ID)>=700000000000 AND MAX(APP_PLN_ID)>=200000000000 THEN MAX(APP_PLN_ID)+500000000000
+                     ELSE MAX(APP_PLN_ID)+0 END) AS MAX_PLN_ID
+        FROM DDWV01.LOAN_INFO_TACT
+        GROUP BY 1,2
+    ) AS LIT_FIX
+        ON L.AR_ID = LIT_FIX.AR_ID AND L.IP_ID = LIT_FIX.IP_ID
+    LEFT JOIN cr_app_prod AS b
+        ON APP_LINK = b.orgnl_casper_prod_app_id AND b.sys_src_id <> 66
+    LEFT JOIN cr_app_mortg_prod AS c
+        ON b.cr_app_id = c.cr_app_id
+       AND b.cr_app_prod_seq_no = c.cr_app_prod_seq_no
+       AND b.sys_src_id = c.sys_src_id
+    LEFT JOIN (
+        SELECT DISTINCT a.ar_id, REQ_SUB_TYP_CD
+        FROM ddwv01.loan_info_tact AS a,
+             DDWV01.CLNT_AR_RELTN AS b,
+             DDWV01.COMPLT_REQ AS c
+        WHERE a.ar_id = b.ar_id
+          AND a.dw_srvc_id = 21
+          AND a.snap_dt = '{dt_str}'
+          AND b.snap_dt IN ('{dt2_str}','{dt_str}')
+          AND A.issue_dt BETWEEN '{ms_str}' AND '{dt_str}'
+          AND a.ln_prod_cd IN ('HPRINB','HPRIVB','HPRIVC','HPRIVU','HPRSUN','HPRICN','HPRICH','HPRIVG')
+          AND a.status IN ('02','03','04','05','08')
+          AND b.clnt_no = c.clnt_no
+          AND CAST(req_cls_tmstmp AS DATE) BETWEEN '{ms_str}' AND '{dt_str}'
+          AND REQ_SUB_TYP_CD = 'HRA'
+    ) AS cart1
+        ON cart1.ar_id = MGEN.ar_id
+    LEFT JOIN (
+        SELECT L1.ar_id_fac, COUNT(*) AS curr_seg_count
+        FROM DDWV01.loan_info_tact AS L1
+        WHERE L1.snap_dt = '{dt_str}'
+          AND L1.ar_id_fac IN (
+              SELECT loan_info_tact.ar_id_fac
+              FROM DDWV01.loan_info_tact AS loan_info_tact,
+                   DDWV01.MORTG_GENERAL AS MORTG_GENERAL
+              WHERE loan_info_tact.snap_dt = '{dt_str}'
+                AND MORTG_GENERAL.snap_dt = '{dt_str}'
+                AND loan_info_tact.status IN ('02','03','04','05','08')
+                AND loan_info_tact.ln_prod_cd IN ('HPRINB','HPRIVB','HPRIVC','HPRIVU','HPRSUN','HPRICN','HPRICH','HPRIVG')
+                AND MORTG_GENERAL.ACT_DT BETWEEN '{ms_str}' AND '{dt_str}'
+                AND loan_info_tact.DW_SRVC_ID = 21
+                AND MORTG_GENERAL.DW_SRVC_ID = 21
+                AND MORTG_GENERAL.AR_ID = loan_info_tact.AR_ID
+                AND MORTG_GENERAL.SNAP_DT = loan_info_tact.SNAP_DT
+          )
+        GROUP BY L1.ar_id_fac
+    ) AS curr_seg
+        ON L.ar_id_fac = curr_seg.ar_id_fac
+    LEFT JOIN (
+        SELECT L2.ar_id_fac, COUNT(*) AS prev_seg_count
+        FROM DDWV01.loan_info_tact AS L2
+        WHERE L2.snap_dt = '{dt2_str}'
+          AND L2.ar_id_fac IN (
+              SELECT loan_info_tact.ar_id_fac
+              FROM DDWV01.loan_info_tact AS loan_info_tact,
+                   DDWV01.MORTG_GENERAL AS MORTG_GENERAL
+              WHERE loan_info_tact.snap_dt = '{dt_str}'
+                AND MORTG_GENERAL.snap_dt = '{dt_str}'
+                AND loan_info_tact.status IN ('02','03','04','05','08')
+                AND loan_info_tact.ln_prod_cd IN ('HPRINB','HPRIVB','HPRIVC','HPRIVU','HPRSUN','HPRICN','HPRICH','HPRIVG')
+                AND MORTG_GENERAL.ACT_DT BETWEEN '{ms_str}' AND '{dt_str}'
+                AND loan_info_tact.DW_SRVC_ID = 21
+                AND MORTG_GENERAL.DW_SRVC_ID = 21
+                AND MORTG_GENERAL.AR_ID = loan_info_tact.AR_ID
+                AND MORTG_GENERAL.SNAP_DT = loan_info_tact.SNAP_DT
+          )
+        GROUP BY L2.ar_id_fac
+    ) AS prev_seg
+        ON L.ar_id_fac = prev_seg.ar_id_fac
+WHERE MGEN.SNAP_DT = '{dt_str}'
+  AND MGEN.ACT_DT >= '{ms_str}'
+  AND MTG_TYPE IS NOT NULL
+  AND MGEN.DW_SRVC_ID = 21
+  AND Transit_type = 'Non-Testing_Transit'
+  AND L.status IN ('02','03','04','05','08')
+  AND Advanced_ind NOT IN ('N')
+QUALIFY EARLIEST = 1
+ORDER BY MGEN.ar_id DESC
+"""
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Uppercase all column names so downstream selection is case-stable.
+
+    Teradata may return names in mixed or upper case depending on driver
+    settings; normalizing once here prevents the silent column-drop we saw
+    where mixed-case names fell into the 'missing columns' path.
+    """
+    df.columns = [c.upper() for c in df.columns]
+    return df
+
+
+def _coerce_ar_id_string(df: pd.DataFrame, expected_width: Optional[int] = None) -> pd.DataFrame:
+    """Force AR_ID to a fixed-width string and validate width.
+
+    AR_ID is a 15+ digit identifier; if the driver returned it as a float/int
+    the SUBSTR-derived TRANSIT/ACCOUNT_NUM/LOAN_SEG and the OMNI join key are
+    all silently wrong. Make it a string and assert a consistent width.
+    """
+    if "AR_ID" not in df.columns:
+        raise RuntimeError("AR_ID column not present in extract output")
+
+    df["AR_ID"] = df["AR_ID"].astype("string").str.strip()
+
+    widths = df["AR_ID"].dropna().str.len().unique().tolist()
+    LOGGER.info("AR_ID dtype=%s, observed widths=%s", df["AR_ID"].dtype, widths)
+
+    if expected_width is not None:
+        bad = df.loc[df["AR_ID"].str.len() != expected_width, "AR_ID"]
+        if len(bad) > 0:
+            raise RuntimeError(
+                f"AR_ID width mismatch: expected {expected_width}, "
+                f"found widths {widths}. Sample bad value: {bad.iloc[0]!r}. "
+                f"This breaks SUBSTR parsing and the OMNI join — confirm the "
+                f"Teradata AR_ID type/padding with the source owner."
+            )
+    return df
+
+
+def extract_mortgage_base(
+    teradata_conn, dt: date, dt2: date, ms: date,
+    ar_id_width: Optional[int] = None,
+) -> pd.DataFrame:
+    """Extract the newly-activated mortgage base population from Teradata."""
+    LOGGER.info("PHASE 1: Extracting mortgage base from Teradata...")
+    sql = build_extract_sql(dt, dt2, ms)
+
+    LOGGER.info("Executing Teradata extraction query...")
+    with teradata_conn.cursor() as cur:
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    df_base = pd.DataFrame.from_records(rows, columns=cols)
+
+    df_base = _normalize_columns(df_base)
+    df_base = _coerce_ar_id_string(df_base, expected_width=ar_id_width)
+
+    LOGGER.info("Extracted %d base records from Teradata", len(df_base))
+    return df_base
+
+
+
+# OMNI HL REALLOCATION EXCLUSION
+
+
+def exclude_omni_reallocations(
+    base_df: pd.DataFrame, teradata_conn, dt: date
+) -> Tuple[pd.DataFrame, int]:
+    """Remove Digital HLP Reallocation segments (OMNI), matching the SAS join.
+
+    SAS key: input(substr(a.ar_id,10,11), best12.) = b.olms_acct_no
+    SUBSTR(x,10,11) is 1-based -> Python AR_ID[9:20] (11 chars).
+    """
+    LOGGER.info("PHASE 1b: Excluding OMNI HL Reallocations...")
+
+    omni_sql = """
+SELECT DISTINCT a.olms_acct_no AS OLMS_ACCT_NO
+FROM ddwv01.CR_HOMELINEPLAN_TXN_WKLY AS a
+WHERE BUS_TXN_TYP_HDNG_TXT = 'Homeline Plan Reallocation'
+  AND PROD_ITM_DESC = 'R_HLP_MTG_SEG'
+  AND NEW_LMT_AMT <> 0
+  AND ITM_SEG_ACTN_CD = '03'
+  AND OLMS_Acct_no <> 0
+QUALIFY ROW_NUMBER() OVER (PARTITION BY OLMS_Acct_no ORDER BY captr_dt DESC) = 1
+"""
+    LOGGER.info("Querying OMNI transactions...")
+    with teradata_conn.cursor() as cur:
+        cur.execute(omni_sql)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    omni_df = pd.DataFrame.from_records(rows, columns=cols)
+    omni_df.columns = [c.upper() for c in omni_df.columns]
+
+    if len(omni_df) == 0:
+        LOGGER.info("No OMNI reallocations found")
+        return base_df, 0
+
+    LOGGER.info("Found %d OMNI account(s) to exclude", len(omni_df))
+
+    key = pd.to_numeric(base_df["AR_ID"].str[9:20], errors="coerce")
+    omni_accounts = set(pd.to_numeric(omni_df["OLMS_ACCT_NO"], errors="coerce").dropna())
+
+    before = len(base_df)
+    kept = base_df[~key.isin(omni_accounts)].copy()
+    excluded = before - len(kept)
+
+    LOGGER.info("Excluded %d OMNI reallocation records", excluded)
+    return kept, excluded
+
+
+
+# SAMPLING  (SAS PROC SURVEYSELECT method=srs)
+
+
+def survey_select_srs(
+    base_df: pd.DataFrame, sampsize: int, seed: int
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Replicate SAS PROC SURVEYSELECT method=srs (simple random sample).
+
+    Logic parity only: the drawn records will differ from SAS (different RNG),
+    but the size is fixed and Sample + AutoComplete partition the population
+    so balances reconcile. Seed is explicit for reproducibility.
+
+    Raises if the population is smaller than sampsize, matching SAS behavior
+    (SAS errors rather than silently shrinking the sample).
+    """
+    LOGGER.info("PHASE 2: Simple random sample (n=%d, seed=%d)...", sampsize, seed)
+
+    if len(base_df) < sampsize:
+        raise RuntimeError(
+            f"Base population ({len(base_df)}) is smaller than sample size "
+            f"({sampsize}). SAS PROC SURVEYSELECT errors in this case; this is "
+            f"a control exception, not a silent shrink. Escalate to the control owner."
+        )
+
+    sample_df = base_df.sample(n=sampsize, random_state=seed)
+    not_sampled_df = base_df.loc[~base_df.index.isin(sample_df.index)].copy()
+
+    LOGGER.info(
+        "Sample: %d records | AutoComplete: %d records",
+        len(sample_df), len(not_sampled_df),
+    )
+    return sample_df.reset_index(drop=True), not_sampled_df.reset_index(drop=True)
+
+
+
+# OUTPUT PREP
+
+
+def prepare_sample_output(sample_df: pd.DataFrame) -> pd.DataFrame:
+    """Select and order the 34 export columns (SAS sample projection)."""
+    LOGGER.info("PHASE 3: Preparing sample output (34 columns)...")
+
+    missing = [c for c in SAMPLE_OUTPUT_COLUMNS if c not in sample_df.columns]
+    if missing:
+        raise RuntimeError(
+            f"Sample is missing required output columns: {missing}. "
+            f"Available: {sorted(sample_df.columns)}"
+        )
+
+    output_df = sample_df[SAMPLE_OUTPUT_COLUMNS].copy()
+    LOGGER.info(
+        "Sample output prepared: %d rows x %d columns",
+        len(output_df), len(output_df.columns),
+    )
+    return output_df
+
+
+def prepare_autocomplete_output(not_sampled_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate the not-sampled population into the AutoComplete summary.
+
+    SAS: group by MTG_TYPE -> LOB, TestType, ProductType, actionTaken, volume, BAL
+    """
+    LOGGER.info("PHASE 3b: Preparing AutoComplete aggregation...")
+
+    if len(not_sampled_df) == 0:
+        LOGGER.warning("No not-sampled records; AutoComplete will be empty")
+        return pd.DataFrame(
+            columns=["LOB", "TestType", "ProductType", "actionTaken", "volume", "BAL"]
+        )
+
+    auto_df = (
+        not_sampled_df.groupby("MTG_TYPE", dropna=False)
+        .agg(volume=("AR_ID", "count"), BAL=("BALANCE", "sum"))
+        .reset_index()
+        .rename(columns={"MTG_TYPE": "ProductType"})
+    )
+    auto_df["LOB"] = "HEF"
+    auto_df["TestType"] = "Sample"
+    auto_df["actionTaken"] = "Not Reviewed"
+    auto_df = auto_df[["LOB", "TestType", "ProductType", "actionTaken", "volume", "BAL"]]
+
+    LOGGER.info("AutoComplete prepared: %d product types", len(auto_df))
+    return auto_df
+
+
+def log_balance_reconciliation(
+    base_df: pd.DataFrame, sample_df: pd.DataFrame, not_sampled_df: pd.DataFrame
+) -> None:
+    """Emit the balance figures that the agreed parity test checks.
+
+    Sample BAL + AutoComplete BAL must equal the base population BAL by
+    construction. This is logged (not validated against SAS here) so the run
+    log carries the number the external harness will compare to SAS.
+    """
+    base_bal = float(base_df["BALANCE"].sum())
+    sample_bal = float(sample_df["BALANCE"].sum())
+    auto_bal = float(not_sampled_df["BALANCE"].sum())
+    LOGGER.info("BALANCE RECON: base=%.2f", base_bal)
+    LOGGER.info("BALANCE RECON: sample=%.2f + autocomplete=%.2f = %.2f",
+                sample_bal, auto_bal, sample_bal + auto_bal)
+    if abs((sample_bal + auto_bal) - base_bal) > 0.01:
+        LOGGER.error(
+            "BALANCE RECON FAILED: partition does not sum to base (diff=%.2f). "
+            "Sample/AutoComplete are not a clean partition of the population.",
+            (sample_bal + auto_bal) - base_bal,
+        )
+
+
+
+# EXCEL EXPORT
+
+
+def export_to_excel(
+    sample_df: pd.DataFrame, autocomplete_df: pd.DataFrame,
+    export_dir: Path, label: str,
+) -> Tuple[Path, Path]:
+    """Write the Sample and AutoComplete workbooks."""
+    LOGGER.info("PHASE 4: Exporting to Excel...")
+
+    sample_path = export_dir / f"MRRMIP_25_samples_{label}.xlsx"
+    with pd.ExcelWriter(
+        sample_path, engine="xlsxwriter",
+        date_format="mm/dd/yyyy", datetime_format="mm/dd/yyyy",
+    ) as writer:
+        sample_df.to_excel(writer, sheet_name="25_samples", index=False)
+    LOGGER.info("Sample exported: %s (%d rows)", sample_path.name, len(sample_df))
+
+    auto_path = export_dir / f"MRRMIP_AutoComplete_{label}.xlsx"
+    with pd.ExcelWriter(
+        auto_path, engine="xlsxwriter",
+        date_format="mm/dd/yyyy", datetime_format="mm/dd/yyyy",
+    ) as writer:
+        autocomplete_df.to_excel(writer, sheet_name="autoComplete", index=False)
+    LOGGER.info("AutoComplete exported: %s (%d rows)", auto_path.name, len(autocomplete_df))
+
+    return sample_path, auto_path
+
+
+
+# SQL SERVER LOAD  (deferred — "baby steps"; off by default)
+
+
+def load_to_sql_server(sample_df: pd.DataFrame, sql_conn) -> None:
+    """Delete-all-then-insert into the staging table (matches SAS).
+
+    Deferred until after parity sign-off. Not called from main() by default.
+    """
+    LOGGER.info("PHASE 5: SQL Server load (delete + insert)...")
+    table_name = "dbo.Load_COB_MRRMIP_MR"
+    cols = list(sample_df.columns)
+    col_list = ", ".join(f"[{c}]" for c in cols)
+    placeholders = ", ".join(["?"] * len(cols))
+    insert_sql = f"INSERT INTO {table_name} ({col_list}) VALUES ({placeholders})"
+
+    try:
+        cur = sql_conn.cursor()
+        cur.fast_executemany = True
+        cur.execute(f"DELETE FROM {table_name}")
+        rows = [tuple(r) for r in sample_df.itertuples(index=False, name=None)]
+        cur.executemany(insert_sql, rows)
+        sql_conn.commit()
+        LOGGER.info("Inserted %d records into %s", len(rows), table_name)
+    except pyodbc.Error as exc:
+        LOGGER.error("SQL Server load failed: %s", exc)
+        sql_conn.rollback()
+        raise
+
+
+
+# CLI / ENTRY POINT
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="COB MRR/MIP extract — sample of newly activated mortgages"
+    )
+    parser.add_argument(
+        "--runday", type=str, default=None,
+        help="Run day YYYYMMDD (e.g. 20260515). Defaults to today.",
+    )
+    parser.add_argument(
+        "--ar-id-width", type=int, default=None,
+        help="Expected AR_ID string width; if set, mismatches raise. "
+             "Confirm the value with the SAS/source owner before enforcing.",
+    )
+    parser.add_argument(
+        "--load-sql", action="store_true",
+        help="Also load the sample to SQL Server (deferred; off by default).",
+    )
+    return parser.parse_args()
+
+
+def validate_and_parse_runday(runday_str: Optional[str]) -> date:
+    if runday_str is None:
+        LOGGER.info("No runday specified, using today's date")
+        return date.today()
+    if len(runday_str) != 8 or not runday_str.isdigit():
+        raise ValueError(
+            f"Invalid date format: '{runday_str}'. Expected YYYYMMDD (e.g. 20260515)"
+        )
+    run_date = date(int(runday_str[0:4]), int(runday_str[4:6]), int(runday_str[6:8]))
+    LOGGER.info("Using specified runday: %s", run_date.strftime("%d%b%Y").upper())
+    return run_date
+
+
+def main() -> int:
+    """Run the COB MRR/MIP extraction end to end."""
+    try:
+        args = parse_arguments()
+    except SystemExit:
+        return 1
+
+    try:
+        log_dir, export_dir = configure_paths()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    log_path = setup_logging(log_dir)
+
+    try:
+        run_date = validate_and_parse_runday(args.runday)
+    except ValueError as exc:
+        LOGGER.error("%s", exc)
+        return 1
+
+    LOGGER.info(
+        ">>>>>>>>>> Starting at %s by %s <<<<<<<<<<",
+        datetime.now().strftime("%d%b%Y:%H:%M:%S").upper(), USER,
+    )
+    LOGGER.info(">>>>>>>>>> Env: %s | Run Day: %s <<<<<<<<<<",
+                ENV, run_date.strftime("%d%b%Y").upper())
+    LOGGER.info("Log file:   %s", log_path)
+    LOGGER.info("Export dir: %s", export_dir)
+
+    dt, dt2, label, ms = get_run_dates(run_date)
+    LOGGER.info("dt  (period end)    = %s", dt.strftime("%d%b%Y").upper())
+    LOGGER.info("dt2 (2 months back) = %s", dt2.strftime("%d%b%Y").upper())
+    LOGGER.info("label (YYYYMM)      = %s", label)
+    LOGGER.info("ms  (period start)  = %s", ms.strftime("%d%b%Y").upper())
+
+    # Deterministic, audit-replayable seed tied to the reporting month.
+    seed = int(label)
+    LOGGER.info("Sample seed (= label) = %d", seed)
+
+    try:
+        secrets = load_vault_secrets()
+    except RuntimeError as exc:
+        LOGGER.error("%s", exc)
+        return 1
+
+    try:
+        teradata_conn = get_teradata_connection(secrets)
+    except RuntimeError as exc:
+        LOGGER.error("%s", exc)
+        return 1
+
+    sql_conn = None
+    if args.load_sql:
+        try:
+            sql_conn = get_sql_server_connection(secrets)
+        except RuntimeError as exc:
+            LOGGER.error("SQL Server connection failed: %s", exc)
+            teradata_conn.close()
+            return 1
+
+    try:
+        base_df = extract_mortgage_base(
+            teradata_conn, dt, dt2, ms, ar_id_width=args.ar_id_width
+        )
+        if not base_df.index.is_unique:
+            base_df = base_df.reset_index(drop=True)
+        LOGGER.info("Base population: %d records", len(base_df))
+
+        base_df, omni_count = exclude_omni_reallocations(base_df, teradata_conn, dt)
+        LOGGER.info("After OMNI exclusion: %d records (excluded %d)",
+                    len(base_df), omni_count)
+
+        base_df = base_df.reset_index(drop=True)
+        sample_df, not_sampled_df = survey_select_srs(base_df, SAMPLE_SIZE, seed)
+
+        log_balance_reconciliation(base_df, sample_df, not_sampled_df)
+
+        sample_output = prepare_sample_output(sample_df)
+        autocomplete_output = prepare_autocomplete_output(not_sampled_df)
+
+        sample_path, auto_path = export_to_excel(
+            sample_output, autocomplete_output, export_dir, label
+        )
+
+        LOGGER.info("=" * 70)
+        LOGGER.info("EXPORT COMPLETE")
+        LOGGER.info("Sample (25):        %s", sample_path)
+        LOGGER.info("AutoComplete:       %s", auto_path)
+        LOGGER.info("=" * 70)
+
+        if args.load_sql and sql_conn is not None:
+            load_to_sql_server(sample_output, sql_conn)
+        else:
+            LOGGER.info("SQL load skipped (deferred until parity sign-off). "
+                        "Use --load-sql to enable.")
+
+        LOGGER.info(">>>>>>>>>> Completed at %s <<<<<<<<<<",
+                    datetime.now().strftime("%d%b%Y:%H:%M:%S").upper())
+        return 0
+
+    except Exception as exc:
+        LOGGER.error("Program failed: %s", exc, exc_info=True)
+        return 1
+
+    finally:
+        try:
+            teradata_conn.close()
+            if sql_conn is not None:
+                sql_conn.close()
+        except Exception as exc:
+            LOGGER.warning("Error closing connections: %s", exc)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
