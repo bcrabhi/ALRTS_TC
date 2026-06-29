@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""
+C86 Alerts Cards
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import sys
+import json
+import logging
+from datetime import date, datetime, timedelta
+from typing import Optional
+
+try:
+    import pandas as pd
+except ImportError as e:  # pragma: no cover
+    print(f"[FATAL] pandas not available: {e}", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    import trino
+    from trino.auth import BasicAuthentication
+except ImportError as e:  # pragma: no cover
+    print(f"[FATAL] trino client not available: {e}", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError as e:  # pragma: no cover
+    print(f"[FATAL] boto3 not available: {e}", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+SAMPLE_ROWS = 100          # number of rows to keep after the full read
+READ_CHUNKSIZE = 200_000   # streaming chunk size for the full read
+
+TRINO_PORT = 8443
+TRINO_CATALOG = "edl0_im"
+TRINO_SCHEMA = "prod_brt0_ess"
+TRINO_SOURCE = "c86_alerts_cards"
+
+S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"
+S3_BUCKET = "ryu0-s3-sas-migration"
+S3_OUTPUT_PREFIX = "output/c86_alerts_cards"
+
+VAULT_ENV_PATHS = (
+    "/rbc_vault2/secrets/vault.secrets.env",
+    "/rbc_vault/secrets/vault_secrets.env",
+    "rbc_vault2/secrets/vault.secrets.env",
+    "vault.secrets.env",
+)
+
+LOCAL_OUT_DIR = "./c86/output/alert/cards"
+
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger("C86_CardsSample")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] - %(message)s",
+                              datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        logger.addHandler(ch)
+    return logger
+
+
+LOG = setup_logging()
+
+
+# ── Credentials (same pattern as smoke test) ─────────────────────────────────
+
+def load_vault_env(logger: logging.Logger) -> Optional[str]:
+    if load_dotenv is None:
+        logger.warning("python-dotenv not installed; relying on pre-set environment vars only")
+        return None
+    for path in VAULT_ENV_PATHS:
+        if os.path.exists(path):
+            load_dotenv(path, override=True)
+            logger.info("Vault env loaded from: %s", path)
+            return path
+    logger.warning("No vault env file found in known locations; relying on environment vars")
+    return None
+
+
+def get_credentials(logger: logging.Logger) -> dict:
+    required = {
+        "trino_host": "TRINO_HOST",
+        "trino_user": "TRINO_USERNAME",
+        "trino_pass": "TRINO_PASSWORD",
+    }
+    required_multi = {
+        "s3_access_key": ("RYU0_S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+        "s3_secret_key": ("RYU0_S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+    }
+
+    resolved: dict = {}
+    missing = []
+    for key, env_name in required.items():
+        val = os.environ.get(env_name)
+        if not val:
+            missing.append(env_name)
+        resolved[key] = val
+
+    for key, env_names in required_multi.items():
+        val = next((os.environ[n] for n in env_names if os.environ.get(n)), None)
+        if not val:
+            missing.append(" or ".join(env_names))
+        resolved[key] = val
+
+    if missing:
+        raise RuntimeError(
+            "Missing required credential env var(s): "
+            + ", ".join(missing)
+            + ". Check vault.secrets.env or ocp_secret_mapping.yaml."
+        )
+
+    logger.info(
+        "Credentials resolved: host=%s user=%s pass=%s s3_access=%s s3_secret=%s",
+        "SET" if resolved["trino_host"] else "MISSING",
+        "SET" if resolved["trino_user"] else "MISSING",
+        "SET" if resolved["trino_pass"] else "MISSING",
+        "SET" if resolved["s3_access_key"] else "MISSING",
+        "SET" if resolved["s3_secret_key"] else "MISSING",
+    )
+    return resolved
+
+
+# ── Date logic (from original) ───────────────────────────────────────────────
+
+def compute_dates(today: Optional[date] = None) -> dict:
+    if not today:
+        today = date.today()
+
+    start_dt_ini = date(2022, 6, 30)
+    week_end_dt_ini = date(2022, 7, 25)
+
+    weekday = today.weekday()
+    days_since_friday = (weekday - 4) % 7
+    week_start_friday = today - timedelta(days=days_since_friday)
+    end_dt = week_start_friday - timedelta(days=2)
+
+    if end_dt < week_end_dt_ini:
+        start_dt = start_dt_ini
+    else:
+        start_dt = end_dt - timedelta(days=6)
+
+    return {
+        "report_dt": today,
+        "week_start_dt": start_dt,
+        "week_end_dt": end_dt,
+        "week_end_dt_p1": end_dt + timedelta(days=1),
+        "pardt": start_dt - timedelta(days=7),
+        "label": today.strftime("%Y%m%d"),
+    }
+
+
+# ── SQL helpers (from original) ──────────────────────────────────────────────
+
+def _SAFE_TS(expr: str) -> str:
+    return f"""
+    TRY(
+      CAST(
+        from_iso8601_timestamp(
+          regexp_replace(
+            regexp_replace({expr}, ' ', 'T'),
+            'Z$', '+00:00'
+          )
+        ) AS timestamp
+      )
+    )
+    """.strip()
+
+
+ESS_PROCESS_TS = _SAFE_TS("element_at(eventAttributes, 'ess_process_timestamp')")
+ESS_SRC_TS = _SAFE_TS("element_at(eventAttributes, 'ess_src_event_timestamp')")
+SRC_HDR = "TRY(json_parse(element_at(eventAttributes, 'SourceEventHeader')))"
+EVT_PAYLOAD = "TRY(json_parse(element_at(eventAttributes, 'eventPayload')))"
+EVT_ID = f"TRY(json_extract_scalar({SRC_HDR}, '$.eventId'))"
+EVT_TS = _SAFE_TS(f"json_extract_scalar({SRC_HDR}, '$.eventTimestamp')")
+
+
+def q_xb80_cards(schema: str, week_start: date, week_end_p1: date, pardt: date) -> str:
+    """Query 1: xb80 cards events (triple-underscore table name is quoted)."""
+    return f"""
+    WITH cards AS (
+     SELECT
+       event_activity_type,
+       source_event_id,
+       partition_date,
+       TRY(date_parse(partition_date, '%Y%m%d')) AS partition_date_parsed,
+       {ESS_PROCESS_TS} AS ess_process_timestamp,
+       {ESS_SRC_TS}    AS ess_src_event_timestamp,
+       {EVT_ID}        AS eventId,
+       {EVT_TS}        AS eventTimestamp,
+       {EVT_PAYLOAD}   AS eventPayload
+     FROM {schema}."xb80___credit_card_system_interface"
+    )
+    SELECT
+      event_activity_type,
+      source_event_id,
+      partition_date,
+      ess_process_timestamp,
+      ess_src_event_timestamp,
+      eventId,
+      eventTimestamp,
+      TRY(json_extract_scalar(eventPayload, '$.accountId'))      AS accountId,
+      TRY(json_extract_scalar(eventPayload, '$.alertType'))      AS alertType,
+      TRY(CAST(json_extract_scalar(eventPayload, '$.thresholdAmount') AS DECIMAL(12,2))) AS thresholdAmount,
+      TRY(json_extract_scalar(eventPayload, '$.customerID'))     AS customerID,
+      TRY(json_extract_scalar(eventPayload, '$.accountCurrency')) AS accountCurrency,
+      TRY(CAST(json_extract_scalar(eventPayload, '$.creditLimit') AS DECIMAL(12,2)))     AS creditLimit,
+      TRY(json_extract_scalar(eventPayload, '$.maskedAccount'))  AS maskedAccount,
+      TRY(json_extract_scalar(eventPayload, '$.decisionId'))     AS decisionId,
+      TRY(CAST(json_extract_scalar(eventPayload, '$.alertAmount') AS DECIMAL(12,2)))     AS alertAmount
+    FROM cards
+    WHERE
+      partition_date_parsed > DATE '{pardt.isoformat()}'
+      AND event_activity_type = 'Alert Decision Cards'
+      AND TRY(json_extract_scalar(eventPayload, '$.alertType')) = 'AVAIL_CREDIT_REMAINING'
+      AND {_SAFE_TS("CAST(eventTimestamp AS varchar)")}
+        BETWEEN TIMESTAMP '{week_start.isoformat()} 00:00:00'
+          AND TIMESTAMP '{week_end_p1.isoformat()} 00:00:00'
+    """
+    # If the full read ever gets too heavy, append:  ... LIMIT {SAMPLE_ROWS}
+    # to push the cap into Trino instead of trimming in pandas.
+
+
+# ── Trino ────────────────────────────────────────────────────────────────────
+
+def get_trino_connection(creds: dict, logger: logging.Logger):
+    auth = BasicAuthentication(creds["trino_user"], creds["trino_pass"]) if creds["trino_pass"] else None
+    logger.info("Connecting to Trino: host=%s user=%s", creds["trino_host"], creds["trino_user"])
+    return trino.dbapi.connect(
+        host=creds["trino_host"],
+        port=TRINO_PORT,
+        user=creds["trino_user"],
+        http_scheme="https",
+        auth=auth,
+        catalog=TRINO_CATALOG,
+        schema=TRINO_SCHEMA,
+        source=TRINO_SOURCE,
+    )
+
+
+def read_full_df(conn, sql: str, logger: logging.Logger, chunksize: int = READ_CHUNKSIZE) -> pd.DataFrame:
+    """Full read of the query result, streamed in chunks and concatenated."""
+    logger.info("Running query 1 (q_xb80_cards), full read...")
+    chunks = pd.read_sql(sql, conn, chunksize=chunksize)
+    df = pd.concat(chunks, ignore_index=True)
+    logger.info("Full read complete: %d rows, %d cols", len(df), df.shape[1])
+    return df
+
+
+# ── S3 ───────────────────────────────────────────────────────────────────────
+
+def get_s3_client(creds: dict):
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=creds["s3_access_key"],
+        aws_secret_access_key=creds["s3_secret_key"],
+        config=BotoConfig(signature_version="s3v4", retries={"max_attempts": 3}),
+    )
+
+
+def upload_file_to_s3(creds: dict, local_path: str, s3_key: str, logger: logging.Logger) -> str:
+    s3 = get_s3_client(creds)
+    s3.upload_file(local_path, S3_BUCKET, s3_key)
+    uri = f"s3://{S3_BUCKET}/{s3_key}"
+    logger.info("Uploaded to %s", uri)
+    return uri
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    LOG.info("=" * 70)
+    LOG.info("C86 Alerts Cards — Query 1 sample → Excel → S3")
+    LOG.info("Start: %s", datetime.now().isoformat())
+    LOG.info("=" * 70)
+
+    try:
+        load_vault_env(LOG)
+        creds = get_credentials(LOG)
+    except Exception as e:  # noqa: BLE001
+        LOG.error("Credential resolution FAILED: %s", e)
+        return 1
+
+    dt = compute_dates()
+    label = dt["label"]
+    schema = f"{TRINO_CATALOG}.{TRINO_SCHEMA}"
+    LOG.info("Week window: %s to %s | label=%s",
+             dt["week_start_dt"], dt["week_end_dt"], label)
+
+    # 1. Run query 1, full read.
+    try:
+        with get_trino_connection(creds, LOG) as conn:
+            sql = q_xb80_cards(schema, dt["week_start_dt"], dt["week_end_dt_p1"], dt["pardt"])
+            df_cards = read_full_df(conn, sql, LOG)
+    except Exception as e:  # noqa: BLE001
+        LOG.error("Trino read FAILED: %s", e)
+        return 1
+
+    if df_cards.empty:
+        LOG.warning("Query returned 0 rows — nothing to sample. Writing an empty file anyway.")
+
+    # 2. Trim to first N rows in pandas.
+    df_sample = df_cards.head(SAMPLE_ROWS).copy()
+    LOG.info("Sampled first %d rows (got %d).", SAMPLE_ROWS, len(df_sample))
+
+    # 3. Write the sample to a local .xlsx.
+    out_dir = os.path.join(LOCAL_OUT_DIR, label)
+    os.makedirs(out_dir, exist_ok=True)
+    filename = f"cards_query1_sample_{label}.xlsx"
+    local_path = os.path.join(out_dir, filename)
+    try:
+        df_sample.to_excel(local_path, sheet_name="cards_sample", index=False)
+        LOG.info("Wrote local Excel: %s (%d rows)", local_path, len(df_sample))
+    except Exception as e:  # noqa: BLE001
+        LOG.error("Excel write FAILED: %s", e)
+        return 1
+
+    # 4. Upload to S3.
+    try:
+        s3_key = f"{S3_OUTPUT_PREFIX}/{label}/{filename}"
+        uri = upload_file_to_s3(creds, local_path, s3_key, LOG)
+    except (BotoCoreError, ClientError) as e:
+        LOG.error("S3 upload FAILED (boto): %s", e)
+        return 1
+    except Exception as e:  # noqa: BLE001
+        LOG.error("S3 upload FAILED: %s", e)
+        return 1
+
+    LOG.info("=" * 70)
+    LOG.info("DONE — sample written and uploaded.")
+    LOG.info("  rows written : %d", len(df_sample))
+    LOG.info("  local file   : %s", local_path)
+    LOG.info("  s3 uri       : %s", uri)
+    LOG.info("=" * 70)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
