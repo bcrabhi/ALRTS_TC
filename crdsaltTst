@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 C86 Alerts Cards 
-
 """
 
 from __future__ import annotations
@@ -26,11 +25,7 @@ except ImportError:
     load_dotenv = None
 
 
-# ── Vault credential loading (mirrors pa_client360, image 1) ─────────────────
-# Load vault.secrets.env at import time from the known mount paths, so this job
-# resolves its own credentials even if main.py's load_dotenv didn't find the
-# file. The _vault_loaded print shows which path was used (or None) in the log —
-# that single line tells you immediately whether the vault file was present.
+# ── Vault credential loading 
 
 _VAULT_ENV_PATHS = (
     "/rbc_vault2/secrets/vault.secrets.env",   # production OCP mount
@@ -51,52 +46,63 @@ print(f"[C86_Alerts_Cards] vault env loaded from: {_vault_loaded} (cwd={os.getcw
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
+# Defaults below are PROD fallbacks; the YAML config (job_conf) overrides them.
+# Config keys are flat under the c86-alerts-cards: section, e.g. job_conf["trino_host"].
 
 SAMPLE_ROWS = 100
 READ_CHUNKSIZE = 200_000
 
 TRINO_PORT = 8443
-TRINO_CATALOG = "edl0_im"
-TRINO_SCHEMA = "prod_brt0_ess"
-TRINO_SOURCE = "c86_alerts_cards"
+TRINO_HOST = "strplvaexh0001-dev.fg.rbc.com"   # config: trino_host
+TRINO_CATALOG = "edl0_im"                        # config: trino_catalog
+TRINO_SCHEMA = "prod_brt0_ess"                   # config: trino_schema
+TRINO_SOURCE = "c86_alerts_cards"                # config: trino_source
 
-S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"
-S3_BUCKET = "ryu0-s3-sas-migration"
-S3_OUTPUT_PREFIX = "output/c86_alerts_cards"
+S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"           # config: S3_ENDPOINT
+S3_BUCKET = "ryu0-s3-sas-migration"                            # config: S3_BUCKET
+# config: s3_output_folder = s3a://ryu0-s3-sas-migration/output/c86_alerts_cards/dev
+S3_OUTPUT_PREFIX = "output/c86_alerts_cards/dev"
 
-LOCAL_OUT_DIR = "./c86/output/alert/cards"
-LOCAL_LOG_DIR = "./c86/log/alert/cards"
+LOCAL_OUT_DIR = "/sas/RSD/RBS_DEV/C86/output/alert/cards"      # config: local_output_path
+LOCAL_LOG_DIR = "/sas/RSD/RBS_DEV/C86/log/alert/cards"         # config: local_log_path
 
 
-# ── Config accessor ──────────────────────────────────────────────────────────
+# ── Config helpers ───────────────────────────────────────────────────────────
 
-def cfg_get(job_conf, key: str, default, logger: logging.Logger = None,
-            section: str = None):
+def cfg(job_conf, key: str, default, logger: logging.Logger = None):
+    """Read `key` from the flat YAML job_conf dict, falling back to `default`.
 
+    job_conf is the load_config() output — a flat dict keyed exactly as the YAML
+    (trino_host, trino_catalog, S3_BUCKET, ...). Missing/empty -> default, logged
+    at DEBUG (not WARNING) since falling back to a PROD constant is expected, not
+    alarming.
+    """
     val = None
-    try:
-        if section is not None:
-            # sectioned dict: job_conf[section][key]
-            sect = job_conf[section] if hasattr(job_conf, "__getitem__") else getattr(job_conf, section, None)
-            if sect is not None:
-                val = sect[key] if hasattr(sect, "__getitem__") and key in sect else getattr(sect, key, None)
-        if val is None and hasattr(job_conf, "__getitem__"):
-            # flat dict
-            try:
-                val = job_conf[key]
-            except (KeyError, TypeError):
-                val = None
-        if val is None:
-            # attribute-style object
-            val = getattr(job_conf, key, None)
-    except Exception:  # noqa: BLE001 — accessor must never break the job
-        val = None
-
+    if job_conf is not None:
+        try:
+            val = job_conf.get(key) if hasattr(job_conf, "get") else getattr(job_conf, key, None)
+        except Exception:  # noqa: BLE001 — config read must never break the job
+            val = None
     if val is None or val == "":
         if logger:
-            logger.warning("Config key '%s' not found in job_conf; using default: %s", key, default)
+            logger.debug("Config key '%s' absent; using default: %s", key, default)
         return default
     return val
+
+
+def parse_s3_uri(uri: str, default_bucket: str, default_prefix: str):
+
+    if not uri:
+        return default_bucket, default_prefix
+    stripped = uri
+    for scheme in ("s3a://", "s3n://", "s3://"):
+        if stripped.startswith(scheme):
+            stripped = stripped[len(scheme):]
+            break
+    parts = stripped.strip("/").split("/", 1)
+    bucket = parts[0] if parts and parts[0] else default_bucket
+    prefix = parts[1] if len(parts) > 1 and parts[1] else default_prefix
+    return bucket, prefix
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -125,7 +131,6 @@ def get_credentials(logger: logging.Logger) -> dict:
     vault.secrets.env and main.py loads it via load_dotenv() before this runs,
     so the values are already in os.environ here."""
     required = {
-        "trino_host": "TRINO_HOST",
         "trino_user": "TRINO_USERNAME",
         "trino_pass": "TRINO_PASSWORD",
     }
@@ -157,8 +162,8 @@ def get_credentials(logger: logging.Logger) -> dict:
         )
 
     logger.info(
-        "Credentials resolved: host=%s user=%s pass=%s s3_access=%s s3_secret=%s",
-        "SET" if resolved["trino_host"] else "MISSING",
+        "Credentials resolved: user=%s pass=%s s3_access=%s s3_secret=%s "
+        "(trino_host comes from config, injected later)",
         "SET" if resolved["trino_user"] else "MISSING",
         "SET" if resolved["trino_pass"] else "MISSING",
         "SET" if resolved["s3_access_key"] else "MISSING",
@@ -268,7 +273,8 @@ def q_xb80_cards(schema: str, week_start: date, week_end_p1: date, pardt: date) 
 # ── Trino ────────────────────────────────────────────────────────────────────
 
 def get_trino_connection(creds: dict, logger: logging.Logger,
-                         catalog: str = TRINO_CATALOG, db_schema: str = TRINO_SCHEMA):
+                         catalog: str = TRINO_CATALOG, db_schema: str = TRINO_SCHEMA,
+                         source: str = TRINO_SOURCE):
     auth = BasicAuthentication(creds["trino_user"], creds["trino_pass"]) if creds["trino_pass"] else None
     logger.info("Connecting to Trino: host=%s user=%s", creds["trino_host"], creds["trino_user"])
     return trino.dbapi.connect(
@@ -279,7 +285,7 @@ def get_trino_connection(creds: dict, logger: logging.Logger,
         auth=auth,
         catalog=catalog,
         schema=db_schema,
-        source=TRINO_SOURCE,
+        source=source,
     )
 
 
@@ -316,7 +322,21 @@ def upload_file_to_s3(creds: dict, local_path: str, s3_key: str, logger: logging
 # ── Tyr/Helios entry point ───────────────────────────────────────────────────
 
 def process_C86_alerts_cards(ss, job_conf):
+    """Tyr/Helios job entry point.
 
+    Args:
+        ss: SparkSession injected by the framework. Unused by this job (Trino
+            read + boto3 write), but kept to match the dispatcher signature.
+        job_conf: Job configuration passed through by the framework. Credentials
+            are read from the environment (vault init container + main.py
+            load_dotenv), not from job_conf.
+
+    Raises:
+        On any failure (credentials, Trino read, Excel write, S3 upload). Raising
+        rather than returning a code is deliberate: the framework's main.py does
+        not inspect the return value, so a returned 1 was being reported as
+        SUCCESS. An uncaught exception produces a real FAILURE / non-zero exit.
+    """
     log_file = Path(LOCAL_LOG_DIR) / f"C86_Alerts_Cards_{date.today():%Y%m%d}.log"
     logger = setup_logging(log_file)
 
@@ -336,26 +356,43 @@ def process_C86_alerts_cards(ss, job_conf):
         logger.exception("Credential resolution FAILED — aborting job.")
         raise
 
-    # Resolve config from job_conf (load_config output), falling back to the
-    # module constants if a key is absent. Adjust `section=` if load_config
-    # returns a sectioned dict (e.g. section="TRINO").
-    catalog = cfg_get(job_conf, "catalog", TRINO_CATALOG, logger)
-    db_schema = cfg_get(job_conf, "schema", TRINO_SCHEMA, logger)
-    s3_bucket = cfg_get(job_conf, "s3_bucket", S3_BUCKET, logger)
-    s3_endpoint = cfg_get(job_conf, "s3_endpoint", S3_ENDPOINT, logger)
-    s3_prefix = cfg_get(job_conf, "s3_output_prefix", S3_OUTPUT_PREFIX, logger)
-    out_root = cfg_get(job_conf, "out_root", LOCAL_OUT_DIR, logger)
+    # Resolve config from job_conf (flat YAML dict), falling back to PROD
+    # constants. Keys match the c86-alerts-cards: section of the config file.
+    trino_host = cfg(job_conf, "trino_host", TRINO_HOST, logger)
+    catalog = cfg(job_conf, "trino_catalog", TRINO_CATALOG, logger)
+    db_schema = cfg(job_conf, "trino_schema", TRINO_SCHEMA, logger)
+    trino_source = cfg(job_conf, "trino_source", TRINO_SOURCE, logger)
+    s3_endpoint = cfg(job_conf, "S3_ENDPOINT", S3_ENDPOINT, logger)
+    out_root = cfg(job_conf, "local_output_path", LOCAL_OUT_DIR, logger)
+
+    # S3 bucket+prefix: single source of truth is the s3_output_folder URI in
+    # config (e.g. s3a://ryu0-s3-sas-migration/output/c86_alerts_cards/dev).
+    # Parse it into bucket + prefix for boto3 (which rejects a scheme in the key).
+    s3_output_folder = cfg(job_conf, "s3_output_folder", "", logger)
+    s3_bucket, s3_prefix = parse_s3_uri(
+        s3_output_folder,
+        default_bucket=cfg(job_conf, "S3_BUCKET", S3_BUCKET, logger),
+        default_prefix=S3_OUTPUT_PREFIX,
+    )
+
+    # Trino host comes from config (it is a hostname, not a secret). Only
+    # username/password come from vault. Inject the host into creds here.
+    creds["trino_host"] = trino_host
 
     dt = compute_dates()
     label = dt["label"]
     schema = f"{catalog}.{db_schema}"
-    logger.info("Catalog=%s Schema=%s Bucket=%s", catalog, db_schema, s3_bucket)
+    logger.info("Trino host=%s catalog=%s schema=%s source=%s",
+                trino_host, catalog, db_schema, trino_source)
+    logger.info("S3 endpoint=%s bucket=%s prefix=%s", s3_endpoint, s3_bucket, s3_prefix)
+    logger.info("Local out=%s", out_root)
     logger.info("Week window: %s to %s | label=%s",
                 dt["week_start_dt"], dt["week_end_dt"], label)
 
     # 1. Run query 1, full read.
     try:
-        with get_trino_connection(creds, logger, catalog=catalog, db_schema=db_schema) as conn:
+        with get_trino_connection(creds, logger, catalog=catalog, db_schema=db_schema,
+                                  source=trino_source) as conn:
             sql = q_xb80_cards(schema, dt["week_start_dt"], dt["week_end_dt_p1"], dt["pardt"])
             df_cards = read_full_df(conn, sql, logger)
     except Exception:
