@@ -1,49 +1,29 @@
 #!/usr/bin/env python3
 """
-C86 Alerts Cards
+C86 Alerts Cards 
 """
 
 from __future__ import annotations
 
-import io
 import os
 import sys
-import json
 import logging
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
-try:
-    import pandas as pd
-except ImportError as e:  # pragma: no cover
-    print(f"[FATAL] pandas not available: {e}", file=sys.stderr)
-    sys.exit(2)
-
-try:
-    import trino
-    from trino.auth import BasicAuthentication
-except ImportError as e:  # pragma: no cover
-    print(f"[FATAL] trino client not available: {e}", file=sys.stderr)
-    sys.exit(2)
-
-try:
-    import boto3
-    from botocore.config import Config as BotoConfig
-    from botocore.exceptions import BotoCoreError, ClientError
-except ImportError as e:  # pragma: no cover
-    print(f"[FATAL] boto3 not available: {e}", file=sys.stderr)
-    sys.exit(2)
-
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
+import pandas as pd
+import trino
+from trino.auth import BasicAuthentication
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import BotoCoreError, ClientError
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-SAMPLE_ROWS = 100          # number of rows to keep after the full read
-READ_CHUNKSIZE = 200_000   # streaming chunk size for the full read
+SAMPLE_ROWS = 100
+READ_CHUNKSIZE = 200_000
 
 TRINO_PORT = 8443
 TRINO_CATALOG = "edl0_im"
@@ -54,50 +34,77 @@ S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"
 S3_BUCKET = "ryu0-s3-sas-migration"
 S3_OUTPUT_PREFIX = "output/c86_alerts_cards"
 
-VAULT_ENV_PATHS = (
-    "/rbc_vault2/secrets/vault.secrets.env",
-    "/rbc_vault/secrets/vault_secrets.env",
-    "rbc_vault2/secrets/vault.secrets.env",
-    "vault.secrets.env",
-)
-
 LOCAL_OUT_DIR = "./c86/output/alert/cards"
+LOCAL_LOG_DIR = "./c86/log/alert/cards"
+
+
+# ── Config accessor ──────────────────────────────────────────────────────────
+
+def cfg_get(job_conf, key: str, default, logger: logging.Logger = None,
+            section: str = None):
+    """Read a value from job_conf tolerantly, falling back to `default`.
+
+    Handles the three shapes load_config might return without us knowing which:
+      - flat dict:           job_conf["catalog"]
+      - sectioned dict:      job_conf["TRINO"]["catalog"]   (pass section="TRINO")
+      - attribute/object:    job_conf.catalog
+
+    Never raises on a missing key — logs and returns the default instead, so a
+    config-schema surprise degrades to the hardcoded constant rather than
+    crashing the job. Once the real schema is confirmed, drop this and read keys
+    directly.
+    """
+    val = None
+    try:
+        if section is not None:
+            # sectioned dict: job_conf[section][key]
+            sect = job_conf[section] if hasattr(job_conf, "__getitem__") else getattr(job_conf, section, None)
+            if sect is not None:
+                val = sect[key] if hasattr(sect, "__getitem__") and key in sect else getattr(sect, key, None)
+        if val is None and hasattr(job_conf, "__getitem__"):
+            # flat dict
+            try:
+                val = job_conf[key]
+            except (KeyError, TypeError):
+                val = None
+        if val is None:
+            # attribute-style object
+            val = getattr(job_conf, key, None)
+    except Exception:  # noqa: BLE001 — accessor must never break the job
+        val = None
+
+    if val is None or val == "":
+        if logger:
+            logger.warning("Config key '%s' not found in job_conf; using default: %s", key, default)
+        return default
+    return val
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-def setup_logging() -> logging.Logger:
+def setup_logging(log_path: Path) -> logging.Logger:
+    """Configure file + console logging."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("C86_CardsSample")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
+        fh = logging.FileHandler(log_path)
         ch = logging.StreamHandler(sys.stdout)
-        ch.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] - %(message)s",
-                              datefmt="%Y-%m-%d %H:%M:%S")
-        )
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] - %(message)s",
+                                datefmt="%Y-%m-%d %H:%M:%S")
+        fh.setFormatter(fmt)
+        ch.setFormatter(fmt)
+        logger.addHandler(fh)
         logger.addHandler(ch)
     return logger
 
 
-LOG = setup_logging()
-
-
-# ── Credentials (same pattern as smoke test) ─────────────────────────────────
-
-def load_vault_env(logger: logging.Logger) -> Optional[str]:
-    if load_dotenv is None:
-        logger.warning("python-dotenv not installed; relying on pre-set environment vars only")
-        return None
-    for path in VAULT_ENV_PATHS:
-        if os.path.exists(path):
-            load_dotenv(path, override=True)
-            logger.info("Vault env loaded from: %s", path)
-            return path
-    logger.warning("No vault env file found in known locations; relying on environment vars")
-    return None
-
+# ── Credentials (read from env; vault.secrets.env already loaded by main.py) ──
 
 def get_credentials(logger: logging.Logger) -> dict:
+    """Resolve credentials from the environment. The vault init container writes
+    vault.secrets.env and main.py loads it via load_dotenv() before this runs,
+    so the values are already in os.environ here."""
     required = {
         "trino_host": "TRINO_HOST",
         "trino_user": "TRINO_USERNAME",
@@ -126,7 +133,8 @@ def get_credentials(logger: logging.Logger) -> dict:
         raise RuntimeError(
             "Missing required credential env var(s): "
             + ", ".join(missing)
-            + ". Check vault.secrets.env or ocp_secret_mapping.yaml."
+            + ". Vault init container may not have written vault.secrets.env, "
+            "or ocp_secret_mapping.yaml is mismapped."
         )
 
     logger.info(
@@ -236,13 +244,12 @@ def q_xb80_cards(schema: str, week_start: date, week_end_p1: date, pardt: date) 
         BETWEEN TIMESTAMP '{week_start.isoformat()} 00:00:00'
           AND TIMESTAMP '{week_end_p1.isoformat()} 00:00:00'
     """
-    # If the full read ever gets too heavy, append:  ... LIMIT {SAMPLE_ROWS}
-    # to push the cap into Trino instead of trimming in pandas.
 
 
 # ── Trino ────────────────────────────────────────────────────────────────────
 
-def get_trino_connection(creds: dict, logger: logging.Logger):
+def get_trino_connection(creds: dict, logger: logging.Logger,
+                         catalog: str = TRINO_CATALOG, db_schema: str = TRINO_SCHEMA):
     auth = BasicAuthentication(creds["trino_user"], creds["trino_pass"]) if creds["trino_pass"] else None
     logger.info("Connecting to Trino: host=%s user=%s", creds["trino_host"], creds["trino_user"])
     return trino.dbapi.connect(
@@ -251,8 +258,8 @@ def get_trino_connection(creds: dict, logger: logging.Logger):
         user=creds["trino_user"],
         http_scheme="https",
         auth=auth,
-        catalog=TRINO_CATALOG,
-        schema=TRINO_SCHEMA,
+        catalog=catalog,
+        schema=db_schema,
         source=TRINO_SOURCE,
     )
 
@@ -268,92 +275,134 @@ def read_full_df(conn, sql: str, logger: logging.Logger, chunksize: int = READ_C
 
 # ── S3 ───────────────────────────────────────────────────────────────────────
 
-def get_s3_client(creds: dict):
+def get_s3_client(creds: dict, endpoint: str = S3_ENDPOINT):
     return boto3.client(
         "s3",
-        endpoint_url=S3_ENDPOINT,
+        endpoint_url=endpoint,
         aws_access_key_id=creds["s3_access_key"],
         aws_secret_access_key=creds["s3_secret_key"],
         config=BotoConfig(signature_version="s3v4", retries={"max_attempts": 3}),
     )
 
 
-def upload_file_to_s3(creds: dict, local_path: str, s3_key: str, logger: logging.Logger) -> str:
-    s3 = get_s3_client(creds)
-    s3.upload_file(local_path, S3_BUCKET, s3_key)
-    uri = f"s3://{S3_BUCKET}/{s3_key}"
+def upload_file_to_s3(creds: dict, local_path: str, s3_key: str, logger: logging.Logger,
+                      bucket: str = S3_BUCKET, endpoint: str = S3_ENDPOINT) -> str:
+    s3 = get_s3_client(creds, endpoint=endpoint)
+    s3.upload_file(local_path, bucket, s3_key)
+    uri = f"s3://{bucket}/{s3_key}"
     logger.info("Uploaded to %s", uri)
     return uri
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Tyr/Helios entry point ───────────────────────────────────────────────────
 
-def main() -> int:
-    LOG.info("=" * 70)
-    LOG.info("C86 Alerts Cards — Query 1 sample → Excel → S3")
-    LOG.info("Start: %s", datetime.now().isoformat())
-    LOG.info("=" * 70)
+def process_C86_alerts_cards(ss, job_conf):
+    """Tyr/Helios job entry point.
 
+    Args:
+        ss: SparkSession injected by the framework. Unused by this job (Trino
+            read + boto3 write), but kept to match the dispatcher signature.
+        job_conf: Job configuration passed through by the framework. Credentials
+            are read from the environment (vault init container + main.py
+            load_dotenv), not from job_conf.
+
+    Returns:
+        int: 0 on success, 1 on failure.
+    """
+    log_file = Path(LOCAL_LOG_DIR) / f"C86_Alerts_Cards_{date.today():%Y%m%d}.log"
+    logger = setup_logging(log_file)
+
+    logger.info("=" * 70)
+    logger.info("C86 Alerts Cards — Query 1 sample -> Excel -> S3")
+    logger.info("Start: %s", datetime.now().isoformat())
+    logger.info("Spark master: %s", getattr(getattr(ss, "sparkContext", None), "master", "n/a"))
+    logger.info("=" * 70)
+
+    # Resolve credentials from environment (vault.secrets.env already loaded).
     try:
-        load_vault_env(LOG)
-        creds = get_credentials(LOG)
+        creds = get_credentials(logger)
     except Exception as e:  # noqa: BLE001
-        LOG.error("Credential resolution FAILED: %s", e)
+        logger.error("Credential resolution FAILED: %s", e)
         return 1
+
+    # Resolve config from job_conf (load_config output), falling back to the
+    # module constants if a key is absent. Adjust `section=` if load_config
+    # returns a sectioned dict (e.g. section="TRINO").
+    catalog = cfg_get(job_conf, "catalog", TRINO_CATALOG, logger)
+    db_schema = cfg_get(job_conf, "schema", TRINO_SCHEMA, logger)
+    s3_bucket = cfg_get(job_conf, "s3_bucket", S3_BUCKET, logger)
+    s3_endpoint = cfg_get(job_conf, "s3_endpoint", S3_ENDPOINT, logger)
+    s3_prefix = cfg_get(job_conf, "s3_output_prefix", S3_OUTPUT_PREFIX, logger)
+    out_root = cfg_get(job_conf, "out_root", LOCAL_OUT_DIR, logger)
 
     dt = compute_dates()
     label = dt["label"]
-    schema = f"{TRINO_CATALOG}.{TRINO_SCHEMA}"
-    LOG.info("Week window: %s to %s | label=%s",
-             dt["week_start_dt"], dt["week_end_dt"], label)
+    schema = f"{catalog}.{db_schema}"
+    logger.info("Catalog=%s Schema=%s Bucket=%s", catalog, db_schema, s3_bucket)
+    logger.info("Week window: %s to %s | label=%s",
+                dt["week_start_dt"], dt["week_end_dt"], label)
 
     # 1. Run query 1, full read.
     try:
-        with get_trino_connection(creds, LOG) as conn:
+        with get_trino_connection(creds, logger, catalog=catalog, db_schema=db_schema) as conn:
             sql = q_xb80_cards(schema, dt["week_start_dt"], dt["week_end_dt_p1"], dt["pardt"])
-            df_cards = read_full_df(conn, sql, LOG)
+            df_cards = read_full_df(conn, sql, logger)
     except Exception as e:  # noqa: BLE001
-        LOG.error("Trino read FAILED: %s", e)
+        logger.error("Trino read FAILED: %s", e)
         return 1
 
     if df_cards.empty:
-        LOG.warning("Query returned 0 rows — nothing to sample. Writing an empty file anyway.")
+        logger.warning("Query returned 0 rows — nothing to sample. Writing an empty file anyway.")
 
     # 2. Trim to first N rows in pandas.
     df_sample = df_cards.head(SAMPLE_ROWS).copy()
-    LOG.info("Sampled first %d rows (got %d).", SAMPLE_ROWS, len(df_sample))
+    logger.info("Sampled first %d rows (got %d).", SAMPLE_ROWS, len(df_sample))
 
     # 3. Write the sample to a local .xlsx.
-    out_dir = os.path.join(LOCAL_OUT_DIR, label)
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = Path(out_root) / label
+    out_dir.mkdir(parents=True, exist_ok=True)
     filename = f"cards_query1_sample_{label}.xlsx"
-    local_path = os.path.join(out_dir, filename)
+    local_path = out_dir / filename
     try:
         df_sample.to_excel(local_path, sheet_name="cards_sample", index=False)
-        LOG.info("Wrote local Excel: %s (%d rows)", local_path, len(df_sample))
+        logger.info("Wrote local Excel: %s (%d rows)", local_path, len(df_sample))
     except Exception as e:  # noqa: BLE001
-        LOG.error("Excel write FAILED: %s", e)
+        logger.error("Excel write FAILED: %s", e)
         return 1
 
     # 4. Upload to S3.
     try:
-        s3_key = f"{S3_OUTPUT_PREFIX}/{label}/{filename}"
-        uri = upload_file_to_s3(creds, local_path, s3_key, LOG)
+        s3_key = f"{s3_prefix}/{label}/{filename}"
+        uri = upload_file_to_s3(creds, str(local_path), s3_key, logger,
+                                bucket=s3_bucket, endpoint=s3_endpoint)
     except (BotoCoreError, ClientError) as e:
-        LOG.error("S3 upload FAILED (boto): %s", e)
+        logger.error("S3 upload FAILED (boto): %s", e)
         return 1
     except Exception as e:  # noqa: BLE001
-        LOG.error("S3 upload FAILED: %s", e)
+        logger.error("S3 upload FAILED: %s", e)
         return 1
 
-    LOG.info("=" * 70)
-    LOG.info("DONE — sample written and uploaded.")
-    LOG.info("  rows written : %d", len(df_sample))
-    LOG.info("  local file   : %s", local_path)
-    LOG.info("  s3 uri       : %s", uri)
-    LOG.info("=" * 70)
+    logger.info("=" * 70)
+    logger.info("DONE — sample written and uploaded.")
+    logger.info("  rows written : %d", len(df_sample))
+    logger.info("  local file   : %s", local_path)
+    logger.info("  s3 uri       : %s", uri)
+    logger.info("=" * 70)
     return 0
 
 
+# ── Standalone run (for local testing outside Tyr) ───────────────────────────
+
 if __name__ == "__main__":
-    sys.exit(main())
+    # Local/dev only. Under Tyr, main.py imports and calls process_C86_alerts_cards.
+    try:
+        from dotenv import load_dotenv
+        for _p in ("/rbc_vault2/secrets/vault.secrets.env",
+                   "/rbc_vault/secrets/vault_secrets.env",
+                   "vault.secrets.env"):
+            if os.path.exists(_p):
+                load_dotenv(_p, override=True)
+                break
+    except ImportError:
+        pass
+    sys.exit(process_C86_alerts_cards(None, {}))
