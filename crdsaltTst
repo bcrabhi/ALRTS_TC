@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 C86 Alerts Cards 
+
 """
 
 from __future__ import annotations
@@ -18,6 +19,35 @@ from trino.auth import BasicAuthentication
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+
+# ── Vault credential loading (mirrors pa_client360, image 1) ─────────────────
+# Load vault.secrets.env at import time from the known mount paths, so this job
+# resolves its own credentials even if main.py's load_dotenv didn't find the
+# file. The _vault_loaded print shows which path was used (or None) in the log —
+# that single line tells you immediately whether the vault file was present.
+
+_VAULT_ENV_PATHS = (
+    "/rbc_vault2/secrets/vault.secrets.env",   # production OCP mount
+    "/rbc_vault/secrets/vault_secrets.env",    # production (vault-initc)
+    "rbc_vault2/secrets/vault.secrets.env",    # Brain Jupyter relative path
+    "vault.secrets.env",                       # project-root fallback
+)
+
+_vault_loaded = None
+if load_dotenv is not None:
+    for _p in _VAULT_ENV_PATHS:
+        if os.path.exists(_p):
+            load_dotenv(_p, override=True)
+            _vault_loaded = _p
+            break
+
+print(f"[C86_Alerts_Cards] vault env loaded from: {_vault_loaded} (cwd={os.getcwd()})")
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -42,18 +72,7 @@ LOCAL_LOG_DIR = "./c86/log/alert/cards"
 
 def cfg_get(job_conf, key: str, default, logger: logging.Logger = None,
             section: str = None):
-    """Read a value from job_conf tolerantly, falling back to `default`.
 
-    Handles the three shapes load_config might return without us knowing which:
-      - flat dict:           job_conf["catalog"]
-      - sectioned dict:      job_conf["TRINO"]["catalog"]   (pass section="TRINO")
-      - attribute/object:    job_conf.catalog
-
-    Never raises on a missing key — logs and returns the default instead, so a
-    config-schema surprise degrades to the hardcoded constant rather than
-    crashing the job. Once the real schema is confirmed, drop this and read keys
-    directly.
-    """
     val = None
     try:
         if section is not None:
@@ -297,33 +316,25 @@ def upload_file_to_s3(creds: dict, local_path: str, s3_key: str, logger: logging
 # ── Tyr/Helios entry point ───────────────────────────────────────────────────
 
 def process_C86_alerts_cards(ss, job_conf):
-    """Tyr/Helios job entry point.
 
-    Args:
-        ss: SparkSession injected by the framework. Unused by this job (Trino
-            read + boto3 write), but kept to match the dispatcher signature.
-        job_conf: Job configuration passed through by the framework. Credentials
-            are read from the environment (vault init container + main.py
-            load_dotenv), not from job_conf.
-
-    Returns:
-        int: 0 on success, 1 on failure.
-    """
     log_file = Path(LOCAL_LOG_DIR) / f"C86_Alerts_Cards_{date.today():%Y%m%d}.log"
     logger = setup_logging(log_file)
 
     logger.info("=" * 70)
     logger.info("C86 Alerts Cards — Query 1 sample -> Excel -> S3")
     logger.info("Start: %s", datetime.now().isoformat())
+    logger.info("Vault env loaded from: %s", _vault_loaded)
     logger.info("Spark master: %s", getattr(getattr(ss, "sparkContext", None), "master", "n/a"))
     logger.info("=" * 70)
 
-    # Resolve credentials from environment (vault.secrets.env already loaded).
+    # Resolve credentials from environment (vault.secrets.env loaded at import).
+    # get_credentials raises on a miss; we log and re-raise so the framework
+    # records a FAILURE rather than swallowing it into a return code.
     try:
         creds = get_credentials(logger)
-    except Exception as e:  # noqa: BLE001
-        logger.error("Credential resolution FAILED: %s", e)
-        return 1
+    except Exception:
+        logger.exception("Credential resolution FAILED — aborting job.")
+        raise
 
     # Resolve config from job_conf (load_config output), falling back to the
     # module constants if a key is absent. Adjust `section=` if load_config
@@ -347,9 +358,9 @@ def process_C86_alerts_cards(ss, job_conf):
         with get_trino_connection(creds, logger, catalog=catalog, db_schema=db_schema) as conn:
             sql = q_xb80_cards(schema, dt["week_start_dt"], dt["week_end_dt_p1"], dt["pardt"])
             df_cards = read_full_df(conn, sql, logger)
-    except Exception as e:  # noqa: BLE001
-        logger.error("Trino read FAILED: %s", e)
-        return 1
+    except Exception:
+        logger.exception("Trino read FAILED — aborting job.")
+        raise
 
     if df_cards.empty:
         logger.warning("Query returned 0 rows — nothing to sample. Writing an empty file anyway.")
@@ -366,21 +377,21 @@ def process_C86_alerts_cards(ss, job_conf):
     try:
         df_sample.to_excel(local_path, sheet_name="cards_sample", index=False)
         logger.info("Wrote local Excel: %s (%d rows)", local_path, len(df_sample))
-    except Exception as e:  # noqa: BLE001
-        logger.error("Excel write FAILED: %s", e)
-        return 1
+    except Exception:
+        logger.exception("Excel write FAILED — aborting job.")
+        raise
 
     # 4. Upload to S3.
     try:
         s3_key = f"{s3_prefix}/{label}/{filename}"
         uri = upload_file_to_s3(creds, str(local_path), s3_key, logger,
                                 bucket=s3_bucket, endpoint=s3_endpoint)
-    except (BotoCoreError, ClientError) as e:
-        logger.error("S3 upload FAILED (boto): %s", e)
-        return 1
-    except Exception as e:  # noqa: BLE001
-        logger.error("S3 upload FAILED: %s", e)
-        return 1
+    except (BotoCoreError, ClientError):
+        logger.exception("S3 upload FAILED (boto) — aborting job.")
+        raise
+    except Exception:
+        logger.exception("S3 upload FAILED — aborting job.")
+        raise
 
     logger.info("=" * 70)
     logger.info("DONE — sample written and uploaded.")
@@ -388,21 +399,14 @@ def process_C86_alerts_cards(ss, job_conf):
     logger.info("  local file   : %s", local_path)
     logger.info("  s3 uri       : %s", uri)
     logger.info("=" * 70)
-    return 0
+    # Success is "ran without raising" — no return code for the framework to
+    # misread. Any failure above raises and the task is marked FAILED.
 
 
 # ── Standalone run (for local testing outside Tyr) ───────────────────────────
 
 if __name__ == "__main__":
     # Local/dev only. Under Tyr, main.py imports and calls process_C86_alerts_cards.
-    try:
-        from dotenv import load_dotenv
-        for _p in ("/rbc_vault2/secrets/vault.secrets.env",
-                   "/rbc_vault/secrets/vault_secrets.env",
-                   "vault.secrets.env"):
-            if os.path.exists(_p):
-                load_dotenv(_p, override=True)
-                break
-    except ImportError:
-        pass
-    sys.exit(process_C86_alerts_cards(None, {}))
+    # Vault loading already happened at import time above. Raises on any failure
+    # (exit code != 0); completes silently with exit 0 on success.
+    process_C86_alerts_cards(None, {})
