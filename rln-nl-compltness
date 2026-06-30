@@ -1,0 +1,847 @@
+"""C86 RBIS GIC Renewal Notification — Completeness (pandas port of SAS).
+
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import datetime as dt
+import logging
+import os
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+ #
+# Logging — mirrors the SAS log cadence (one banner per logical step) so a SAS
+# reviewer can read the run and recognise it.
+ #
+logger = logging.getLogger("C86_notif_rbis_completeness")
+
+
+def _configure_logging(level: int = logging.INFO) -> None:
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-5s  %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(level)
+
+
+class step:
+    """Context manager that brackets a logical block, SAS-log style."""
+
+    def __init__(self, title: str) -> None:
+        self.title = title
+
+    def __enter__(self) -> "step":
+        logger.info(">>>>>>>>> %s <<<<<<<<<", self.title)
+        self._t0 = dt.datetime.now()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        elapsed = (dt.datetime.now() - self._t0).total_seconds()
+        if exc_type is None:
+            logger.info("--------- %s done (%.2fs) ---------", self.title, elapsed)
+        else:
+            logger.error("--------- %s FAILED: %s ---------", self.title, exc)
+
+
+ #
+# Date window logic
+ #
+# SAS reference:
+#   tday    = intnx('week.3', today(), 0)   -> snap back to this week's TUESDAY
+#   week_end = tday - 3                      -> the SATURDAY before that Tuesday
+#   snapdt   = tday - 1                      -> the MONDAY before (data SNAP_DT)
+#   week_start = week_end - 6                -> Sunday  (Sun–Sat reporting week)
+#   formpulldt = week_end - 21               -> 1-week+ lookback for RENW_NOTIF
+#   e05end = week_end + 6 ; e21str = +16 ; e21end = +22
+#   p05str = +10 ; p05end = +16 ; p21str = +26 ; p21end = +32 (= endrange)
+#
+# `week.3` defines a week beginning on its 3rd day = Tuesday. intnx with the
+# default BEGINNING alignment and 0 offset returns the start (Tuesday) of the
+# week containing `today`. Because the week is Tue-anchored, any run date from
+# Tuesday through the following Monday maps to the SAME window — which is why
+# the job is robust to not running exactly on Tuesday.
+
+SAS_EPOCH = dt.date(1960, 1, 1)  # SAS day 0
+
+
+def sas_week3_tuesday(today: dt.date) -> dt.date:
+    """Return the Tuesday of the SAS `week.3` week containing ``today``.
+
+    Equivalent to ``intnx('week.3', today, 0)`` with BEGINNING alignment.
+    Python weekday(): Mon=0 .. Sun=6, so Tuesday == 1.
+    """
+    offset = (today.weekday() - 1) % 7  # days since the most recent Tuesday
+    return today - dt.timedelta(days=offset)
+
+
+class DateWindow:
+    """All derived dates for one run, mirroring the SAS `data _null_` block."""
+
+    def __init__(self, run_date: dt.date) -> None:
+        self.run_date = run_date
+        tday = sas_week3_tuesday(run_date)
+
+        self.week_end = tday - dt.timedelta(days=3)        # Saturday
+        self.snap_dt = tday - dt.timedelta(days=1)         # Monday (SNAP_DT)
+        self.week_start = self.week_end - dt.timedelta(days=6)  # Sunday
+        self.formpull = self.week_end - dt.timedelta(days=21)
+
+        self.e05end = self.week_end + dt.timedelta(days=6)
+        self.e21str = self.week_end + dt.timedelta(days=16)
+        self.e21end = self.week_end + dt.timedelta(days=22)
+        self.p05str = self.week_end + dt.timedelta(days=10)
+        self.p05end = self.week_end + dt.timedelta(days=16)
+        self.p21str = self.week_end + dt.timedelta(days=26)
+        self.p21end = self.week_end + dt.timedelta(days=32)  # endrange
+
+        self.today2 = run_date  # SAS today2 = intnx('day', today, 0)
+
+    # -- helpers for the Teradata SQL literals (DATE 'yyyy-mm-dd') ---------- #
+    @staticmethod
+    def td(d: dt.date) -> str:
+        """Render a date as a Teradata DATE literal."""
+        return f"DATE '{d.isoformat()}'"
+
+    def log(self) -> None:
+        for name in (
+            "run_date", "week_start", "week_end", "snap_dt", "formpull",
+            "e05end", "e21str", "e21end", "p05str", "p05end",
+            "p21str", "p21end", "today2",
+        ):
+            logger.info("  %-12s = %s", name, getattr(self, name).isoformat())
+
+
+ #
+# Connectors — STUBS. Wire these to your vault / connector module in ONE place.
+# No business logic lives here, so swapping the implementation is safe.
+ #
+# ID columns that MUST stay strings to protect 15-digit precision (SAS stores
+# everything as 8-byte float; pandas would corrupt these as int64/float64).
+_STRING_ID_COLS = {
+    "AR_ID", "CLNT_NO", "CO_OWN_CLNT_NO", "plan_number", "PLN_NO",
+    "ACCT_NO", "SEG_NO", "ACCT_TR_NO", "CERT_NO", "FND_NO",
+}
+
+
+def read_teradata(sql: str) -> pd.DataFrame:
+    """Run a Teradata pass-through query and return a DataFrame.
+
+    STUB. Replace the body with your connector, e.g.::
+
+        import teradatasql
+        with teradatasql.connect(host=CFG["TERADATA_HOST"],
+                                 logmech=CFG["logmech"], ...) as con:
+            return pd.read_sql(sql, con, dtype="string")
+
+    Requirements the real implementation MUST honour:
+      * Return ID columns in ``_STRING_ID_COLS`` as pandas string dtype.
+      * Return DATE columns as datetime64[ns] (or strings parseable as such).
+      * Do NOT alter column names / case (downstream joins are name-sensitive).
+    """
+    raise NotImplementedError(
+        "read_teradata is a stub — wire it to your Teradata connector. "
+        "SQL was:\n" + sql[:500]
+    )
+
+
+def load_to_sql(df: pd.DataFrame, table: str, mode: str = "append") -> None:
+    """Load the AC output to the target SQL Server table.
+
+    STUB, and GATED OFF by default (see --load flag). Run only after parity
+    validation. Replace the body with your SQLAlchemy/pyodbc connector::
+
+        engine = create_engine(CFG["SQL_CONN_STR"])
+        df.to_sql(table, engine, if_exists=mode, index=False)
+    """
+    raise NotImplementedError(
+        f"load_to_sql is a stub — wire it before enabling --load "
+        f"(table={table!r}, mode={mode!r}, rows={len(df)})."
+    )
+
+
+def _coerce_id_strings(df: pd.DataFrame) -> pd.DataFrame:
+    """Defensive: force known ID columns to string dtype if a stub returns
+    them numeric. Real connector should already do this."""
+    for col in df.columns:
+        if col in _STRING_ID_COLS:
+            df[col] = df[col].astype("string").str.strip()
+    return df
+
+
+ #
+# Source SQL — preserved VERBATIM from the SAS pass-through blocks.
+# The mixed comma/ANSI joins in mif_14 / mif_13 are intentionally NOT rewritten
+# (fidelity over cleanliness). Row counts are logged after each build so any
+# fan-out is visible during validation rather than silent. The two cardinality
+# claims to route to the SAS authors:
+#   mif_14: "one row per AR_ID x CLNT_NO at snap date; left joins never
+#            multiply rows."
+#   mif_13: "the DISTINCT collapses FUND_HOLDING_TXN dupes; PLN_NO stays 1:1
+#            per AR_ID."
+# {snap}, {wk_end}, {endrange}, {formpull} are substituted with Teradata DATE
+# literals from DateWindow.
+ #
+
+SQL_MIF_14 = """
+select
+    AR_DLY.AR_ID,
+    CLNT_AR_RELTN_DLY.CLNT_NO,
+    AR_DLY.SNAP_DT,
+    AR_DLY.MTRTY_EXPRY_DT as mtrty_dt,
+    AR_DLY.SRVC_ID ,
+    AR_DLY.DT_CLS,
+    AR_DLY.DT_OPEN,
+    AR_DLY.OPEN_CLS_STS ,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_DAYS      as TRM_DAYS_14,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_YRS       as TRM_YRS_14,
+    'N' as RGSTR_NO_RGSTR_CD,
+    RB_CLNT_DLY.BSC,
+    INVSTMT_HLDNG_DLY.PLN_NO
+from
+    ddwv01.AR_DLY ,
+    ddwv01.INVSTMT_HLDNG_DLY,
+    ddwv01.CLNT_AR_RELTN_DLY
+    left join ddwv01.TRM_INVSTMT_HLDNG_DLY as TRM_INVSTMT_HLDNG_DLY
+            on CLNT_AR_RELTN_DLY.AR_ID = TRM_INVSTMT_HLDNG_DLY.AR_ID
+            and CLNT_AR_RELTN_DLY.SNAP_DT = TRM_INVSTMT_HLDNG_DLY.snap_dt
+            and TRM_INVSTMT_HLDNG_DLY.SRVC_ID = 14
+            and TRM_INVSTMT_HLDNG_DLY.snap_dt = {snap}
+        left join ddwv01.RB_CLNT_DLY as RB_CLNT_DLY
+            on CLNT_AR_RELTN_DLY.CLNT_NO = RB_CLNT_DLY.CLNT_NO
+            and CLNT_AR_RELTN_DLY.SNAP_DT = RB_CLNT_DLY.SNAP_DT
+where
+    AR_DLY.SNAP_DT = {snap}
+    and CLNT_AR_RELTN_DLY.SNAP_DT = {snap}
+    and INVSTMT_HLDNG_DLY.SNAP_DT = {snap}
+    and AR_DLY.MTRTY_EXPRY_DT between {wk_end} and {endrange}
+    and AR_DLY.OPEN_CLS_STS ne 'C'
+    and RB_CLNT_DLY.BSC between 600 and 699
+    and AR_DLY.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and AR_DLY.SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
+    and AR_DLY.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
+    and INVSTMT_HLDNG_DLY.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and INVSTMT_HLDNG_DLY.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
+order by
+1,2,3,4
+"""
+
+SQL_MIF_13 = """
+select distinct
+    RBI_INVST_GIC_DLY_S.AR_ID,
+    CLNT_AR_RELTN_DLY.CLNT_NO,
+    RBI_INVST_GIC_DLY_S.SNAP_DT,
+    RBI_INVST_GIC_DLY_S.SRVC_ID,
+    RBI_INVST_GIC_DLY_S.MTRTY_DT ,
+    RBI_INVST_GIC_DLY_S.STS_CD,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_YRS     as DEP_TERM_IN_YRS_13,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_DAYS    as DEP_TERM_IN_DAYS_13,
+    RGSTR_NO_RGSTR_CD,
+    RB_CLNT_DLY.BSC,
+    FUND_HOLDING_TXN.PLN_NO
+from
+    ddwv01.RBI_INVST_GIC_DLY_S ,
+    ddwv01.FUND_HOLDING_TXN ,
+    ddwv01.CLNT_AR_RELTN_DLY
+    left join ddwv01.INVSTMT_HLDNG_DLY_DELTA as INVSTMT_HLDNG_DLY_DELTA
+            on CLNT_AR_RELTN_DLY.AR_ID = INVSTMT_HLDNG_DLY_DELTA.AR_ID
+            and INVSTMT_HLDNG_DLY_DELTA.chg_dt = '9999-12-31'
+            and INVSTMT_HLDNG_DLY_DELTA.SRVC_ID = 13
+    left join ddwv01.RB_CLNT_DLY as RB_CLNT_DLY
+            on CLNT_AR_RELTN_DLY.CLNT_NO = RB_CLNT_DLY.CLNT_NO
+            and CLNT_AR_RELTN_DLY.SNAP_DT = RB_CLNT_DLY.SNAP_DT
+where
+    RBI_INVST_GIC_DLY_S.SNAP_DT = {snap}
+    and CLNT_AR_RELTN_DLY.SNAP_DT = {snap}
+    and RBI_INVST_GIC_DLY_S.MTRTY_DT between {wk_end} and {endrange}
+    and RBI_INVST_GIC_DLY_S.STS_CD ne 'T'
+    and RB_CLNT_DLY.BSC between 600 and 699
+    and RBI_INVST_GIC_DLY_S.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and RBI_INVST_GIC_DLY_S.SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
+    and RBI_INVST_GIC_DLY_S.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
+    and FUND_HOLDING_TXN.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and FUND_HOLDING_TXN.DW_SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
+order by
+1,2,3,5
+"""
+
+SQL_RBIS_NOTI_BASE = """
+select
+    RENW_NOTIF.CLNT_NO,
+    RENW_NOTIF.CLNT_AR_OWN_TYP,
+    RENW_NOTIF.ACCT_NO,
+    RENW_NOTIF.SEG_NO,
+    RENW_NOTIF.ACCT_TR_NO,
+    RENW_NOTIF.PROD_NM,
+    RENW_NOTIF.PROD_TRM_IN_YR,
+    RENW_NOTIF.PROD_TRM_IN_DYS,
+    RENW_NOTIF.MTRTY_DT,
+    RENW_NOTIF.CERT_NO,
+    RENW_NOTIF.FND_NO,
+    RENW_NOTIF.ACCT_TYP,
+    RENW_NOTIF.NOTIF_SENT_DT,
+    RENW_NOTIF.AR_ID,
+    RENW_NOTIF.SRVC_ID,
+    RENW_NOTIF.RENW_PROD_NOTIF_TYP,
+    RENW_NOTIF.SNAP_DT,
+    RENW_NOTIF.CLNT_SYS_SRC_ID,
+    RENW_NOTIF.CO_OWN_CLNT_NO,
+    RENW_NOTIF.RGSTR_NO_RGSTR_IND,
+    RENW_NOTIF.SEP_DISCLSR_IND,
+    RENW_NOTIF.NOTIF_NO_OF_DYS,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_DAYS    as TRM_DAYS_14,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_YRS     as TRM_YRS_14,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_YRS   as DEP_TERM_IN_YRS_13,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_DAYS  as DEP_TERM_IN_DAYS_13
+from
+    ddwv01.RENW_NOTIF as RENW_NOTIF
+    left join ddwv01.TRM_INVSTMT_HLDNG_DLY as TRM_INVSTMT_HLDNG_DLY
+            on RENW_NOTIF.AR_ID = TRM_INVSTMT_HLDNG_DLY.AR_ID
+            and TRM_INVSTMT_HLDNG_DLY.SRVC_ID = 14
+            and TRM_INVSTMT_HLDNG_DLY.snap_dt = {snap}
+    left join ddwv01.INVSTMT_HLDNG_DLY_DELTA as INVSTMT_HLDNG_DLY_DELTA
+            on RENW_NOTIF.AR_ID = INVSTMT_HLDNG_DLY_DELTA.AR_ID
+            and INVSTMT_HLDNG_DLY_DELTA.chg_dt = '9999-12-31'
+            and INVSTMT_HLDNG_DLY_DELTA.SRVC_ID = 13
+where
+    RENW_PROD_NOTIF_TYP = 2
+    and RENW_NOTIF.SNAP_DT >= {formpull}
+order by
+    RENW_NOTIF.AR_ID, RENW_NOTIF.CLNT_NO, RENW_NOTIF.MTRTY_DT
+"""
+
+SQL_ALL_PLANS1 = """
+select
+    ARNGMNT_OPTION.MIF_SRVC_ID,
+    ARNGMNT_OPTION.CHOICE_CD_VAL_ID,
+    ARNGMNT_OPTION.CHANGE_TMSTMP,
+    ARNGMNT_OPTION.DW_SRVC_ID   as pln_DW_SRVC_ID,
+    ARNGMNT_OPTION.PREF_ID ,
+    right(ARNGMNT_OPTION.AR_ID,9) as plan_number
+from
+    ddwv01.ARNGMNT_OPTION
+where
+    ARNGMNT_OPTION.PREF_ID in (13001,13004)
+    and ARNGMNT_OPTION.DW_SRVC_ID in (10,99)
+order by
+    6
+"""
+
+
+ #
+# Merge parity guard
+ #
+# SAS `MERGE ... BY key` with non-unique keys on BOTH sides does POSITIONAL
+# pairing (row1<->row1, row2<->row2, row3<->row2 [last retained]). pandas
+# left-merge does a CARTESIAN pairing, which inflates Volume. They agree iff
+# the key is unique on at least one side (here we require uniqueness per side
+# to match SAS BY-merge exactly, since the SAS keeps the base population with
+# `if inbase`). This guard turns "same as SAS" from an assumption into a
+# verified fact: if it fires, we know the join needs positional semantics.
+
+MERGE_KEYS = ["AR_ID", "CLNT_NO", "MTRTY_DT"]
+
+
+def assert_merge_parity(base: pd.DataFrame, form: pd.DataFrame,
+                        keys: list[str], label: str) -> None:
+    """Warn if either side has duplicate keys (SAS BY-merge != pandas merge)."""
+    for name, df in (("base", base), ("RENW_NOTIF", form)):
+        if df.empty:
+            continue
+        dup = df.duplicated(subset=keys, keep=False).sum()
+        if dup:
+            logger.warning(
+                "MERGE PARITY [%s]: %d duplicate-key rows on %s side. "
+                "pandas left-merge will fan out where SAS MERGE pairs "
+                "positionally — Volume may differ. Keys=%s",
+                label, dup, name, keys,
+            )
+
+
+def sas_presence_merge(base: pd.DataFrame, form: pd.DataFrame,
+                       keys: list[str], label: str) -> pd.DataFrame:
+    """Reproduce the SAS:
+
+        merge base (in=inbase) form (in=hasform); by keys;
+        pass = 'N'; if inbase and hasform then pass = 'Y'; if inbase;
+
+    Faithful-to-code reading: Pass requires presence on BOTH sides for the
+    key; NOTIF_SENT_DT does NOT gate Pass (diagnostic only). We keep the base
+    population (`if inbase`) and flag whether a matching RENW_NOTIF row exists.
+
+    We collapse the form side to one row per key (presence test) BEFORE merging
+    so a duplicated RENW_NOTIF key cannot fan out the base — which matches the
+    intent "exists in RENW_NOTIF -> Pass" and keeps Volume == base row count.
+    The parity guard above still reports duplicates so we can audit them.
+    """
+    assert_merge_parity(base, form, keys, label)
+
+    form_keys = form[keys].drop_duplicates().copy()
+    form_keys["__hasform"] = True
+
+    out = base.merge(form_keys, on=keys, how="left")
+    out["pass"] = np.where(out["__hasform"].fillna(False), "Y", "N")
+    out = out.drop(columns="__hasform")
+    n_pass = (out["pass"] == "Y").sum()
+    logger.info("  %-18s base=%d  pass=%d  fail=%d",
+                label, len(out), n_pass, len(out) - n_pass)
+    return out
+
+
+ #
+# Latest delivery preference (SAS plans99 / plans10)
+ #
+# SAS keeps, per PLN_NO, the row with max(CHANGE_TMSTMP), then NODUPKEY by
+# PLN_NO. = FIRST./LAST. on a sort. Window/groupby reproduces it.
+
+def latest_preference(plans_dump: pd.DataFrame) -> pd.DataFrame:
+    if plans_dump.empty:
+        return plans_dump.copy()
+    df = plans_dump.copy()
+    idx = df.groupby("PLN_NO")["CHANGE_TMSTMP"].idxmax()
+    out = df.loc[idx].copy()
+    # NODUPKEY by PLN_NO — idxmax already gives one row per PLN_NO, but guard
+    # against tie timestamps (SAS keeps the first encountered after sort).
+    out = out.sort_values("PLN_NO").drop_duplicates("PLN_NO", keep="first")
+    return out.reset_index(drop=True)
+
+
+ #
+# Term bucketing (methodology-cited)
+ #
+# total_term_day = yrs*365 + days.
+#   > 30          -> 'Renewals > 30 days '   (note trailing space — load-bearing)
+#   0..30         -> 'Renewals <= 30 days'
+#   missing (NaN) -> 'Renewals > 30 days '   per methodology: blank terms convert
+#                    to a default 1-year term on renewal, i.e. > 30 days.
+# Padded literals are preserved verbatim for output parity.
+GT30 = "Renewals > 30 days "
+LE30 = "Renewals <= 30 days"
+
+
+def _term_bucket(total_term_day: pd.Series) -> pd.Series:
+    return np.select(
+        [total_term_day > 30,
+         (total_term_day <= 30) & (total_term_day >= 0)],
+        [GT30, LE30],
+        default=GT30,  # NaN / negative -> >30 (methodology: default 1-yr term)
+    )
+
+
+def build_all_base(base: pd.DataFrame, srvc_id: int) -> pd.DataFrame:
+    """SAS all99 (srvc 13) / all10 (srvc 14): base + BSC filter + term bucket.
+
+    total_term_day:
+      srvc 13: DEP_TERM_IN_YRS_13 * 365 + DEP_TERM_IN_DAYS_13
+      srvc 14: TRM_YRS_14          * 365 + TRM_DAYS_14
+    """
+    df = base.copy()
+    df = df[(df["BSC"] >= 600) & (df["BSC"] <= 699)].copy()
+    if srvc_id == 13:
+        df["total_term_day"] = (
+            df["DEP_TERM_IN_YRS_13"] * 365 + df["DEP_TERM_IN_DAYS_13"]
+        )
+    else:
+        df["total_term_day"] = df["TRM_YRS_14"] * 365 + df["TRM_DAYS_14"]
+    df["thirty_day_ind"] = _term_bucket(df["total_term_day"])
+    return df
+
+
+def slice_window(df: pd.DataFrame, choice_cd: int,
+                 lo: dt.date, hi: dt.date, *,
+                 drop_le30_short: bool) -> pd.DataFrame:
+    """Apply the per-bucket maturity-window + delivery-channel filter.
+
+    drop_le30_short=True (5-day paths): SAS deletes the row when
+        thirty_day_ind == LE30 and total_term_day <= 4.
+    5-day paths keep BOTH buckets (>30 and <=30); 21-day paths keep only >30
+    (caller pre-filters via `gt30_only`).
+    CHOICE_CD_VAL_ID 14002 = electronic/OLB, 14004 = paper/mail.
+    """
+    out = df.copy()
+    if drop_le30_short:
+        mask_del = (out["thirty_day_ind"] == LE30) & (out["total_term_day"] <= 4)
+        out = out[~mask_del].copy()
+    lo_ts, hi_ts = pd.Timestamp(lo), pd.Timestamp(hi)
+    out = out[
+        (out["CHOICE_CD_VAL_ID"] == choice_cd)
+        & (out["MTRTY_DT"] >= lo_ts)
+        & (out["MTRTY_DT"] <= hi_ts)
+    ].copy()
+    return out
+
+
+ #
+# Pipeline
+ #
+def build_bases(win: DateWindow):
+    """Pull the four Teradata sources and assemble all99 / all10 + RENW_NOTIF.
+
+    Returns (all99, all10, rbis_noti_base).
+    """
+    fmt = dict(snap=DateWindow.td(win.snap_dt),
+               wk_end=DateWindow.td(win.week_end),
+               endrange=DateWindow.td(win.p21end),
+               formpull=DateWindow.td(win.formpull))
+
+    with step("Pull mif_14 (SRVC_ID 14 / non-registered EDW base)"):
+        mif_14 = _coerce_id_strings(read_teradata(SQL_MIF_14.format(**fmt)))
+        logger.info("  mif_14 rows=%d", len(mif_14))
+
+    with step("Pull mif_13 (SRVC_ID 13 / registered EDW base)"):
+        mif_13 = _coerce_id_strings(read_teradata(SQL_MIF_13.format(**fmt)))
+        logger.info("  mif_13 rows=%d", len(mif_13))
+
+    with step("Pull rbis_noti_base (RENW_NOTIF, type=2)"):
+        rbis_noti_base = _coerce_id_strings(
+            read_teradata(SQL_RBIS_NOTI_BASE.format(**fmt)))
+        logger.info("  rbis_noti_base rows=%d", len(rbis_noti_base))
+
+    with step("Pull all_plans1 (delivery preference lookup)"):
+        all_plans1 = _coerce_id_strings(read_teradata(SQL_ALL_PLANS1))
+        logger.info("  all_plans1 rows=%d", len(all_plans1))
+
+    with step("Build delivery-preference tables (plans99 / plans10)"):
+        # PLN_NO = plan_number + 0  (char -> numeric in SAS). We keep PLN_NO as
+        # a normalised STRING join key (strip leading zeros to match `+ 0`).
+        def _to_pln(s: pd.Series) -> pd.Series:
+            # int cast removes leading zeros exactly like SAS `+ 0`, then back
+            # to string for a safe, precision-preserving join key.
+            return pd.to_numeric(s, errors="coerce").astype("Int64").astype("string")
+
+        plans99_dump = all_plans1[
+            (all_plans1["pln_DW_SRVC_ID"] == 99) & (all_plans1["PREF_ID"] == 13001)
+        ].copy()
+        plans99_dump["PLN_NO"] = _to_pln(plans99_dump["plan_number"])
+        plans99 = latest_preference(plans99_dump)
+
+        plans10_dump = all_plans1[
+            (all_plans1["pln_DW_SRVC_ID"] == 10) & (all_plans1["PREF_ID"] == 13001)
+        ].copy()
+        plans10_dump["PLN_NO"] = _to_pln(plans10_dump["plan_number"])
+        plans10 = latest_preference(plans10_dump)
+
+        # Normalise base PLN_NO the same way before merging.
+        mif_13["PLN_NO"] = _to_pln(mif_13["PLN_NO"])
+        mif_14["PLN_NO"] = _to_pln(mif_14["PLN_NO"])
+
+    with step("Merge base x preference (all99 / all10)"):
+        # SAS: merge mif_13 (in=inbase) plans99; by PLN_NO; if inbase;
+        all99 = mif_13.merge(
+            plans99.drop_duplicates("PLN_NO"), on="PLN_NO", how="left")
+        all10 = mif_14.merge(
+            plans10.drop_duplicates("PLN_NO"), on="PLN_NO", how="left")
+        logger.info("  all99 rows=%d  all10 rows=%d", len(all99), len(all10))
+
+    return all99, all10, rbis_noti_base
+
+
+def split_noti_base(rbis_noti_base: pd.DataFrame):
+    """SAS rbis_noti_base{13,14}_{5,21}: split by SRVC_ID and NOTIF_NO_OF_DYS."""
+    nb = rbis_noti_base
+    return {
+        (13, 5):  nb[(nb["SRVC_ID"] == 13) & (nb["NOTIF_NO_OF_DYS"] == 5)].copy(),
+        (14, 5):  nb[(nb["SRVC_ID"] == 14) & (nb["NOTIF_NO_OF_DYS"] == 5)].copy(),
+        (13, 21): nb[(nb["SRVC_ID"] == 13) & (nb["NOTIF_NO_OF_DYS"] == 21)].copy(),
+        (14, 21): nb[(nb["SRVC_ID"] == 14) & (nb["NOTIF_NO_OF_DYS"] == 21)].copy(),
+    }
+
+
+def add_sent_dt_diagnostic(merged: pd.DataFrame, form: pd.DataFrame,
+                           win: DateWindow, notif_days: int) -> pd.DataFrame:
+    """DIAGNOSTIC ONLY (does not gate Pass/Fail).
+
+    For passed rows, bring the earliest NOTIF_SENT_DT for the key and flag
+    whether it lands in the methodology's expected window
+    (MTRTY_DT - notif_days .. MTRTY_DT). Lets reviewers quantify how many
+    Passes would flip if the doc's sent-date gate were enforced (reading #2).
+    """
+    if form.empty:
+        merged["NOTIF_SENT_DT"] = pd.NaT
+        merged["sent_dt_in_window"] = pd.NA
+        return merged
+    sent = (form[MERGE_KEYS + ["NOTIF_SENT_DT"]]
+            .dropna(subset=["NOTIF_SENT_DT"])
+            .sort_values("NOTIF_SENT_DT")
+            .drop_duplicates(MERGE_KEYS, keep="first"))
+    merged = merged.merge(sent, on=MERGE_KEYS, how="left")
+    win_lo = merged["MTRTY_DT"] - pd.to_timedelta(notif_days, unit="D")
+    in_win = (merged["NOTIF_SENT_DT"] >= win_lo) & \
+             (merged["NOTIF_SENT_DT"] <= merged["MTRTY_DT"])
+    merged["sent_dt_in_window"] = np.where(
+        merged["pass"] == "Y", in_win.fillna(False), pd.NA)
+    return merged
+
+
+def run_completeness(all99: pd.DataFrame, all10: pd.DataFrame,
+                     noti: dict, win: DateWindow) -> pd.DataFrame:
+    """Build all 8 base/channel/SLA combos, merge to RENW_NOTIF, label
+    Pass/Fail, and return the unioned completeness_total_gic_renewals frame
+    with form_day (05/21) and the registered/non-reg split preserved."""
+    a99 = build_all_base(all99, srvc_id=13)
+    a10 = build_all_base(all10, srvc_id=14)
+
+    # (label, base, choice_cd, lo, hi, gt30_only, drop_le30_short, srvc, days)
+    specs = [
+        # ---- 5-day (keeps both buckets; drops <=30 with term<=4) ----------
+        ("all99_5e", a99, 14002, win.week_end, win.e05end, False, True, 13, 5),
+        ("all99_5p", a99, 14004, win.p05str,  win.p05end, False, True, 13, 5),
+        ("all10_5e", a10, 14002, win.week_end, win.e05end, False, True, 14, 5),
+        ("all10_5p", a10, 14004, win.p05str,  win.p05end, False, True, 14, 5),
+        # ---- 21-day (only >30-day terms) ----------------------------------
+        ("all99_21e", a99, 14002, win.e21str, win.e21end, True, False, 13, 21),
+        ("all99_21p", a99, 14004, win.p21str, win.p21end, True, False, 13, 21),
+        ("all10_21e", a10, 14002, win.e21str, win.e21end, True, False, 14, 21),
+        ("all10_21p", a10, 14004, win.p21str, win.p21end, True, False, 14, 21),
+    ]
+
+    parts = []
+    for label, base, cc, lo, hi, gt30_only, drop_short, srvc, days in specs:
+        b = base
+        if gt30_only:
+            b = b[b["thirty_day_ind"] == GT30].copy()
+        sl = slice_window(b, cc, lo, hi, drop_le30_short=drop_short)
+        form = noti[(srvc, days)]
+        merged = sas_presence_merge(sl, form, MERGE_KEYS, label)
+        merged = add_sent_dt_diagnostic(merged, form, win, days)
+        merged["form_day"] = f"{days:02d}"
+        parts.append(merged)
+
+    total = pd.concat(parts, ignore_index=True)
+
+    # Delivery preference + control labels + Pass/Fail comment (verbatim pads).
+    total["deliverypreference"] = np.select(
+        [total["CHOICE_CD_VAL_ID"] == 14002, total["CHOICE_CD_VAL_ID"] == 14004],
+        ["OLB Notification", "Mail"], default="Other")
+    total["RegulatoryName"] = "C86"
+    total["LOB"] = "PSI"
+    total["ReportName"] = "C86 Notification Renewals"
+    total["ProductType"] = "GIC"
+    is_pass = total["pass"] == "Y"
+    total["CommentCode"] = np.where(is_pass, "COM16", "COM19")
+    total["Comments"] = np.where(
+        is_pass, "Pass                    ", "Potential Fail              ")
+    return total
+
+
+ #
+# AC aggregation (SAS ac_comp_rbis_noti_{reg,nonreg}_{05,21})
+ #
+# Each block groups its slice to a volume count with a fixed segment layout.
+# RDE codes per methodology:
+#   NOTIF033 Reg 21-day, NOTIF034 Reg 5-day,
+#   NOTIF035 Non-reg 21-day, NOTIF036 Non-reg 5-day.
+# SAS groups by cols 1..22,26,27 — i.e. every constant/segment column plus
+# CommentCode/Comments plus DateCompleted/SnapDate. In practice the grain that
+# varies is: thirty_day_ind (Seg4), deliverypreference (Seg5), segment10
+# (yymmn6 of SNAP_DT), CommentCode/Comments. We group on those.
+
+_AC_SPECS = [
+    # (segment_subset_predicate, RDE, Segment2, Segment3)
+]
+
+
+def _ac_block(df: pd.DataFrame, rde: str, segment2: str, segment3: str,
+              win: DateWindow) -> pd.DataFrame:
+    """Aggregate one reg/non-reg x 5/21 slice into the AC volume layout."""
+    if df.empty:
+        return pd.DataFrame()
+    g = df.copy()
+    # segment10 = put(SNAP_DT, yymmn6.) -> 'YYYYMM'
+    g["segment10"] = pd.to_datetime(g["SNAP_DT"]).dt.strftime("%Y%m")
+    group_cols = ["thirty_day_ind", "deliverypreference", "segment10",
+                  "CommentCode", "Comments"]
+    agg = (g.groupby(group_cols, dropna=False)
+             .size().reset_index(name="Volume"))
+
+    agg["RegulatoryName"] = "C86"
+    agg["LOB"] = "PSI"
+    agg["ReportName"] = "C86 Notification Renewals"
+    agg["ControlRisk"] = "Completeness"
+    agg["TestType"] = "Reconciliation"
+    agg["TestPeriod"] = "Portfolio"
+    agg["ProductType"] = "GIC"
+    agg["RDE"] = rde
+    agg["SubDE"] = ""
+    agg["Segment"] = "Renewals"
+    agg["Segment2"] = segment2
+    agg["Segment3"] = segment3
+    agg["Segment4"] = agg["thirty_day_ind"]
+    agg["Segment5"] = agg["deliverypreference"]
+    for s in ("Segment6", "Segment7", "Segment8", "Segment9"):
+        agg[s] = ""
+    agg["HoldoutFlag"] = "N"
+    agg["Bal"] = np.nan
+    agg["Amount"] = np.nan
+    agg["DateCompleted"] = pd.Timestamp(win.today2)
+    agg["SnapDate"] = pd.Timestamp(win.week_end)
+    return agg
+
+
+def build_ac(total: pd.DataFrame, win: DateWindow) -> pd.DataFrame:
+    """Produce renew_gic_comp_ac (the four control blocks, unioned)."""
+    reg = total[total["RGSTR_NO_RGSTR_CD"] != "N"].copy()
+    nreg = total[total["RGSTR_NO_RGSTR_CD"] == "N"].copy()
+
+    reg_05 = reg[reg["form_day"] == "05"]
+    reg_21 = reg[reg["form_day"] == "21"]
+    nreg_05 = nreg[nreg["form_day"] == "05"]
+    nreg_21 = nreg[nreg["form_day"] == "21"]
+
+    blocks = [
+        _ac_block(nreg_05, "Notif036_Completeness_SLA", "5 days",  "Non-Registered GIC", win),
+        _ac_block(nreg_21, "Notif035_Completeness_SLA", "21 days", "Non-Registered GIC", win),
+        _ac_block(reg_05,  "Notif034_Completeness_SLA", "5 days",  "Registered GIC",     win),
+        _ac_block(reg_21,  "Notif033_Completeness_SLA", "21 days", "Registered GIC",     win),
+    ]
+    blocks = [b for b in blocks if not b.empty]
+    if not blocks:
+        cols = ["RegulatoryName", "LOB", "ReportName", "ProductType",
+                "Segment", "Segment2", "Segment3", "Volume", "SnapDate"]
+        return pd.DataFrame(columns=cols)
+
+    ac = pd.concat(blocks, ignore_index=True)
+    ordered = [
+        "RegulatoryName", "LOB", "ReportName", "ControlRisk", "TestType",
+        "TestPeriod", "ProductType", "RDE", "SubDE", "Segment", "Segment2",
+        "Segment3", "Segment4", "Segment5", "Segment6", "Segment7",
+        "Segment8", "Segment9", "segment10", "HoldoutFlag", "CommentCode",
+        "Comments", "Volume", "Bal", "Amount", "DateCompleted", "SnapDate",
+    ]
+    return ac[ordered]
+
+
+ #
+# Fail detail (SAS notidata.rbis_noti_comp_fail_&ymd)
+ #
+def build_fail_detail(total: pd.DataFrame, win: DateWindow) -> pd.DataFrame:
+    """One row per Potential Fail, with the masked-client detail layout."""
+    df = total[total["Comments"] == "Potential Fail              "].copy()
+    if df.empty:
+        return df
+
+    df["Notification_Delivery_Type"] = df["deliverypreference"]
+    df["Campaign_id"] = "N/A"
+    df["Credit_card_account"] = "N/A"
+    df["promo_rule"] = "N/A"
+    df["Type_of_Notification"] = df["thirty_day_ind"]
+    df["Renewal_Date"] = pd.to_datetime(df["MTRTY_DT"])
+    # clientid_mask = substr(CLNT_NO, len-2, 3) -> last 3 chars
+    df["clientid_mask"] = df["CLNT_NO"].astype("string").str[-3:]
+    df["date_completed"] = pd.Timestamp(win.today2)
+    df["product"] = np.where(
+        df["RGSTR_NO_RGSTR_CD"] == "N", "Non-Registered GIC",
+        np.where(df["RGSTR_NO_RGSTR_CD"] == "R", "Registered GIC   ", ""))
+    df["DEP_TERM_IN_YRS"] = np.where(
+        df["SRVC_ID"] == 13, df.get("DEP_TERM_IN_YRS_13"), df.get("TRM_YRS_14"))
+    df["DEP_TERM_IN_DAYS"] = np.where(
+        df["SRVC_ID"] == 13, df.get("DEP_TERM_IN_DAYS_13"), df.get("TRM_DAYS_14"))
+
+    keep = ["AR_ID", "SRVC_ID", "BSC", "total_term_day", "thirty_day_ind",
+            "deliverypreference", "RegulatoryName", "LOB", "ReportName",
+            "ProductType", "CommentCode", "Comments", "form_day",
+            "date_completed", "Renewal_Date", "Notification_Delivery_Type",
+            "Campaign_id", "Credit_card_account", "promo_rule",
+            "Type_of_Notification", "clientid_mask", "product",
+            "DEP_TERM_IN_YRS", "DEP_TERM_IN_DAYS", "sent_dt_in_window"]
+    keep = [c for c in keep if c in df.columns]
+    return df[keep].copy()
+
+
+ #
+# Outputs
+ #
+def write_outputs(ac: pd.DataFrame, fail: pd.DataFrame, total: pd.DataFrame,
+                  outdir: str, ymd: str) -> dict:
+    os.makedirs(outdir, exist_ok=True)
+    paths = {}
+
+    ac_parquet = os.path.join(outdir, "renew_gic_comp_ac.parquet")
+    ac.to_parquet(ac_parquet, index=False)
+    paths["ac_parquet"] = ac_parquet
+
+    ac_xlsx = os.path.join(outdir, "renew_gic_comp_autocomplete.xlsx")
+    with pd.ExcelWriter(ac_xlsx, engine="openpyxl") as xw:
+        ac.to_excel(xw, sheet_name="renew_gic_comp_ac", index=False)
+    paths["ac_xlsx"] = ac_xlsx
+
+    fail_parquet = os.path.join(outdir, f"rbis_noti_comp_fail_{ymd}.parquet")
+    fail.to_parquet(fail_parquet, index=False)
+    paths["fail_parquet"] = fail_parquet
+
+    fail_xlsx = os.path.join(outdir, "Notif_RBIS_Renew_Completeness_Detail.xlsx")
+    with pd.ExcelWriter(fail_xlsx, engine="openpyxl") as xw:
+        fail.to_excel(xw, sheet_name="Notif_RBIS_Renew_Comp", index=False)
+    paths["fail_xlsx"] = fail_xlsx
+
+    return paths
+
+
+ #
+# Entry point
+ #
+def main(run_date: Optional[dt.date] = None, outdir: str = "./output",
+         do_load: bool = False) -> dict:
+    _configure_logging()
+    run_date = run_date or dt.date.today()
+    ymd = run_date.strftime("%Y%m%d")
+
+    logger.info(">>>>>>>>> C86 RBIS Renewal Completeness (pandas) <<<<<<<<<")
+    win = DateWindow(run_date)
+    with step("Derive date window"):
+        win.log()
+
+    all99, all10, rbis_noti_base = build_bases(win)
+
+    with step("Split RENW_NOTIF by SRVC_ID x NOTIF_NO_OF_DYS"):
+        noti = split_noti_base(rbis_noti_base)
+        for k, v in noti.items():
+            logger.info("  rbis_noti_base%s_%s rows=%d", k[0], k[1], len(v))
+
+    with step("Run completeness comparisons (8 base/channel/SLA combos)"):
+        total = run_completeness(all99, all10, noti, win)
+        logger.info("  completeness_total_gic_renewals rows=%d", len(total))
+
+    with step("Aggregate AC volume table"):
+        ac = build_ac(total, win)
+        logger.info("  renew_gic_comp_ac rows=%d  total volume=%s",
+                    len(ac), int(ac["Volume"].sum()) if len(ac) else 0)
+
+    with step("Build fail detail"):
+        fail = build_fail_detail(total, win)
+        logger.info("  potential fails=%d", len(fail))
+
+    with step("Write outputs (parquet + xlsx)"):
+        paths = write_outputs(ac, fail, total, outdir, ymd)
+        for k, p in paths.items():
+            logger.info("  %-14s -> %s", k, p)
+
+    if do_load:
+        with step("SQL load (gated)"):
+            load_to_sql(ac, table="renew_gic_comp_ac", mode="append")
+    else:
+        logger.info("SQL load skipped (use --load after parity validation).")
+
+    logger.info(">>>>>>>>> Done <<<<<<<<<")
+    return paths
+
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(description="C86 RBIS GIC Renewal Completeness")
+    p.add_argument("--run-date", type=lambda s: dt.date.fromisoformat(s),
+                   default=None, help="YYYY-MM-DD; defaults to today")
+    p.add_argument("--outdir", default="./output")
+    p.add_argument("--load", action="store_true",
+                   help="Enable SQL load (off by default; validate first)")
+    return p.parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    main(run_date=args.run_date, outdir=args.outdir, do_load=args.load)
