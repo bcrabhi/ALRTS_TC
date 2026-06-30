@@ -1,0 +1,747 @@
+"""
+C86_notif_rbis_renewal_completeness.py
+
+"""
+
+from __future__ import annotations
+
+import configparser
+import datetime as dt
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+
+logger = logging.getLogger("C86_notif_rbis_completeness")
+
+
+
+# SQL pass-through queries
+
+MIF_14 = """
+select
+    AR_DLY.AR_ID,
+    CLNT_AR_RELTN_DLY.CLNT_NO,
+    AR_DLY.SNAP_DT,
+    AR_DLY.MTRTY_EXPRY_DT as mtrty_dt,
+    AR_DLY.SRVC_ID ,
+    AR_DLY.DT_CLS,
+    AR_DLY.DT_OPEN,
+    AR_DLY.OPEN_CLS_STS ,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_DAYS      as TRM_DAYS_14,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_YRS       as TRM_YRS_14,
+    'N' as RGSTR_NO_RGSTR_CD,
+    RB_CLNT_DLY.BSC,
+    INVSTMT_HLDNG_DLY.PLN_NO
+
+from
+    ddwv01.AR_DLY ,
+    ddwv01.INVSTMT_HLDNG_DLY,
+    ddwv01.CLNT_AR_RELTN_DLY
+    left join ddwv01.TRM_INVSTMT_HLDNG_DLY as TRM_INVSTMT_HLDNG_DLY
+            on CLNT_AR_RELTN_DLY.AR_ID = TRM_INVSTMT_HLDNG_DLY.AR_ID
+            and CLNT_AR_RELTN_DLY.SNAP_DT = TRM_INVSTMT_HLDNG_DLY.snap_dt
+            and TRM_INVSTMT_HLDNG_DLY.SRVC_ID = 14
+            and TRM_INVSTMT_HLDNG_DLY.snap_dt = '{snap_dt}'
+
+        left join ddwv01.RB_CLNT_DLY as RB_CLNT_DLY
+            on CLNT_AR_RELTN_DLY.CLNT_NO = RB_CLNT_DLY.CLNT_NO
+            and CLNT_AR_RELTN_DLY.SNAP_DT = RB_CLNT_DLY.SNAP_DT
+where
+    AR_DLY.SNAP_DT = '{snap_dt}'
+    and CLNT_AR_RELTN_DLY.SNAP_DT = '{snap_dt}'
+    and INVSTMT_HLDNG_DLY.SNAP_DT = '{snap_dt}'
+    and AR_DLY.MTRTY_EXPRY_DT between date '{wk_end}' and date '{endrange}'
+    and AR_DLY.OPEN_CLS_STS ne 'C'
+    and RB_CLNT_DLY.BSC between 600 and 699
+    and AR_DLY.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and AR_DLY.SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
+    and AR_DLY.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
+    and INVSTMT_HLDNG_DLY.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and INVSTMT_HLDNG_DLY.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
+order by
+1,2,3,4
+"""
+
+# mif_13 — SRVC_ID 13 maturing GICs.
+MIF_13 = """
+select distinct
+
+    RBI_INVST_GIC_DLY_S.AR_ID,
+    CLNT_AR_RELTN_DLY.CLNT_NO,
+    RBI_INVST_GIC_DLY_S.SNAP_DT,
+    RBI_INVST_GIC_DLY_S.SRVC_ID,
+    RBI_INVST_GIC_DLY_S.MTRTY_DT ,
+    RBI_INVST_GIC_DLY_S.STS_CD,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_YRS     as DEP_TERM_IN_YRS_13,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_DAYS    as DEP_TERM_IN_DAYS_13,
+    RGSTR_NO_RGSTR_CD,
+    RB_CLNT_DLY.BSC,
+    FUND_HOLDING_TXN.PLN_NO
+from
+    ddwv01.RBI_INVST_GIC_DLY_S ,
+    ddwv01.FUND_HOLDING_TXN ,
+    ddwv01.CLNT_AR_RELTN_DLY
+
+    left join ddwv01.INVSTMT_HLDNG_DLY_DELTA as INVSTMT_HLDNG_DLY_DELTA
+            on CLNT_AR_RELTN_DLY.AR_ID = INVSTMT_HLDNG_DLY_DELTA.AR_ID
+            and INVSTMT_HLDNG_DLY_DELTA.chg_dt = '9999-12-31'
+            and INVSTMT_HLDNG_DLY_DELTA.SRVC_ID = 13
+    left join ddwv01.RB_CLNT_DLY as RB_CLNT_DLY
+            on CLNT_AR_RELTN_DLY.CLNT_NO = RB_CLNT_DLY.CLNT_NO
+            and CLNT_AR_RELTN_DLY.SNAP_DT = RB_CLNT_DLY.SNAP_DT
+where
+    RBI_INVST_GIC_DLY_S.SNAP_DT = '{snap_dt}'
+    and CLNT_AR_RELTN_DLY.SNAP_DT = '{snap_dt}'
+    and RBI_INVST_GIC_DLY_S.MTRTY_DT between date '{wk_end}' and date '{endrange}'
+    and RBI_INVST_GIC_DLY_S.STS_CD ne 'T'
+    and RB_CLNT_DLY.BSC between 600 and 699
+    and RBI_INVST_GIC_DLY_S.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and RBI_INVST_GIC_DLY_S.SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
+    and RBI_INVST_GIC_DLY_S.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
+    and FUND_HOLDING_TXN.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and FUND_HOLDING_TXN.DW_SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
+order by
+1,2,3,5
+"""
+
+# rbis_noti_base — RENW_NOTIF form records.  &formpull. is a 'YYYY-MM-DD' literal,
+# compared bare in SAS (>= &formpull.) -> >= '2025-11-22'.
+RBIS_NOTI_BASE = """
+select
+    RENW_NOTIF.CLNT_NO,
+    RENW_NOTIF.CLNT_AR_OWN_TYP,
+    RENW_NOTIF.ACCT_NO,
+    RENW_NOTIF.SEG_NO,
+    RENW_NOTIF.ACCT_TR_NO,
+    RENW_NOTIF.PROD_NM,
+    RENW_NOTIF.PROD_TRM_IN_YR,
+    RENW_NOTIF.PROD_TRM_IN_DYS,
+    RENW_NOTIF.MTRTY_DT,
+    RENW_NOTIF.CERT_NO,
+    RENW_NOTIF.FND_NO,
+    RENW_NOTIF.ACCT_TYP,
+    RENW_NOTIF.NOTIF_SENT_DT,
+    RENW_NOTIF.AR_ID,
+    RENW_NOTIF.SRVC_ID,
+    RENW_NOTIF.RENW_PROD_NOTIF_TYP,
+    RENW_NOTIF.SNAP_DT,
+    RENW_NOTIF.CLNT_SYS_SRC_ID,
+    RENW_NOTIF.CO_OWN_CLNT_NO,
+    RENW_NOTIF.RGSTR_NO_RGSTR_IND,
+    RENW_NOTIF.SEP_DISCLSR_IND,
+    RENW_NOTIF.NOTIF_NO_OF_DYS,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_DAYS    as TRM_DAYS_14,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_YRS     as TRM_YRS_14,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_YRS   as DEP_TERM_IN_YRS_13,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_DAYS  as DEP_TERM_IN_DAYS_13
+from
+    ddwv01.RENW_NOTIF as RENW_NOTIF
+
+    left join ddwv01.TRM_INVSTMT_HLDNG_DLY as TRM_INVSTMT_HLDNG_DLY
+            on RENW_NOTIF.AR_ID = TRM_INVSTMT_HLDNG_DLY.AR_ID
+            and TRM_INVSTMT_HLDNG_DLY.SRVC_ID = 14
+            and TRM_INVSTMT_HLDNG_DLY.snap_dt = '{snap_dt}'
+
+    left join ddwv01.INVSTMT_HLDNG_DLY_DELTA as INVSTMT_HLDNG_DLY_DELTA
+            on RENW_NOTIF.AR_ID = INVSTMT_HLDNG_DLY_DELTA.AR_ID
+            and INVSTMT_HLDNG_DLY_DELTA.chg_dt = '9999-12-31'
+            and INVSTMT_HLDNG_DLY_DELTA.SRVC_ID = 13
+where
+    RENW_PROD_NOTIF_TYP = 2
+    and RENW_NOTIF.SNAP_DT >= '{formpull}'
+order by
+    RENW_NOTIF.AR_ID, RENW_NOTIF.CLNT_NO, RENW_NOTIF.MTRTY_DT
+"""
+
+# all_plans1 — delivery-preference choice codes.  No date params.
+ALL_PLANS1 = """
+select
+    ARNGMNT_OPTION.MIF_SRVC_ID,
+    ARNGMNT_OPTION.CHOICE_CD_VAL_ID,
+    ARNGMNT_OPTION.CHANGE_TMSTMP,
+    ARNGMNT_OPTION.DW_SRVC_ID   as pln_DW_SRVC_ID,
+    ARNGMNT_OPTION.PREF_ID ,
+    right(ARNGMNT_OPTION.AR_ID,9) as plan_number
+from
+    ddwv01.ARNGMNT_OPTION
+where
+    ARNGMNT_OPTION.PREF_ID in (13001,13004)
+    and ARNGMNT_OPTION.DW_SRVC_ID in (10,99)
+order by
+    6
+"""
+
+
+ #
+# Config / connection
+ #
+def load_config(path: str = "config.ini") -> configparser.ConfigParser:
+    """Load the externalized job configuration."""
+    cfg = configparser.ConfigParser()
+    if not cfg.read(path):
+        raise FileNotFoundError(f"Config file not found: {path}")
+    return cfg
+
+
+def get_connection(cfg: configparser.ConfigParser):
+    """Open a Teradata connection.
+
+    Credentials come from environment (TD_USER / TD_PASSWORD) and config — never
+    hardcoded (Phase 6: config externalized; OCP can't resolve env at connect time).
+    """
+    import teradatasql  # imported lazily so date logic is testable without driver
+
+    user = os.environ.get("TD_USER")
+    password = os.environ.get("TD_PASSWORD")
+    if not user or not password:
+        raise RuntimeError("TD_USER / TD_PASSWORD must be set in the environment.")
+    return teradatasql.connect(
+        host=cfg.get("teradata", "host"),
+        user=user,
+        password=password,
+        logmech=cfg.get("teradata", "logmech", fallback="LDAP"),
+    )
+
+
+ #
+# Date / control-variable derivation  (replaces %ini_check + `data _null_`)
+ #
+class RunDates:
+    """All macro variables the SAS `data _null_` produced.
+
+    SAS reference points:
+      tday = intnx('week.3', today(), 0)  -> the Tuesday of the current week
+      week_end = tday - 3                 -> the Saturday
+      snapdt   = tday - 1                 -> Monday (snapshot date)
+    All `*_dt` SAS macro vars were `date 'YYYY-MM-DD'` literals; the bare ones
+    (snap_dt, wk_end, endrange, formpull) were 'YYYY-MM-DD' text. We expose plain
+    date objects and format at the SQL boundary.
+    """
+
+    def __init__(self, ini_run: bool, day_buff: int, launch_dt: dt.date,
+                 runday: dt.date):
+        self.runday = runday
+        self.launch_dt = launch_dt
+
+        # tday = intnx('week.3', today(), 0): start of the SAS week.3 interval that
+        # contains today. week.3 means weeks begin on day 3 (Tuesday). So tday is
+        # the Tuesday on/most-recently-before today.
+        self.tday = self._intnx_week3(runday)
+        self.tday2 = runday                      # intnx('day', today, 0)
+        self.startday = runday - dt.timedelta(days=10)
+        self.medate = self._month_end(runday, months_back=1)  # prior month end
+
+        self.week_end = self.tday - dt.timedelta(days=3)   # Saturday
+        self.snapdt = self.tday - dt.timedelta(days=1)     # Monday
+
+        if not ini_run:
+            self.ongoing_start = max(runday - dt.timedelta(days=day_buff),
+                                     launch_dt)
+            self.week_start = self.week_end - dt.timedelta(days=6)  # last Sunday
+        else:
+            self.ongoing_start = launch_dt
+            self.week_start = self.ongoing_start
+
+        self.formpulldt = self.week_end - dt.timedelta(days=21)
+        self.e05end = self.week_end + dt.timedelta(days=6)
+        self.e21str = self.week_end + dt.timedelta(days=16)
+        self.e21end = self.week_end + dt.timedelta(days=22)
+        self.p05str = self.week_end + dt.timedelta(days=10)
+        self.p05end = self.week_end + dt.timedelta(days=16)
+        self.p21str = self.week_end + dt.timedelta(days=26)
+        self.p21end = self.week_end + dt.timedelta(days=32)
+        self.endrange = self.p21end  # SAS: call symput('endrange', p21end)
+
+    @staticmethod
+    def _intnx_week3(d: dt.date) -> dt.date:
+        """SAS intnx('week.3', d, 0): Tuesday on/before d (weeks start Tuesday)."""
+        # Python weekday(): Mon=0..Sun=6; Tuesday=1.
+        offset = (d.weekday() - 1) % 7
+        return d - dt.timedelta(days=offset)
+
+    @staticmethod
+    def _month_end(d: dt.date, months_back: int) -> dt.date:
+        first_this = d.replace(day=1)
+        # step back `months_back` months, then take last day of that month
+        m = first_this
+        for _ in range(months_back):
+            m = (m - dt.timedelta(days=1)).replace(day=1)
+        # last day of month m
+        nxt = (m.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+        return nxt - dt.timedelta(days=1)
+
+    # SAS YYMMDD10. text the macro vars carried
+    @staticmethod
+    def _ymd(d: dt.date) -> str:
+        return d.strftime("%Y-%m-%d")
+
+    @property
+    def snap_dt(self) -> str:
+        return self._ymd(self.snapdt)
+
+    @property
+    def wk_end(self) -> str:
+        return self._ymd(self.week_end)
+
+    @property
+    def endrange_s(self) -> str:
+        return self._ymd(self.endrange)
+
+    @property
+    def formpull(self) -> str:
+        return self._ymd(self.formpulldt)
+
+    def log_all(self) -> None:
+        for name in ("week_start", "week_end", "snapdt", "endrange", "formpulldt",
+                     "tday2", "medate", "startday", "e05end", "e21str", "e21end",
+                     "p05str", "p05end", "p21str", "p21end"):
+            logger.info(">>> %-12s = %s", name, getattr(self, name))
+
+
+def ini_check(outpath: Path, runday: dt.date) -> tuple[bool, int]:
+    """Replicate %ini_check.
+
+    If renew_gic_comp_ac exists -> ongoing run: back it up and compute day_buff as
+    (runday - max(SnapDate)). Else -> initial run, day_buff = 1.
+
+    Returns (ini_run, day_buff) where ini_run True == SAS 'Y'.
+    """
+    ac_path = outpath / "renew_gic_comp_ac.parquet"
+    if ac_path.exists():
+        backup = outpath / "renew_gic_comp_ac_backup.parquet"
+        pd.read_parquet(ac_path).to_parquet(backup, index=False)  # x cp
+        existing = pd.read_parquet(ac_path)
+        max_snap = pd.to_datetime(existing["SnapDate"]).max().date()
+        day_buff = (runday - max_snap).days
+        logger.info(">>> ini_run = N  (ongoing); day_buff = %s", day_buff)
+        return False, day_buff
+    logger.info(">>> ini_run = Y  (initial); day_buff = 1")
+    return True, 1
+
+
+ #
+# Extraction
+ #
+def extract(conn, query: str, rd: RunDates, name: str) -> pd.DataFrame:
+    """Run a pass-through query, formatting only the date placeholders."""
+    formatted = query.format(
+        snap_dt=rd.snap_dt, wk_end=rd.wk_end, endrange=rd.endrange_s,
+        formpull=rd.formpull,
+    )
+    logger.info(">>> extracting %s", name)
+    df = pd.read_sql(formatted, conn)
+    df.columns = [c.upper() for c in df.columns]  # normalize for downstream logic
+    _stringify_ids(df)
+    return df
+
+
+def _stringify_ids(df: pd.DataFrame) -> None:
+    """Keep 15-digit identifiers as strings to avoid float precision loss."""
+    for col in ("AR_ID", "CLNT_NO", "CO_OWN_CLNT_NO", "ACCT_NO"):
+        if col in df.columns:
+            df[col] = df[col].astype("string").str.strip()
+
+
+ #
+# Plan-preference resolution  (plans99 / plans10)
+ #
+def latest_plans(all_plans1: pd.DataFrame, dw_srvc_id: int) -> pd.DataFrame:
+    """Replicate plansNN_dump -> plansNN -> nodupkey.
+
+    Steps from SAS:
+      plansNN_dump: keep DW_SRVC_ID==NN and PREF_ID==13001; PLN_NO = plan_number+0
+      plansNN     : keep rows whose CHANGE_TMSTMP == max(CHANGE_TMSTMP) per PLN_NO
+      proc sort nodupkey by PLN_NO : drop dup rows w/ identical max timestamp
+    """
+    d = all_plans1[
+        (all_plans1["PLN_DW_SRVC_ID"] == dw_srvc_id)
+        & (all_plans1["PREF_ID"] == 13001)
+    ].copy()
+    # PLN_NO = plan_number + 0  -> numeric. plan_number = right(AR_ID,9).
+    d["PLN_NO"] = pd.to_numeric(d["PLAN_NUMBER"], errors="coerce").astype("Int64")
+
+    maxtime = d.groupby("PLN_NO", dropna=False)["CHANGE_TMSTMP"].transform("max")
+    d = d[d["CHANGE_TMSTMP"] == maxtime].copy()
+
+    keep = ["MIF_SRVC_ID", "CHOICE_CD_VAL_ID", "PLN_DW_SRVC_ID", "PREF_ID",
+            "PLN_NO", "CHANGE_TMSTMP"]
+    d = d[keep].sort_values("PLN_NO")
+    # nodupkey by PLN_NO: keep first occurrence within each key
+    d = d.drop_duplicates(subset=["PLN_NO"], keep="first").reset_index(drop=True)
+    return d
+
+
+def merge_mif_with_plans(mif: pd.DataFrame, plans: pd.DataFrame) -> pd.DataFrame:
+    """SAS: merge mif (in=inbase) plans; by PLN_NO; if inbase;
+
+    Keep all MIF rows; attach plan columns where PLN_NO matches. PLN_NO is unique
+    on the plan side (nodupkey), so this is a safe left join.
+    """
+    mif = mif.copy()
+    mif["PLN_NO"] = pd.to_numeric(mif["PLN_NO"], errors="coerce").astype("Int64")
+    plan_cols = ["PLN_NO", "MIF_SRVC_ID", "CHOICE_CD_VAL_ID", "PLN_DW_SRVC_ID",
+                 "PREF_ID", "CHANGE_TMSTMP"]
+    return mif.merge(plans[plan_cols], on="PLN_NO", how="left")
+
+
+ #
+# Term-day bucketing + window filter  (the all99_*/all10_* DATA steps)
+ #
+def _total_term_day(df: pd.DataFrame, srvc_id: int) -> pd.Series:
+    """SRVC 13: DEP_TERM_IN_YRS_13*365 + DEP_TERM_IN_DAYS_13.
+       SRVC 14: TRM_YRS_14*365 + TRM_DAYS_14.
+    Computed only where SRVC_ID matches (SAS guarded with `if SRVC_ID=..`)."""
+    if srvc_id == 13:
+        yrs, days = df["DEP_TERM_IN_YRS_13"], df["DEP_TERM_IN_DAYS_13"]
+    else:
+        yrs, days = df["TRM_YRS_14"], df["TRM_DAYS_14"]
+    return yrs * 365 + days
+
+
+def _thirty_day_ind(total_term_day: pd.Series) -> pd.Series:
+    """SAS cascade. Note missing -> '> 30 days' (last branch). Literal text and
+    trailing spaces preserved exactly."""
+    gt = "Renewals > 30 days "    # trailing space, as in SAS literal
+    le = "Renewals <= 30 days"
+    out = pd.Series(gt, index=total_term_day.index, dtype="object")
+    out[(total_term_day <= 30) & (total_term_day >= 0)] = le
+    out[total_term_day.isna()] = gt  # SAS: total_term_day = . -> '> 30 days'
+    out[total_term_day > 30] = gt
+    return out
+
+
+def build_cell(all_df: pd.DataFrame, srvc_id: int, choice_cd: int,
+               mtrty_lo: dt.date, mtrty_hi: dt.date, *, is_21day: bool) -> pd.DataFrame:
+    """Replicate one all99_/all10_ DATA step (5-day or 21-day, e or p).
+
+    Common to all:
+      - keep 600<=bsc<=699
+      - total_term_day per SRVC; thirty_day_ind cascade
+    5-day branch: drop rows where (<=30 days) and total_term_day<=4.
+    21-day branch: keep only thirty_day_ind == '> 30 days'.
+    Then keep CHOICE_CD_VAL_ID == choice_cd and MTRTY_DT within [lo, hi].
+    """
+    d = all_df[(all_df["BSC"] >= 600) & (all_df["BSC"] <= 699)].copy()
+    d["TOTAL_TERM_DAY"] = _total_term_day(d, srvc_id)
+    d["THIRTY_DAY_IND"] = _thirty_day_ind(d["TOTAL_TERM_DAY"])
+
+    if is_21day:
+        d = d[d["THIRTY_DAY_IND"] == "Renewals > 30 days "]
+    else:
+        drop = (d["THIRTY_DAY_IND"] == "Renewals <= 30 days") & (d["TOTAL_TERM_DAY"] <= 4)
+        d = d[~drop]
+
+    mtrty = pd.to_datetime(d["MTRTY_DT"]).dt.date
+    d = d[(d["CHOICE_CD_VAL_ID"] == choice_cd)
+          & (mtrty >= mtrty_lo) & (mtrty <= mtrty_hi)]
+    return d.reset_index(drop=True)
+
+
+ #
+# SAS MERGE (in=inbase / in=hasform) emulation
+ #
+def merge_inbase_hasform(base: pd.DataFrame, form: pd.DataFrame,
+                         keys: list[str]) -> pd.DataFrame:
+    """Replicate:  merge base(in=inbase) form(in=hasform); by keys;
+                   pass='N'; if inbase and hasform then pass='Y'; if inbase;
+
+    Semantics: keep every `base` row; set pass='Y' iff the BY-key exists in `form`.
+    The form contributes no columns to the output here (none are read afterward),
+    so a key-membership test reproduces SAS exactly without row multiplication.
+    """
+    base = base.copy()
+    bkey = base[keys].astype("string").apply(lambda r: "\x1f".join(r.fillna("")), axis=1)
+    fkey = form[keys].astype("string").apply(lambda r: "\x1f".join(r.fillna("")), axis=1)
+    has = bkey.isin(set(fkey))
+    base["PASS"] = np.where(has, "Y", "N")
+    return base
+
+
+ #
+# Completeness roll-up + AC aggregation
+ #
+def _delivery_pref(choice: pd.Series) -> pd.Series:
+    out = pd.Series("Other", index=choice.index, dtype="object")
+    out[choice == 14002] = "OLB Notification"
+    out[choice == 14004] = "Mail"
+    return out
+
+
+def build_completeness(cells: list[pd.DataFrame]) -> pd.DataFrame:
+    """Replicate the rbis_noti_complete_* DATA step (reg / non-reg split deferred).
+
+    Stacks the four *_total cells, derives deliverypreference, the fixed C86
+    labels, and CommentCode/Comments from `pass`. Trailing spaces preserved.
+    """
+    df = pd.concat(cells, ignore_index=True)
+    df["DELIVERYPREFERENCE"] = _delivery_pref(df["CHOICE_CD_VAL_ID"])
+    df["REGULATORYNAME"] = "C86"
+    df["LOB"] = "PSI"
+    df["REPORTNAME"] = "C86 Notification Renewals"
+    df["PRODUCTTYPE"] = "GIC"
+    is_pass = df["PASS"] == "Y"
+    df["COMMENTCODE"] = np.where(is_pass, "COM16", "COM19")
+    df["COMMENTS"] = np.where(is_pass,
+                              "Pass                    ",
+                              "Potential Fail              ")
+    return df
+
+
+def split_reg(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """SAS: if RGSTR_NO_RGSTR_CD='N' -> non-reg else reg."""
+    nonreg = df[df["RGSTR_NO_RGSTR_CD"] == "N"].reset_index(drop=True)
+    reg = df[df["RGSTR_NO_RGSTR_CD"] != "N"].reset_index(drop=True)
+    return reg, nonreg
+
+
+def aggregate_ac(df: pd.DataFrame, rde: str, segment2: str, segment3: str,
+                 rd: RunDates) -> pd.DataFrame:
+    """Replicate one ac_comp_rbis_noti_* PROC SQL aggregation.
+
+    GROUP BY the constant + segment columns (matches SAS group-by 1..22,26,27);
+    Volume = count(*). Bal / Amount are missing (NaN). DateCompleted = today2,
+    SnapDate = wk_end. segment10 = put(SNAP_DT, yymmn6.) -> 'YYYYMM'.
+    """
+    if df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    d["SEGMENT10"] = pd.to_datetime(d["SNAP_DT"]).dt.strftime("%Y%m")
+
+    group_cols = {
+        "RegulatoryName": d["REGULATORYNAME"],
+        "LOB": d["LOB"],
+        "ReportName": d["REPORTNAME"],
+        "ControlRisk": "Completeness",
+        "TestType": "Reconciliation",
+        "TestPeriod": "Portfolio",
+        "ProductType": d["PRODUCTTYPE"],
+        "RDE": rde,
+        "SubDE": "",
+        "Segment": "Renewals",
+        "Segment2": segment2,
+        "Segment3": segment3,
+        "Segment4": d["THIRTY_DAY_IND"],
+        "Segment5": d["DELIVERYPREFERENCE"],
+        "Segment6": "",
+        "Segment7": "",
+        "Segment8": "",
+        "Segment9": "",
+        "segment10": d["SEGMENT10"],
+        "HoldoutFlag": "N",
+        "CommentCode": d["COMMENTCODE"],
+        "Comments": d["COMMENTS"],
+    }
+    g = pd.DataFrame(group_cols)
+    keys = list(g.columns)
+    out = g.groupby(keys, dropna=False).size().reset_index(name="Volume")
+    out["Bal"] = np.nan
+    out["Amount"] = np.nan
+    out["DateCompleted"] = rd.tday2          # input(today2)
+    out["SnapDate"] = rd.week_end            # input(wk_end)
+    return out
+
+
+ #
+# Accumulator  (%completeness macro)
+ #
+def accumulate(curr: pd.DataFrame, outpath: Path, mainpath: Path,
+               ini_run: bool, week_end: dt.date) -> pd.DataFrame:
+    """Replicate %completeness.
+
+    Initial run: AC = current.
+    Ongoing run: AC = existing rows WHERE SnapDate != week_end, then append current
+                 (i.e. overwrite this week's snapshot, keep history).
+    Writes both notidata.renew_gic_comp_ac and notif_m.cnac_renew_gic_comp_ac.
+    """
+    ac_path = outpath / "renew_gic_comp_ac.parquet"
+    if ini_run:
+        ac = curr.copy()
+    else:
+        existing = pd.read_parquet(ac_path)
+        existing_sd = pd.to_datetime(existing["SnapDate"]).dt.date
+        kept = existing[existing_sd != week_end]
+        ac = pd.concat([kept, curr], ignore_index=True)
+
+    ac.to_parquet(ac_path, index=False)
+    ac.to_parquet(mainpath / "cnac_renew_gic_comp_ac.parquet", index=False)
+    return ac
+
+
+ #
+# Fail-detail extract
+ #
+FAIL_DETAIL_COLS = [
+    "AR_ID", "SRVC_ID", "BSC", "TOTAL_TERM_DAY", "THIRTY_DAY_IND",
+    "DELIVERYPREFERENCE", "REGULATORYNAME", "LOB", "REPORTNAME", "PRODUCTTYPE",
+    "COMMENTCODE", "COMMENTS", "FORM_DAY", "DATE_COMPLETED", "RENEWAL_DATE",
+    "NOTIFICATION_DELIVERY_TYPE", "CAMPAIGN_ID", "CREDIT_CARD_ACCOUNT",
+    "PROMO_RULE", "TYPE_OF_NOTIFICATION", "CLIENTID_MASK", "PRODUCT",
+    "DEP_TERM_IN_YRS", "DEP_TERM_IN_DAYS",
+]
+
+
+def build_fail_detail(reg05, nreg05, reg21, nreg21, rd: RunDates) -> pd.DataFrame:
+    """Replicate completeness_total_gic_renewals -> rbis_noti_comp_fail_*.
+
+    form_day stamped per source (05 / 21); keep only Potential Fail; derive the
+    masked client id, product label, and the SRVC-conditional term columns.
+    """
+    parts = []
+    for d, fd in ((nreg21, "21"), (nreg05, "05"), (reg21, "21"), (reg05, "05")):
+        if d is None or d.empty:
+            continue
+        t = d.copy()
+        t["FORM_DAY"] = fd
+        parts.append(t)
+    df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame(columns=FAIL_DETAIL_COLS)
+
+    df = df[df["COMMENTS"] == "Potential Fail              "].copy()
+    df["NOTIFICATION_DELIVERY_TYPE"] = df["DELIVERYPREFERENCE"]
+    df["CAMPAIGN_ID"] = "N/A"
+    df["CREDIT_CARD_ACCOUNT"] = "N/A"
+    df["PROMO_RULE"] = "N/A"
+    df["TYPE_OF_NOTIFICATION"] = df["THIRTY_DAY_IND"]
+    df["RENEWAL_DATE"] = pd.to_datetime(df["MTRTY_DT"]).dt.date
+    # clientid_mask = substr(CLNT_NO, length-2, 3) -> last 3 chars
+    df["CLIENTID_MASK"] = df["CLNT_NO"].astype("string").str[-3:]
+    df["DATE_COMPLETED"] = rd.tday2
+
+    df["PRODUCT"] = np.where(
+        df["RGSTR_NO_RGSTR_CD"] == "N", "Non-Registered GIC",
+        np.where(df["RGSTR_NO_RGSTR_CD"] == "R", "Registered GIC   ", ""))
+
+    is13 = df["SRVC_ID"] == 13
+    df["DEP_TERM_IN_YRS"] = np.where(is13, df.get("DEP_TERM_IN_YRS_13"),
+                                     df.get("TRM_YRS_14"))
+    df["DEP_TERM_IN_DAYS"] = np.where(is13, df.get("DEP_TERM_IN_DAYS_13"),
+                                      df.get("TRM_DAYS_14"))
+
+    for c in FAIL_DETAIL_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[FAIL_DETAIL_COLS].reset_index(drop=True)
+
+
+ #
+# Orchestration
+ #
+def run(cfg: configparser.ConfigParser) -> None:
+    outpath = Path(cfg.get("paths", "outpath"))
+    mainpath = Path(cfg.get("paths", "mainnotif"))
+    outpath.mkdir(parents=True, exist_ok=True)
+    mainpath.mkdir(parents=True, exist_ok=True)
+
+    run_date_override = cfg.get("job", "run_date", fallback="").strip()
+    runday = (dt.date.fromisoformat(run_date_override)
+              if run_date_override else dt.date.today())
+    launch_dt = dt.date.fromisoformat(cfg.get("job", "launch_date"))
+    rundt = runday.strftime("%Y%m%d")
+    ymd = rundt
+
+    ini_run, day_buff = ini_check(outpath, runday)
+    rd = RunDates(ini_run, day_buff, launch_dt, runday)
+    rd.log_all()
+
+    with get_connection(cfg) as conn:
+        mif_14 = extract(conn, MIF_14, rd, "mif_14")
+        mif_13 = extract(conn, MIF_13, rd, "mif_13")
+        rbis_noti_base = extract(conn, RBIS_NOTI_BASE, rd, "rbis_noti_base")
+        all_plans1 = extract(conn, ALL_PLANS1, rd, "all_plans1")
+
+    # --- split notification base into 4 cells (SRVC x NOTIF_NO_OF_DYS) ---
+    base = rbis_noti_base
+    nb_13_5 = base[(base["SRVC_ID"] == 13) & (base["NOTIF_NO_OF_DYS"] == 5)]
+    nb_14_5 = base[(base["SRVC_ID"] == 14) & (base["NOTIF_NO_OF_DYS"] == 5)]
+    nb_13_21 = base[(base["SRVC_ID"] == 13) & (base["NOTIF_NO_OF_DYS"] == 21)]
+    nb_14_21 = base[(base["SRVC_ID"] == 14) & (base["NOTIF_NO_OF_DYS"] == 21)]
+
+    # --- plan-preference resolution ---
+    plans99 = latest_plans(all_plans1, dw_srvc_id=99)
+    plans10 = latest_plans(all_plans1, dw_srvc_id=10)
+    all99 = merge_mif_with_plans(mif_13, plans99)
+    all10 = merge_mif_with_plans(mif_14, plans10)
+
+    keys = ["AR_ID", "CLNT_NO", "MTRTY_DT"]
+
+    # --- 5-day cells (electronic 14002 / paper 14004) ---
+    a99_5e = build_cell(all99, 13, 14002, rd.week_end, rd.e05end, is_21day=False)
+    a99_5p = build_cell(all99, 13, 14004, rd.p05str, rd.p05end, is_21day=False)
+    a10_5e = build_cell(all10, 14, 14002, rd.week_end, rd.e05end, is_21day=False)
+    a10_5p = build_cell(all10, 14, 14004, rd.p05str, rd.p05end, is_21day=False)
+
+    a99_5e_t = merge_inbase_hasform(a99_5e, nb_13_5, keys)
+    a99_5p_t = merge_inbase_hasform(a99_5p, nb_13_5, keys)
+    a10_5e_t = merge_inbase_hasform(a10_5e, nb_14_5, keys)
+    a10_5p_t = merge_inbase_hasform(a10_5p, nb_14_5, keys)
+
+    # --- 21-day cells ---
+    a99_21e = build_cell(all99, 13, 14002, rd.e21str, rd.e21end, is_21day=True)
+    a99_21p = build_cell(all99, 13, 14004, rd.p21str, rd.p21end, is_21day=True)
+    a10_21e = build_cell(all10, 14, 14002, rd.e21str, rd.e21end, is_21day=True)
+    a10_21p = build_cell(all10, 14, 14004, rd.p21str, rd.p21end, is_21day=True)
+
+    a99_21e_t = merge_inbase_hasform(a99_21e, nb_13_21, keys)
+    a99_21p_t = merge_inbase_hasform(a99_21p, nb_13_21, keys)
+    a10_21e_t = merge_inbase_hasform(a10_21e, nb_14_21, keys)
+    a10_21p_t = merge_inbase_hasform(a10_21p, nb_14_21, keys)
+
+    # --- completeness roll-up + reg/non-reg split ---
+    comp05 = build_completeness([a99_5e_t, a99_5p_t, a10_5e_t, a10_5p_t])
+    comp21 = build_completeness([a99_21e_t, a99_21p_t, a10_21e_t, a10_21p_t])
+    reg05, nreg05 = split_reg(comp05)
+    reg21, nreg21 = split_reg(comp21)
+
+    # --- AC aggregation (4 SLA streams) ---
+    ac_reg05 = aggregate_ac(reg05, "Notif034_Completeness_SLA", "5 days",
+                            "Registered GIC", rd)
+    ac_reg21 = aggregate_ac(reg21, "Notif033_Completeness_SLA", "21 days",
+                            "Registered GIC", rd)
+    ac_nreg05 = aggregate_ac(nreg05, "Notif036_Completeness_SLA", "5 days",
+                             "Non-Registered GIC", rd)
+    ac_nreg21 = aggregate_ac(nreg21, "Notif035_Completeness_SLA", "21 days",
+                             "Non-Registered GIC", rd)
+
+    curr = pd.concat([ac_nreg05, ac_nreg21, ac_reg05, ac_reg21],
+                     ignore_index=True)
+    # snapshot copy named by rundt (SAS: notidata.renew_gic_comp_ac_&rundt.)
+    curr.to_parquet(outpath / f"renew_gic_comp_ac_{rundt}.parquet", index=False)
+
+    # --- accumulate ---
+    ac = accumulate(curr, outpath, mainpath, ini_run, rd.week_end)
+    ac.to_excel(outpath / "renew_gic_comp_autocomplete.xlsx",
+                sheet_name="renew_gic_comp_ac", index=False)
+
+    # --- fail detail ---
+    fail = build_fail_detail(reg05, nreg05, reg21, nreg21, rd)
+    fail.to_parquet(outpath / f"rbis_noti_comp_fail_{ymd}.parquet", index=False)
+    fail.to_excel(outpath / "Notif_RBIS_Renew_Completeness_Detail.xlsx",
+                  sheet_name="Notif_RBIS_Renew_Comp", index=False)
+
+    logger.info(">>> done. AC rows=%s, fail rows=%s", len(ac), len(fail))
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format=">>>>>>>>> %(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    cfg = load_config()
+    logger.info(">>> Program  - %s", cfg.get("job", "job_name"))
+    logger.info(">>> Env      - %s", cfg.get("job", "env"))
+    try:
+        run(cfg)
+    except Exception as e:
+        logger.error("Job failed: %s", e)
+        raise
+
+
+if __name__ == "__main__":
+    main()
