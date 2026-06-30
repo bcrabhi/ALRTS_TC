@@ -1,0 +1,542 @@
+"""
+
+ c86_notification_ln_renewal_Completeness.py
+
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger("c86_notif_ln_renew_completeness")
+
+
+
+# Configuration — externalise paths/creds; nothing hardcoded inline.
+
+REG_PATH = os.environ.get("REG_PATH", "/sas/RSD/REG")
+OUT_PATH = os.path.join(REG_PATH, "C86", "output", "notification", "ln_renew")
+G_OUT_PATH = os.path.join(REG_PATH, "C86", "output", "notification", "MAIN_NOTIF")
+BACKUP_PATH = os.path.join(OUT_PATH, "backup")
+
+# Autocomplete history dataset (SAS: ac.ln_renew_comp_ac).
+AC_HISTORY = os.path.join(OUT_PATH, "ln_renew_comp_ac.parquet")
+# Higher-level combined-LOB copy (SAS: cspath.cnac_ln_renew_comp_ac).
+CS_HISTORY = os.path.join(G_OUT_PATH, "cnac_ln_renew_comp_ac.parquet")
+
+
+
+# Date / interval helpers — explicit ports of SAS INTNX custom-week intervals.
+
+def _intnx_week_start(ref: dt.date, week_start_weekday: int) -> dt.date:
+    """Start of the week containing ``ref`` for a custom SAS week interval.
+
+    SAS ``week.N`` shifts the start-of-week. ``intnx('week.3', d, 0)`` returns
+    the most recent day whose weekday is the 'start' day on or before ``d``.
+    ``week.3`` starts on Tuesday, ``week.7`` starts on Saturday.
+
+    Args:
+        ref: Reference date.
+        week_start_weekday: Python weekday() of the week's start day
+            (Mon=0 ... Sun=6). Tuesday=1, Saturday=5.
+
+    Returns:
+        Date of the week's start day on or before ``ref``.
+    """
+    offset = (ref.weekday() - week_start_weekday) % 7
+    return ref - dt.timedelta(days=offset)
+
+
+def _to_sas_date_num(d: dt.date) -> int:
+    """Convert a date to a SAS date value (days since 1960-01-01)."""
+    return (d - dt.date(1960, 1, 1)).days
+
+
+def _from_sas_date_num(n: float) -> Optional[dt.date]:
+    """Convert a SAS date value (days since 1960-01-01) back to a date."""
+    if pd.isna(n):
+        return None
+    return dt.date(1960, 1, 1) + dt.timedelta(days=int(n))
+
+
+def months_between(start_date, end_date):
+    """Exact port of the FCMP ``months_between`` used by the SAS program.
+
+    y = (yr_end - yr_start) * 12 + (mo_end - mo_start) + (day_end > day_start)
+
+    The final term adds 1 when the end day-of-month is strictly greater than
+    the start day-of-month. Returns ``np.nan`` if either input is missing.
+    This is NOT relativedelta and NOT SQL months_between — do not substitute.
+
+    Args:
+        start_date: Period start (date-like or NaT/None).
+        end_date: Period end (date-like or NaT/None).
+
+    Returns:
+        Integer month difference as a float, or ``np.nan`` if an input is
+        missing.
+    """
+    if pd.isna(start_date) or pd.isna(end_date):
+        return np.nan
+    s = pd.Timestamp(start_date)
+    e = pd.Timestamp(end_date)
+    return (
+        (e.year - s.year) * 12
+        + (e.month - s.month)
+        + (1 if e.day > s.day else 0)
+    )
+
+
+
+# Init / buffer — mirrors %get_init_and_buff.
+
+def get_init_and_buffer(run_day: dt.date) -> tuple[bool, Optional[int]]:
+    """Replicate %get_init_and_buff: detect first run and find the buffer date.
+
+    On a non-initial run, backs up the existing autocomplete history and finds
+    the latest snapshot date already completed before today. That date is the
+    window start so already-processed days are not re-counted.
+
+    Args:
+        run_day: Today's run date.
+
+    Returns:
+        Tuple ``(ini_run_c, last_snap_c)`` where ``ini_run_c`` is True on the
+        first ever run and ``last_snap_c`` is the SAS-numeric buffer date (or
+        ``None`` on the first run).
+    """
+    if not os.path.exists(AC_HISTORY):
+        logger.info("ini_run_c = Y (no existing autocomplete history)")
+        return True, None
+
+    history = pd.read_parquet(AC_HISTORY)
+    os.makedirs(BACKUP_PATH, exist_ok=True)
+    history.to_parquet(os.path.join(BACKUP_PATH, "ln_renew_comp_ac.parquet"))
+
+    run_day_num = _to_sas_date_num(run_day)
+    # SAS: max(snapdate) where DateCompleted < runday. SnapDate column in the
+    # history is the week-ending; it is stored as a date.
+    completed = pd.to_datetime(history["DateCompleted"]).dt.date
+    snap = pd.to_datetime(history["SnapDate"]).dt.date
+    mask = completed.map(_to_sas_date_num) < run_day_num
+    if not mask.any():
+        last_snap_c = 0
+    else:
+        last_snap_c = max(_to_sas_date_num(s) for s in snap[mask])
+
+    logger.info("ini_run_c = N")
+    logger.info("last_snap_c = %s", _from_sas_date_num(last_snap_c))
+    return False, last_snap_c
+
+
+def compute_window(
+    run_day: dt.date, ini_run_c: bool, last_snap_c: Optional[int]
+) -> tuple[str, str]:
+    """Compute the completeness population window (Saturday -> Friday).
+
+    Mirrors the ``data _null_`` block:
+        launch_dt_c = intnx('week.3', runday, 0) - 10   # last Saturday
+        week_start_c = ini ? max(launch_dt_c, last_snap) : last_snap
+        week_end_c   = intnx('week.3', runday, 0) - 4    # last Friday
+
+    Note the SAS ``ifn(ini='Y', max(...), last_snap)`` branch: on the first run
+    there is no buffer date so the launch floor is used; on later runs the
+    buffer (last completed snapshot) is the start.
+
+    Args:
+        run_day: Today's run date (expected to be a Tuesday).
+        ini_run_c: True on the first ever run.
+        last_snap_c: SAS-numeric buffer date, or None on first run.
+
+    Returns:
+        Tuple ``(notif_start_c, week_end_c)`` as 'YYYY-MM-DD' strings for the
+        SQL ``BETWEEN``.
+    """
+    week3_start = _intnx_week_start(run_day, week_start_weekday=1)  # Tuesday
+    launch_dt_c = _to_sas_date_num(week3_start) - 10  # last Saturday
+    week_end_c = _to_sas_date_num(week3_start) - 4    # last Friday
+
+    if ini_run_c:
+        # First run: no buffer; floor at launch date.
+        week_start_c = max(launch_dt_c, last_snap_c or 0)
+    else:
+        # Subsequent runs: resume from last completed snapshot.
+        week_start_c = last_snap_c if last_snap_c is not None else launch_dt_c
+
+    notif_start = _from_sas_date_num(week_start_c)
+    week_end = _from_sas_date_num(week_end_c)
+    logger.info("week_start_c = %s, week_end_c = %s", notif_start, week_end)
+    return notif_start.strftime("%Y-%m-%d"), week_end.strftime("%Y-%m-%d")
+
+
+
+# Teradata pulls — same SQL the SAS connection-to-teradata block runs.
+
+def build_population_sql(notif_start: str, week_end: str) -> str:
+    """SQL for the fixed-loan-due-for-renewal population (a..f + disclosure).
+
+    Identical logic to the SAS pass-through query. The Notif_Typ CASE keeps the
+    intentional inversion (21d-ahead -> 5, 37d-ahead -> 21).
+    """
+    return f"""
+        select distinct
+            x.*
+            , y.disclsr_opt_typ_cd
+        from (
+          select a.snap_dt, a.dw_srvc_id, a.ar_id, a.ln_desc, a.minm_pymt_amt,
+                 a.govt_pln_tp, a.status, a.LST_FNCL_TXN_DT, a.LAST_INT_COLL_DT,
+                 a.INS_IND, a.INS_CD, a.INT_EARN_AMT, d.RESTRAIN_TYPE,
+                 d.TOT_INT_CLCT,
+                 abs(a.INT_EARN_AMT + d.TOT_INT_CLCT) as INT_EARN_TOT,
+                 d.REGLR_PYMT_AMT, e.clnt_no, e.prmry_clnt_ind, b.PYMT_DUE_DT,
+                 b.PYMT_FREQ, b.COB_INT_RT_ADDN, b.INT_BSE_RT, b.INT_MTHD,
+                 b.INT_RULE, b.amort_end_dt, b.curr_amort_end_dt,
+                 b.cob_amort_end_dt, b.cob_pymt_amt, b.chg_dt, b.captr_dt,
+                 b.iss_renw_dt, b.cob_int_renw_dt, f.PROC_CTR_CD, f.CLNT_TYP,
+                 f.BSC, c.bal as IRD_Bal,
+                 case when upper(c.shrt_nm) like '%HSBC%'
+                        or upper(c.shrt_nm) like '%HFMI%'
+                      then 'HSBC' else 'RBC' end as Emerald_Flag,
+                 case when a.minm_pymt_amt + c.bal > 0 then 'Y' else 'N'
+                      end as Payout,
+                 case when b.cob_int_renw_dt - a.snap_dt in (21) then 5
+                      when b.cob_int_renw_dt - a.snap_dt in (37) then 21
+                      end as Notif_Typ
+          from DDWV01.LN_GENERAL_DLY as a,
+               DDWV01.LN_COND_DLY as b,
+               DDWV01.AR_DLY as c,
+               DDWV01.LN_FINANCIAL_HIST_DLY as d,
+               DDWV01.CLNT_AR_RELTN_DLY as e,
+               DDWV01.RB_CLNT_DLY as f
+          where a.ar_id = b.ar_id
+            and a.ar_id = c.ar_id
+            and a.ar_id = d.ar_id
+            and a.ar_id = e.ar_id
+            and e.clnt_no = f.clnt_no
+            and a.snap_dt = b.snap_dt
+            and a.snap_dt = c.snap_dt
+            and a.snap_dt = d.snap_dt
+            and a.snap_dt = e.snap_dt
+            and e.snap_dt = f.snap_dt
+            and b.cob_int_renw_dt - a.snap_dt in (21, 37)
+            and a.snap_dt between DATE '{notif_start}' and DATE '{week_end}'
+            and (a.ln_desc in ('FRINLN', 'FIXED') and a.govt_pln_tp <> '32')
+            and a.status in ('02', '03', '04')
+            and d.RESTRAIN_TYPE = 2
+            and a.DW_SRVC_ID = 20
+        ) as x
+        left join DDWV01.COB_DISCLSR_OPT_DLY_SNAP as y
+          on x.ar_id = y.ar_id
+         and x.snap_dt = y.snap_dt
+         and x.clnt_no = y.clnt_no
+         and y.snap_dt between DATE '{notif_start}' and DATE '{week_end}'
+        where x.prmry_clnt_ind = 'P' or y.disclsr_opt_typ_cd = 'S'
+        order by x.ar_id, x.clnt_no
+    """
+
+
+def build_notif_sql(notif_start: str) -> str:
+    """SQL for renewal notifications sent up to the run date (RENW_NOTIF)."""
+    return f"""
+        select c.*
+        from (
+            select a.*, mtrty_dt - notif_sent_dt as prep_days
+            from ddwv01.RENW_NOTIF as a
+            where renw_prod_notif_typ = 1
+              and (SEP_DISCLSR_IND is null or SEP_DISCLSR_IND = 'Y')
+              and SRVC_ID = 20
+              and NOTIF_SENT_DT >= DATE '{notif_start}'
+        ) as c
+        order by ar_id, MTRTY_DT, NOTIF_NO_OF_DYS, notif_sent_dt
+    """
+
+
+
+# Transformations.
+
+def add_ird_caed(pop: pd.DataFrame) -> pd.DataFrame:
+    """Add IRD_CAED (months) and the >= 6-month flag.
+
+    Mirrors the DATA step using the FCMP ``months_between`` between the COB
+    interest-renewal date and the COB amortization-end date.
+    """
+    pop = pop.copy()
+    pop["IRD_CAED"] = [
+        months_between(s, e)
+        for s, e in zip(pop["cob_int_renw_dt"], pop["cob_amort_end_dt"])
+    ]
+    pop["IRD_CAED_6m"] = np.where(pop["IRD_CAED"] >= 6, "Y", "N")
+    return pop
+
+
+def match_notifications(pop: pd.DataFrame, notif: pd.DataFrame) -> pd.DataFrame:
+    """Left-join population (IRD_CAED_6m == 'Y') to sent notifications.
+
+    Mirrors the ``ln_renew_comp_notif`` PROC SQL: keep population rows whose
+    gap is >= 6 months, join on (ar_id, clnt_no, Notif_Typ == notif_no_of_dys)
+    where the notice was sent on/after the snapshot, and set confirm_flag.
+
+    Because a row can match multiple notices (SAS keeps them all), this is a
+    one-to-many left join — row count can grow, matching SAS.
+    """
+    left = pop[pop["IRD_CAED_6m"] == "Y"].copy()
+
+    right = notif[
+        ["ar_id", "clnt_no", "notif_no_of_dys", "notif_sent_dt", "SEP_DISCLSR_IND"]
+    ].copy()
+    right = right.rename(columns={"notif_no_of_dys": "Notif_Typ"})
+
+    merged = left.merge(
+        right,
+        on=["ar_id", "clnt_no", "Notif_Typ"],
+        how="left",
+        suffixes=("", "_notif"),
+    )
+    # SAS join condition: b.notif_sent_dt >= a.snap_dt. Rows where the matched
+    # notice predates the snapshot are not real matches -> drop the match side
+    # (keep the population row as unmatched).
+    sent = pd.to_datetime(merged["notif_sent_dt"])
+    snap = pd.to_datetime(merged["snap_dt"])
+    too_early = sent.notna() & (sent < snap)
+    for col in ["notif_sent_dt", "SEP_DISCLSR_IND"]:
+        merged.loc[too_early, col] = np.nan
+
+    merged["confirm_flag"] = np.where(merged["notif_sent_dt"].notna(), "Y", "N")
+    return merged
+
+
+# Notif_Typ -> label (PROC FORMAT notiftyp). Inversion intentional; see header.
+_NOTIF_TYPE_FMT = {21: "21 days", 5: "5 days"}
+
+# CommentCode -> human text (PROC FORMAT $cmt). Only codes used downstream.
+_CMT_FMT = {
+    "COM16": "Pass",
+    "COM19": "Potential Fail",
+}
+
+
+def build_control_table(matched: pd.DataFrame, run_day: dt.date) -> pd.DataFrame:
+    """Add control columns: CommentCode, Notif_Type, DateCompleted, week_ending.
+
+    Mirrors ``dataout.ln_renew_comp_notif``. week_ending uses ``week.7`` (week
+    starting Saturday), shifted forward one week to the period's Saturday, to
+    align with the Timeliness week-ending.
+    """
+    out = matched.copy()
+    out["CommentCode"] = np.where(out["confirm_flag"] == "Y", "COM16", "COM19")
+    out["Notif_Type"] = out["Notif_Typ"].map(_NOTIF_TYPE_FMT)
+    out["DateCompleted"] = run_day
+
+    # intnx('week.7', snap_dt, 1, 'b'): start of the NEXT week-7 (Saturday).
+    def _week_ending(snap) -> dt.date:
+        d = pd.Timestamp(snap).date()
+        this_sat = _intnx_week_start(d, week_start_weekday=5)  # Saturday start
+        return this_sat + dt.timedelta(days=7)
+
+    out["week_ending"] = out["snap_dt"].map(_week_ending)
+    return out
+
+
+# Columns the SAS GROUP BY rolls up on (positions 1..23 in OLBB_Notif_AC_Comp).
+_AC_GROUP_COLS = [
+    "RegulatoryName", "LOB", "ReportName", "ControlRisk", "TestType",
+    "TestPeriod", "ProductType", "RDE", "Segment", "Segment2", "Segment3",
+    "Segment4", "Segment5", "Segment6", "Segment7", "Segment8", "Segment9",
+    "segment10", "HoldoutFlag", "CommentCode", "Comments", "DateCompleted",
+    "SnapDate",
+]
+
+
+def build_autocomplete(control: pd.DataFrame, run_day: dt.date) -> pd.DataFrame:
+    """Aggregate to the OLBB autocomplete table (one row per 23-attr combo)."""
+    df = control.copy()
+
+    df["RegulatoryName"] = "C86"
+    df["LOB"] = np.select(
+        [df["LN_DESC"] == "FIXED", df["LN_DESC"] == "FRINLN"],
+        ["PL", "AF"],
+        default=None,
+    )
+    df["ReportName"] = "C86 Notifications"
+    df["ControlRisk"] = "Completeness"
+    df["TestType"] = "Reconciliation"
+    df["TestPeriod"] = "Portfolio"
+    df["ProductType"] = "Installment Loan"
+    df["RDE"] = np.select(
+        [df["Notif_Typ"] == 21, df["Notif_Typ"] == 5],
+        ["Notif032_Completeness_All_Clients", "Notif031_Completeness_All_Clients"],
+        default=None,
+    )
+    df["Segment"] = "Renewals"
+    df["Segment2"] = df["Notif_Type"]
+    df["Segment3"] = df["LN_DESC"]
+    df["Segment4"] = "Renewals >= 6 months"
+    df["Segment5"] = "Mail"
+    # Segments 6-9 are blank string literals in SAS (preserved for output parity).
+    df["Segment6"] = ""
+    df["Segment7"] = ""
+    df["Segment8"] = ""
+    df["Segment9"] = ""
+    df["segment10"] = pd.to_datetime(df["SNAP_DT"]).dt.strftime("%Y%m")
+    df["HoldoutFlag"] = "N"
+    df["Comments"] = df["CommentCode"].map(_CMT_FMT)
+    df["DateCompleted"] = run_day
+    df["SnapDate"] = df["week_ending"]
+
+    grouped = (
+        df.groupby(_AC_GROUP_COLS, dropna=False)
+        .size()
+        .reset_index(name="Volume")
+        .sort_values(_AC_GROUP_COLS)
+        .reset_index(drop=True)
+    )
+    return grouped
+
+
+def build_fail_detail(control: pd.DataFrame, run_day: dt.date) -> pd.DataFrame:
+    """Build the unmatched-account detail (confirm_flag == 'N').
+
+    INT_BSE_RT is intentionally omitted (commented out in SAS). AR_ID is sliced
+    by fixed position, so it must remain a string.
+    """
+    d = control[control["confirm_flag"] == "N"].copy()
+    ar = d["ar_id"].astype(str)
+
+    out = pd.DataFrame(
+        {
+            "LOB": np.select(
+                [d["LN_DESC"] == "FIXED", d["LN_DESC"] == "FRINLN"],
+                ["PL", "AF"],
+                default=None,
+            ),
+            "Notification_Delivery_Type": "Mail",
+            "DateCompleted": run_day,
+            "event_week_ending": d["week_ending"].values,
+            "Event_mth": pd.to_datetime(d["snap_dt"]).dt.strftime("%Y%m").values,
+            "Product": d["LN_DESC"].values,
+            # SAS substr is 1-indexed: substr(ar_id, 5, 5) -> [4:9], etc.
+            "Transit": ar.str[4:9].values,
+            "Account_Number": ar.str[9:17].values,
+            "Segment_Number": ar.str[17:20].values,
+            "STATUS": d["status"].values,
+            "LST_FNCL_TXN_DT": d["LST_FNCL_TXN_DT"].values,
+            "LAST_INT_COLL_DT": d["LAST_INT_COLL_DT"].values,
+            "INS_CD": d["INS_CD"].values,
+            "INT_EARN_TOT": d["INT_EARN_TOT"].values,
+            "REGLR_PYMT_AMT": d["REGLR_PYMT_AMT"].values,
+            "clientNumber_mask": "*******"
+            + d["clnt_no"].apply(lambda x: f"{int(x):09d}"[6:9]).values,
+            "PYMT_DUE_DT": d["PYMT_DUE_DT"].values,
+            "PYMT_FREQ": d["PYMT_FREQ"].values,
+            "COB_INT_RT_ADDN": d["COB_INT_RT_ADDN"].values,
+            "COB_AMORT_END_DT": d["cob_amort_end_dt"].values,
+            "COB_INT_RENW_DT": d["cob_int_renw_dt"].values,
+            "IRD_Bal": d["IRD_Bal"].values,
+            "Days_of_Notification": d["Notif_Type"].values,
+            "NOTIF_SENT_DT": d["notif_sent_dt"].values,
+        }
+    )
+    return out.sort_values(["event_week_ending", "Transit", "Account_Number",
+                            "Segment_Number"]).reset_index(drop=True)
+
+
+
+# History append — mirrors %Completeness (delete-current-day-then-insert).
+
+def update_autocomplete_history(
+    ac_new: pd.DataFrame, ini_run_c: bool, run_day: dt.date
+) -> pd.DataFrame:
+    """Append today's autocomplete rows to history; idempotent on re-run.
+
+    SAS: on first run, history == today's rows; otherwise history is today's
+    rows stacked on prior history with today's DateCompleted removed (so a
+    same-day re-run replaces rather than duplicates).
+    """
+    if ini_run_c or not os.path.exists(AC_HISTORY):
+        combined = ac_new.copy()
+    else:
+        prior = pd.read_parquet(AC_HISTORY)
+        prior_completed = pd.to_datetime(prior["DateCompleted"]).dt.date
+        prior = prior[prior_completed != run_day]
+        combined = pd.concat([ac_new, prior], ignore_index=True)
+
+    combined.to_parquet(AC_HISTORY, index=False)
+    # Higher-level combined-LOB copy (SAS: cspath.cnac_ln_renew_comp_ac).
+    os.makedirs(G_OUT_PATH, exist_ok=True)
+    combined.to_parquet(CS_HISTORY, index=False)
+    return combined
+
+
+
+# Orchestration.
+
+def main(conn, run_day: Optional[dt.date] = None) -> None:
+    """Run the completeness monitoring job.
+
+    Args:
+        conn: A DB-API connection to Teradata (passed to ``pd.read_sql``).
+        run_day: Override run date for dev/testing; defaults to today.
+    """
+    run_day = run_day or dt.date.today()
+    os.makedirs(OUT_PATH, exist_ok=True)
+    os.makedirs(BACKUP_PATH, exist_ok=True)
+
+    ini_run_c, last_snap_c = get_init_and_buffer(run_day)
+    notif_start, week_end = compute_window(run_day, ini_run_c, last_snap_c)
+
+    logger.info("Pulling population from Teradata ...")
+    pop = pd.read_sql(build_population_sql(notif_start, week_end), conn)
+    pop.columns = [c.lower() if c.lower() != "ln_desc" else "LN_DESC"
+                   for c in pop.columns]  # keep LN_DESC casing used downstream
+
+    pop = add_ird_caed(pop)
+    logger.info("IRD_CAED_6m counts:\n%s",
+                pop["IRD_CAED_6m"].value_counts(dropna=False))
+
+    logger.info("Pulling sent notifications from Teradata ...")
+    notif = pd.read_sql(build_notif_sql(notif_start), conn)
+    notif.columns = [c.lower() for c in notif.columns]
+
+    matched = match_notifications(pop, notif)
+    control = build_control_table(matched, run_day)
+
+    rundt = run_day.strftime("%Y%m%d")
+    dataout = os.path.join(OUT_PATH, rundt)
+    os.makedirs(dataout, exist_ok=True)
+    control.to_parquet(os.path.join(dataout, "ln_renew_comp_notif.parquet"),
+                       index=False)
+
+    ac_new = build_autocomplete(control, run_day)
+    ac_new.to_parquet(os.path.join(dataout, "OLBB_Notif_AC_Comp.parquet"),
+                      index=False)
+    update_autocomplete_history(ac_new, ini_run_c, run_day)
+
+    fail_detail = build_fail_detail(control, run_day)
+    fail_detail.to_parquet(
+        os.path.join(dataout, "ln_renew_comp_faildetail.parquet"), index=False)
+    fail_detail.to_excel(
+        os.path.join(OUT_PATH, "Notif_Loan_Renew_Completeness_Detail.xlsx"),
+        sheet_name="Renew_Loan_Detail_Comp",
+        index=False,
+    )
+    logger.info("Done. %d autocomplete rows, %d fail-detail rows.",
+                len(ac_new), len(fail_detail))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format=">>>>>>>>>> %(asctime)s %(levelname)s %(message)s",
+    )
+    # Example wiring (fill in your Teradata connection):
+    # import teradatasql
+    # conn = teradatasql.connect(host=os.environ["TERADATA_HOST"],
+    #                            user=..., password=..., logmech="LDAP")
+    # main(conn, run_day=dt.date(2026, 3, 3))  # dev date override
+    raise SystemExit("Provide a Teradata connection and call main(conn).")
