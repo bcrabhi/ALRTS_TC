@@ -11,61 +11,90 @@ import logging
 import os
 import shutil
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+# Teradata driver (matches reference C86_pa_client360.py)
 import teradatasql
-import openpyxl  # noqa: F401  (used implicitly by pd.ExcelWriter engine)
 
-from pyspark.sql import SparkSession
-
-os.environ.setdefault("SPARK_VERSION", "3.3")
+# Excel formatting
+import openpyxl  # noqa: F401  (engine dependency for pandas ExcelWriter)
 
 
 
-# Configuration
-
-
-S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"
-S3_BUCKET   = "ryu0-s3-sas-migration"
-
-S3_FOLDERS: Dict[str, str] = {
-    "raw":          f"s3a://{S3_BUCKET}/raw",
-    "intermediate": f"s3a://{S3_BUCKET}/intermediate",
-    "output":       f"s3a://{S3_BUCKET}/output",
-    "logs":         f"s3a://{S3_BUCKET}/logs",
-}
+# 0. Configuration
 
 
 @dataclass(frozen=True)
 class Config:
-    """Centralised path and file-name configuration (mirrors SAS %let variables)."""
+    """Frozen config replacing SAS %let macro variables / %global paths.
 
-    # Mirrors &regpath/C86/output/notification/rbis
+    SAS source:
+        %let regpath = .../REG or REG_DEV depending on &env
+        %let logpath = &regpath/C86/log/notification/rbis
+        %let outpath = &regpath/C86/output/notification/rbis
+    """
+
+    # NOTE: these mirror the structure of the reference C86_pa_client360.py
+    # config. Update regpath/env wiring to match the actual deployment
+    # target (PROD vs DEV) when integrating with Tyr/Helios job_conf.
+    regpath: Path = Path("sas/RSD/REG_DEV")
     outpath: Path = Path("sas/RSD/REG_DEV/C86/output/notification/rbis")
-    # Mirrors &regpath/C86/log/notification/rbis
     logpath: Path = Path("sas/RSD/REG_DEV/C86/log/notification/rbis")
-    # Mirrors notif_m libname → MAIN_NOTIF folder
-    main_notif_path: Path = Path("sas/RSD/REG_DEV/C86/output/notification/MAIN_NOTIF")
 
+    # SAS source: libname notif_m "&regpath/C86/output/notification/MAIN_NOTIF";
+    # Second write target for the autocomplete table (notif_m.cnac_renew_gic_ac),
+    # written alongside notidata.renew_gic_ac in the same SAS DATA step.
+    notif_m_outpath: Path = Path("/sas/RSD/REG_DEV/C86/output/notification/MAIN_NOTIF")
+
+    # Teradata connection json (LDAP creds) -- matches reference script
     teradata_conn_json: Path = Path("TeradataConnection_T.json")
 
-    # Persistent autocomplete store (replaces renew_gic_ac.sas7bdat)
-    persistent_ac_file: str     = "renew_gic_ac.parquet"
+    # Persistent state file replacing SAS7BDAT (notidata.renew_gic_ac)
+    # SAS source: &outpath/renew_gic_ac.sas7bdat
+    persistent_ac_file: str = "renew_gic_ac.parquet"
+    # SAS source: notif_m.cnac_renew_gic_ac (second write target, same content)
+    cnac_persistent_file: str = "cnac_renew_gic_ac.parquet"
+
+    # Excel outputs (proc export ... dbms=xlsx)
     excel_autocomplete_file: str = "renew_gic_autocomplete.xlsx"
-    excel_fail_detail_prefix: str = "Notif_RBIS_Renew_Timeliness_Detail"
+
+    # SAS source: notidata.rbis_noti_time_fail_wk_&ymd. -- persisted as a
+    # permanent dated SAS dataset in addition to the Excel export.
+    fail_detail_parquet_prefix: str = "rbis_noti_time_fail_wk_"
+
+    # launch date for the regulatory program (SAS: launch_dt='01JUL2022'd)
+    launch_dt: date = date(2022, 7, 1)
+
+
+# S3 scaffolding (TODO: wire in per C86_pa_client360.py reference when ready)
+S3_ENDPOINT = "https://s3-sg-p1-scc.fg.rbc.com:443"
+S3_BUCKET = "ryu0-s3-sas-migration"
+S3_FOLDERS = {
+    "raw": "s3a://{}/raw".format(S3_BUCKET),
+    "intermediate": "s3a://{}/intermediate".format(S3_BUCKET),
+    "output": "s3a://{}/output".format(S3_BUCKET),
+    "logs": "s3a://{}/logs".format(S3_BUCKET),
+}
+
+
+def s3_path(folder: str, *parts: str) -> str:
+    """TODO: wire into real S3 writes later (see C86_pa_client360.py reference)."""
+    base = S3_FOLDERS.get(folder, folder)
+    return "/".join([base.rstrip("/")] + list(parts))
 
 
 
-# Logging helpers
+# Logging
 
 
 def setup_logging(log_path: Path, log_file_name: str) -> Path:
-    """Configure file + console logging, mirroring SAS proc printto."""
+    """Mirrors SAS `proc printto log=&logfile print=&lstfile new；`."""
     log_path.mkdir(parents=True, exist_ok=True)
     log_file = log_path / log_file_name
 
@@ -75,238 +104,231 @@ def setup_logging(log_path: Path, log_file_name: str) -> Path:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
     )
     logging.info("Logging configured. Log file: %s", log_file)
     return log_file
 
 
 
-# S3 / Spark helpers
+# Teradata connectivity (mirrors C86_pa_client360.py reference)
 
 
-def configure_s3a(spark: SparkSession) -> None:
-    """Wire up S3A filesystem settings on the active SparkSession."""
-    hconf = spark.sparkContext._jsc.hadoopConfiguration()
-    hconf.set("fs.s3a.endpoint",               S3_ENDPOINT)
-    hconf.set("fs.s3a.connection.ssl.enabled", "true")
-    hconf.set("fs.s3a.path.style.access",      "true")
-    hconf.set("fs.s3a.impl",                   "org.apache.hadoop.fs.s3a.S3AFileSystem")
+def get_teradata_connection(conn_file: Path) -> "teradatasql.TeradataConnection":
+    """Open a Teradata connection via LDAP using credentials from JSON.
 
-
-def s3_path(folder: str, *parts: str) -> str:
-    """Build a fully-qualified S3 URI from a folder key and path parts."""
-    base = S3_FOLDERS.get(folder, folder)
-    return "/".join([base.rstrip("/")] + list(parts))
-
-
-def upload_file_to_s3(spark: SparkSession, local_path: str, s3_uri: str) -> None:
-    """Copy a local file to S3 using Hadoop FileSystem API (no boto3 keys needed)."""
-    sc  = spark.sparkContext
-    jvm = sc._jvm
-    conf = sc._jsc.hadoopConfiguration()
-
-    local_fs_path = jvm.org.apache.hadoop.fs.Path(f"file://{os.path.abspath(local_path)}")
-    s3_fs_path    = jvm.org.apache.hadoop.fs.Path(s3_uri)
-    fs = s3_fs_path.getFileSystem(conf)
-    fs.copyFromLocalFile(False, True, local_fs_path, s3_fs_path)
-    logging.info("Uploaded %s -> %s", local_path, s3_uri)
-
-
-def _normalize_column_types(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Coerce mixed column types so that Spark createDataFrame does not choke.
-    Mirrors the SAS implicit type handling before dataset writes.
-    """
-    date_cols   = ("DateCompleted", "SnapDate")
-    string_cols = (
-        "RegulatoryName", "LOB", "ReportName", "ControlRisk",
-        "TestType", "TestPeriod", "ProductType", "RDE",
-        "HoldoutFlag", "CommentCode", "Comments",
-    )
-    numeric_cols = ("Volume", "Amount")
-
-    for col in df.columns:
-        if col in date_cols:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-        elif col.startswith("Segment") or col.startswith("segment") or col in string_cols:
-            df[col] = df[col].fillna("").astype(str)
-        elif col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Catch remaining object columns
-    for col in df.columns:
-        if df[col].dtype == "object":
-            sample = df[col].dropna().head(1)
-            if len(sample) > 0 and isinstance(sample.iloc[0], date):
-                df[col] = pd.to_datetime(df[col], errors="coerce")
-            else:
-                df[col] = df[col].fillna("").astype(str)
-
-    return df
-
-
-def write_parquet_to_s3(spark: SparkSession, df: pd.DataFrame, s3_uri: str) -> None:
-    """Write a pandas DataFrame to S3 as parquet via PySpark."""
-    df = _normalize_column_types(df.copy())
-    sdf = spark.createDataFrame(df)
-    sdf.write.mode("overwrite").parquet(s3_uri)
-    logging.info("Wrote parquet -> %s", s3_uri)
-
-
-def s3_file_exists(spark: SparkSession, s3_uri: str) -> bool:
-    """Check whether an S3 path exists using Hadoop FileSystem API."""
-    sc  = spark.sparkContext
-    jvm = sc._jvm
-    path = jvm.org.apache.hadoop.fs.Path(s3_uri)
-    fs   = path.getFileSystem(sc._jsc.hadoopConfiguration())
-    return fs.exists(path)
-
-
-
-# Teradata connection
-
-
-def get_teradata_connection(conn_file: Path) -> teradatasql.TeradataConnection:
-    """
-    Open a Teradata connection using credentials from a JSON file.
-    Mirrors SAS %connectsql / disconnect from teradata pattern.
+    SAS source: %include "&cdepath/common/security/pswd.sas"; + %connectsql
     """
     if not conn_file.exists():
-        raise FileNotFoundError(f"Teradata connection file not found: {conn_file.resolve()}")
+        logging.error("Connection file not found at: %s", conn_file.resolve())
+        raise FileNotFoundError(
+            "Connection file not found at: {}".format(conn_file.resolve())
+        )
 
-    with open(conn_file, "r", encoding="utf-8") as fh:
-        creds = json.load(fh)
+    with open(conn_file, "r", encoding="utf-8") as f:
+        conn_details = json.load(f)
 
-    host = creds["url"]
-    user = creds["user"]
-    pwd  = creds["password"]
+    url = conn_details.get("url")
+    user = conn_details.get("user")
+    pwd = conn_details.get("password")
 
-    logging.info("Connecting to Teradata host=%s user=%s (LDAP)...", host, user)
+    logging.info("Connecting to Teradata URL: %s with user: %s using LDAP...", url, user)
     try:
-        conn = teradatasql.connect(host=host, user=user, password=pwd, logmech="LDAP")
-        logging.info("Teradata connection established.")
+        conn = teradatasql.connect(host=url, user=user, password=pwd, logmech="LDAP")
+        logging.info("Teradata connection successful.")
         return conn
-    except Exception as exc:
-        logging.error("Teradata connection failed: %s", exc)
+    except Exception as e:
+        logging.error("Failed to connect to Teradata: %s", e)
         raise
 
 
 
-# Date / ini-run logic  (mirrors SAS data _null_ + %ini_check macro)
+# %ini_check macro -> check_ini_run()
 
 
-def _format_sql_date(dt: date) -> str:
-    """Return a SQL-ready quoted date string: '2024-06-01'."""
-    return f"'{dt.strftime('%Y-%m-%d')}'"
+def check_ini_run(outpath: Path, persistent_ac_filename: str) -> Tuple[str, int]:
+    """Replicates the SAS %ini_check macro.
 
+    SAS source:
+        %macro ini_check;
+        %if %sysfunc(fileexist(&outpath/renew_gic_ac.sas7bdat)) %then %do;
+            %let ini_run = 'N';
+            x cp "&outpath/renew_gic_ac.sas7bdat" "&outpath/renew_gic_ac_backup.sas7bdat";
+            proc sql;
+                select &runday - max(SnapDate) into: day_buff
+                from notidata.renew_gic_ac
+                ;
+            quit;
+            %end;
+        %else %do;
+            %let ini_run = 'Y';
+            %let day_buff = 1;
+        %end;
+        %mend;
 
-def check_ini_run(
-    spark: SparkSession,
-    outpath: Path,
-    persistent_ac_file: str,
-) -> Tuple[str, int]:
+    Returns:
+        (ini_run, day_buff) where ini_run is 'Y' or 'N' and day_buff is the
+        integer day gap between today (runday) and the max SnapDate in the
+        existing persistent autocomplete table (or 1 if no prior file).
     """
-    Replicate SAS %ini_check macro.
+    persistent_file = Path(outpath) / persistent_ac_filename
+    backup_file = Path(outpath) / "{}_backup{}".format(
+        persistent_file.stem, persistent_file.suffix
+    )
 
-    Returns
-    -------
-    ini_run : 'Y' (first run) or 'N' (incremental)
-    day_buff : days since last snapshot (used to bound the date window)
-    """
-    local_ac = outpath / persistent_ac_file
-    s3_ac    = s3_path("output", persistent_ac_file)
+    if persistent_file.exists():
+        logging.info("Found existing autocomplete file: %s", persistent_file)
+        ini_run = "N"
+        try:
+            shutil.copy(persistent_file, backup_file)
+            logging.info("Backed up to: %s", backup_file)
+        except Exception as e:
+            logging.warning("Could not create backup of autocomplete file: %s", e)
 
-    exists_locally = local_ac.exists()
-    exists_s3      = s3_file_exists(spark, s3_ac)
-
-    if exists_locally or exists_s3:
-        logging.info("Existing autocomplete file found — incremental run (ini_run='N').")
-
-        # Back up local copy
-        if exists_locally:
-            backup = outpath / f"{local_ac.stem}_backup{local_ac.suffix}"
-            shutil.copy(local_ac, backup)
-            logging.info("Backed up autocomplete file to %s", backup)
-
-        # Calculate day_buff from max(SnapDate) in the existing dataset
-        if exists_locally:
-            ac_df = pd.read_parquet(local_ac)
+        runday = date.today()
+        existing = pd.read_parquet(persistent_file)
+        if "SnapDate" in existing.columns and len(existing) > 0:
+            max_snap = pd.to_datetime(existing["SnapDate"], errors="coerce").max()
+            if pd.isna(max_snap):
+                day_buff = 1
+            else:
+                day_buff = (runday - max_snap.date()).days
         else:
-            ac_df = pd.read_parquet(s3_ac)  # if only on S3
-
-        max_snap = pd.to_datetime(ac_df["SnapDate"], errors="coerce").max()
-        if pd.isna(max_snap):
             day_buff = 1
-        else:
-            day_buff = (date.today() - max_snap.date()).days
-
-        logging.info("day_buff (days since last snap) = %d", day_buff)
-        return "N", day_buff
-
-    logging.info("No autocomplete file found — initial run (ini_run='Y').")
-    return "Y", 1
-
-
-def setup_dates(ini_run: str, day_buff: int) -> Dict[str, str]:
-    """
-    Replicate SAS data _null_ date calculation block.
-
-    Mirrors:
-        week_end  = intnx('week.3', today(), -0) - 3   → last Saturday
-        week_start = week_end - 6                       → last Sunday
-        matdt     = week_end + 36
-        back_dt   = week_start - 20
-        launch_dt = '01JUL2022'd
-    """
-    today       = date.today()
-    launch_dt   = date(2022, 7, 1)
-
-    # week.3 in SAS = week anchored on Tuesday; intnx(..., -0) = current period
-    # The result week_end = that Tuesday - 3 = last Saturday
-    days_since_tuesday = (today.weekday() - 1) % 7   # Monday=0, Tuesday=1
-    this_tuesday  = today - timedelta(days=days_since_tuesday)
-    week_end_dt   = this_tuesday - timedelta(days=3)  # Saturday
-
-    if ini_run == "Y":
-        week_start_dt = launch_dt
     else:
-        runday_dt     = today
-        candidate     = runday_dt - timedelta(days=day_buff)
-        week_start_dt = max(candidate, launch_dt)
+        logging.info("Autocomplete file not found. Setting ini_run = 'Y'.")
+        ini_run = "Y"
+        day_buff = 1
 
-    mat_dt       = week_end_dt  + timedelta(days=36)
-    back_dt      = week_start_dt - timedelta(days=20)
-    me_dt        = (today.replace(day=1) - timedelta(days=1))  # month-end last month
+    logging.info("ini_run=%s, day_buff=%s", ini_run, day_buff)
+    return ini_run, day_buff
 
-    dates = {
-        "wk_start":  _format_sql_date(week_start_dt),
-        "wk_end":    _format_sql_date(week_end_dt),
-        "mat_dt":    _format_sql_date(mat_dt),
-        "back_dt":   _format_sql_date(back_dt),
-        "me_dt":     _format_sql_date(me_dt),
-        "today2":    today.strftime("%Y-%m-%d"),
-        "rundt":     today.strftime("%Y%m%d"),
-        "sasdt2":    week_end_dt.strftime("%Y-%m-%d"),   # used in timeliness filter
-        "week_end_dt": week_end_dt,                      # raw date object for Python logic
+
+
+# data _null_ date setup block -> setup_dates()
+
+
+def _week3_anchor(d: date) -> date:
+    """SAS intnx('week.3', d, -0): most recent Tuesday on/before d.
+
+    SAS WEEK intervals default to starting on Sunday (shift point 1).
+    Shift point 3 moves the interval start to Tuesday (1=Sun, 2=Mon, 3=Tue).
+    With default 'beginning' alignment and increment 0, intnx returns the
+    start (Tuesday) of the WEEK.3 interval containing d.
+    Python date.weekday(): Mon=0 ... Sun=6; Tuesday=1.
+    """
+    delta = (d.weekday() - 1) % 7
+    return d - timedelta(days=delta)
+
+
+def _week7_anchor(d: date, n: int = 0, align: str = "b") -> date:
+    """SAS intnx('week.7', d, n, align): Saturday-anchored week interval.
+
+    Shift point 7 moves the interval start to Saturday (1=Sun,...,7=Sat).
+    align='b' (beginning) -> Saturday start of interval, shifted by n weeks.
+    align='e' (end)       -> Friday end of interval, shifted by n weeks.
+    Python date.weekday(): Saturday=5.
+    """
+    delta = (d.weekday() - 5) % 7
+    start = d - timedelta(days=delta) + timedelta(weeks=n)
+    align = align.lower()
+    if align in ("b", "beginning"):
+        return start
+    if align in ("e", "end"):
+        return start + timedelta(days=6)
+    raise ValueError("Unsupported alignment: {}".format(align))
+
+
+def setup_dates(cfg: Config, ini_run: str, day_buff: int) -> Dict[str, object]:
+    """Replicates the SAS `data _null_;` date-setup block.
+
+    SAS source (key lines):
+        tday2=intnx('day',today(),-0);
+        startday=intnx('day',today(),-10);
+        tday=intnx('week.3',today(),-0);          /* Every Tuesday run */
+        launch_dt='01JUL2022'd;
+        ongoing_start = ifn(&ini_run = 'Y', launch_dt, max(&runday-&day_buff., launch_dt));
+        medate = intnx('month',today(),-1,'E');
+        week_end = tday - 3;                       /* Ends on every Saturday */
+        if &ini_run = 'N' then week_start = week_end - 6;  /* Start on last Sunday */
+        else week_start = ongoing_start;
+        matdt = week_end + 36;
+        back_date_limit = week_start - 20;
+
+    Returns a dict of derived date values (as `date` objects, plus a few
+    pre-formatted strings/SQL literals) matching every SAS macro variable
+    produced by the `call symput(...)` statements.
+    """
+    today = date.today()
+    runday = today
+
+    tday2 = today
+    startday = today - timedelta(days=10)
+    tday = _week3_anchor(today)
+
+    week_end = tday - timedelta(days=3)
+
+    # ongoing_start = ifn(ini_run='Y', launch_dt, max(runday - day_buff, launch_dt))
+    candidate = runday - timedelta(days=day_buff)
+    ongoing_start = cfg.launch_dt if ini_run.upper() == "Y" else max(candidate, cfg.launch_dt)
+
+    # medate = intnx('month', today(), -1, 'E') -> last day of previous month
+    first_of_this_month = today.replace(day=1)
+    last_day_prev_month = first_of_this_month - timedelta(days=1)
+    medate = last_day_prev_month
+
+    if ini_run.upper() == "N":
+        week_start = week_end - timedelta(days=6)
+    else:
+        week_start = ongoing_start
+
+    matdt = week_end + timedelta(days=36)
+    back_date_limit = week_start - timedelta(days=20)
+
+    def sql_date(d: date) -> str:
+        """Format a Python date as a quoted Teradata DATE literal: 'YYYY-MM-DD'."""
+        return "'{}'".format(d.strftime("%Y-%m-%d"))
+
+    dates: Dict[str, object] = {
+        "wk_start": week_start,
+        "wk_end": week_end,
+        "today2": tday2,
+        "me_dt": medate,
+        "rundt": runday.strftime("%Y%m%d"),
+        "str_dt": startday,
+        "mat_dt": matdt,
+        "back_dt": back_date_limit,
+        # SQL literal strings for embedding directly in Teradata SQL text,
+        # preserving the SAS pattern of quoted date literals in the query.
+        "wk_start_sql": sql_date(week_start),
+        "wk_end_sql": sql_date(week_end),
+        "mat_dt_sql": sql_date(matdt),
+        "back_dt_sql": sql_date(back_date_limit),
     }
 
-    for key, val in dates.items():
-        logging.info("Date param  %s = %s", key, val)
+    logging.info("wk_start=%s", dates["wk_start"])
+    logging.info("wk_end=%s", dates["wk_end"])
+    logging.info("today2=%s", dates["today2"])
+    logging.info("me_dt=%s", dates["me_dt"])
+    logging.info("rundt=%s", dates["rundt"])
+    logging.info("str_dt=%s", dates["str_dt"])
+    logging.info("mat_dt=%s", dates["mat_dt"])
+    logging.info("back_dt=%s", dates["back_dt"])
 
     return dates
 
 
 
-# Step 1 — Pull base notification data from Teradata
-# (mirrors: create table rbis_noti_base_init + data rbis_noti_base)
+# Main Teradata pull: rbis_noti_base_init  (SAS: proc sql; create table ... )
 
 
-SQL_BASE = """
-SELECT
+def pull_rbis_noti_base(cfg: Config, dates: Dict[str, object]) -> pd.DataFrame:
+    """Replicates the main `rbis_noti_base_init` Teradata pull.
+
+    SAS SQL preserved verbatim (only &wk_start./&wk_end. are parameterized).
+    """
+    sql = """
+select
     RENW_NOTIF.CLNT_NO,
     RENW_NOTIF.CLNT_AR_OWN_TYP,
     RENW_NOTIF.ACCT_NO,
@@ -331,892 +353,1418 @@ SELECT
     RENW_NOTIF.NOTIF_NO_OF_DYS,
     RENW_NOTIF.NOTIF_DELVRY_PREF,
     RB_CLNT_DLY.BSC,
-    AR_DLY.DT_OPEN                          AS DT_OPEN_mif14,
-    AR_STATIC_DLY.DT_OPEN                  AS DT_OPEN_mif13,
-    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_DAYS AS TRM_DAYS_14,
-    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_YRS  AS TRM_YRS_14,
-    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_YRS  AS DEP_TERM_IN_YRS_13,
-    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_DAYS AS DEP_TERM_IN_DAYS_13
-FROM
-    ddwv01.RENW_NOTIF AS RENW_NOTIF
+    AR_DLY.DT_OPEN as DT_OPEN_mif14,
+    AR_STATIC_DLY.DT_OPEN as DT_OPEN_mif13,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_DAYS    as TRM_DAYS_14,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_YRS     as TRM_YRS_14,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_YRS   as DEP_TERM_IN_YRS_13,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_DAYS  as DEP_TERM_IN_DAYS_13
+from
+    ddwv01.RENW_NOTIF as RENW_NOTIF
 
-    LEFT JOIN ddwv01.RB_CLNT_DLY AS RB_CLNT_DLY
-        ON  RENW_NOTIF.CLNT_NO = RB_CLNT_DLY.CLNT_NO
-        AND RB_CLNT_DLY.SNAP_DT = {wk_end}
+    left join ddwv01.RB_CLNT_DLY as RB_CLNT_DLY
+            on RENW_NOTIF.CLNT_NO = RB_CLNT_DLY.CLNT_NO
+            and RB_CLNT_DLY.SNAP_DT = {wk_end}
 
-    LEFT JOIN ddwv01.AR_DLY AS AR_DLY
-        ON  AR_DLY.AR_ID   = RENW_NOTIF.AR_ID
-        AND AR_DLY.SNAP_DT = {wk_end}
+    left join ddwv01.AR_DLY as AR_DLY
+            on AR_DLY.AR_ID = RENW_NOTIF.AR_ID
+            and AR_DLY.SNAP_DT = {wk_end}
 
-    LEFT JOIN ddwv01.AR_STATIC_DLY AS AR_STATIC_DLY
-        ON  AR_STATIC_DLY.AR_ID   = RENW_NOTIF.AR_ID
-        AND AR_STATIC_DLY.SNAP_DT = {wk_end}
+    left join ddwv01.AR_STATIC_DLY as AR_STATIC_DLY
+            on AR_STATIC_DLY.AR_ID = RENW_NOTIF.AR_ID
+            and AR_STATIC_DLY.SNAP_DT = {wk_end}
 
-    LEFT JOIN ddwv01.TRM_INVSTMT_HLDNG_DLY AS TRM_INVSTMT_HLDNG_DLY
-        ON  RENW_NOTIF.AR_ID = TRM_INVSTMT_HLDNG_DLY.AR_ID
-        AND TRM_INVSTMT_HLDNG_DLY.chg_dt  = '9999-12-31'
-        AND TRM_INVSTMT_HLDNG_DLY.SRVC_ID = 14
-        AND TRM_INVSTMT_HLDNG_DLY.snap_dt = {wk_end}
+    left join ddwv01.TRM_INVSTMT_HLDNG_DLY as TRM_INVSTMT_HLDNG_DLY
+            on RENW_NOTIF.AR_ID = TRM_INVSTMT_HLDNG_DLY.AR_ID
+            and TRM_INVSTMT_HLDNG_DLY.chg_dt = '9999-12-31'
+            and TRM_INVSTMT_HLDNG_DLY.SRVC_ID = 14
+            and TRM_INVSTMT_HLDNG_DLY.snap_dt = {wk_end}
 
-    LEFT JOIN ddwv01.INVSTMT_HLDNG_DLY_DELTA AS INVSTMT_HLDNG_DLY_DELTA
-        ON  RENW_NOTIF.AR_ID = INVSTMT_HLDNG_DLY_DELTA.AR_ID
-        AND INVSTMT_HLDNG_DLY_DELTA.chg_dt  = '9999-12-31'
-        AND INVSTMT_HLDNG_DLY_DELTA.SRVC_ID = 13
+    left join ddwv01.INVSTMT_HLDNG_DLY_DELTA as INVSTMT_HLDNG_DLY_DELTA
+            on RENW_NOTIF.AR_ID = INVSTMT_HLDNG_DLY_DELTA.AR_ID
+            and INVSTMT_HLDNG_DLY_DELTA.chg_dt = '9999-12-31'
+            and INVSTMT_HLDNG_DLY_DELTA.SRVC_ID = 13
 
-WHERE
+where
     RENW_PROD_NOTIF_TYP = 2
-    AND (SEP_DISCLSR_IND IS NULL OR SEP_DISCLSR_IND = 'Y')
-    AND RENW_NOTIF.SNAP_DT BETWEEN {wk_start} AND {wk_end}
-"""
+    and (SEP_DISCLSR_IND is null or SEP_DISCLSR_IND = 'Y')
+    and RENW_NOTIF.SNAP_DT between {wk_start} and {wk_end}
+""".format(wk_start=dates["wk_start_sql"], wk_end=dates["wk_end_sql"])
+
+    logging.info("Executing rbis_noti_base_init Teradata pull...")
+    with get_teradata_connection(cfg.teradata_conn_json) as conn:
+        rbis_noti_base_init = pd.read_sql(sql, conn)
+    logging.info("Loaded %d rows into rbis_noti_base_init.", len(rbis_noti_base_init))
+    return rbis_noti_base_init
 
 
-def pull_base_notifications(conn: teradatasql.TeradataConnection, dates: Dict[str, str]) -> pd.DataFrame:
+def apply_bsc_filter(rbis_noti_base_init: pd.DataFrame) -> pd.DataFrame:
+    """SAS: data rbis_noti_base; set rbis_noti_base_init; if bsc>=600 and bsc<=690;
+
+    Then `proc sort by CLNT_NO AR_ID MTRTY_DT NOTIF_NO_OF_DYS;`
     """
-    Pull raw renewal notification rows from Teradata and apply BSC filter.
-
-    Mirrors:
-        create table rbis_noti_base_init (Teradata pass-through)
-        data rbis_noti_base; if bsc >= 600 and bsc <= 690;
-    """
-    sql = SQL_BASE.format(wk_start=dates["wk_start"], wk_end=dates["wk_end"])
-    logging.info("Pulling base notification data from Teradata...")
-    df = pd.read_sql(sql, conn)
-    logging.info("Loaded %d rows from ddwv01.RENW_NOTIF.", len(df))
-
-    # BSC filter (mirrors: if bsc >= 600 and bsc <= 690)
-    df["BSC"] = pd.to_numeric(df["BSC"], errors="coerce")
+    df = rbis_noti_base_init.copy()
+    df.columns = [c.upper() for c in df.columns]
     df = df[(df["BSC"] >= 600) & (df["BSC"] <= 690)].copy()
-    logging.info("After BSC filter (600-690): %d rows.", len(df))
-
-    # Sort to match PROC SORT
-    df = df.sort_values(["CLNT_NO", "AR_ID", "MTRTY_DT", "NOTIF_NO_OF_DYS"]).reset_index(drop=True)
+    df = df.sort_values(
+        by=["CLNT_NO", "AR_ID", "MTRTY_DT", "NOTIF_NO_OF_DYS"]
+    ).reset_index(drop=True)
+    logging.info("rbis_noti_base after BSC filter (600-690): %d rows", len(df))
     return df
 
 
 
-# Step 2 — Apply pass/fail logic and split into four segment tables
-# (mirrors the DATA step that outputs rbis_noti_compare_reg/nonreg _05/_21)
+# Pass/Fail classification -> rbis_noti_compare01
+# (SAS: data rbis_noti_compare_reg_05 rbis_noti_compare_reg_21
+#            rbis_noti_compare_nonreg_05 rbis_noti_compare_nonreg_21; ...)
 
 
-def _delivery_preference_label(pref: str) -> str:
-    """Mirror SAS format for NOTIF_DELVRY_PREF."""
-    if pref == "E":
-        return "OLB Notification"
-    if pref == "P":
-        return "Mail"
-    return "Other"
+def classify_pass_fail(rbis_noti_base: pd.DataFrame) -> pd.DataFrame:
+    """Replicates the SAS DATA step that:
+      - derives `deliverypreference` from NOTIF_DELVRY_PREF
+      - re-asserts RENW_PROD_NOTIF_TYP = 2 (subsetting IF), drops SEP_DISCLSR_IND='N'
+      - sets RegulatoryName/LOB/ReportName/ProductType literals
+      - computes Total_days = MTRTY_DT - NOTIF_SENT_DT
+      - classifies CommentCode/Comments (COM16 Pass / COM19 Potential Fail)
+        per the 21-day and 5-day SLA windows, split by mail ('P') vs other
+        delivery preference
+      - computes total_term_day from SRVC_ID 14/13 term fields and derives
+        thirty_day_ind
+      - routes rows into 4 logical buckets by RGSTR_NO_RGSTR_IND x NOTIF_NO_OF_DYS
+        (reg_05 / reg_21 / nonreg_05 / nonreg_21), unioned here into one frame
+        with a `_bucket` column for traceability, mirroring the SAS
+        `rbis_noti_compare01` UNION of the 4 output datasets.
 
-
-def _thirty_day_ind(total_term_day: Optional[float]) -> str:
-    """Mirror SAS thirty_day_ind logic."""
-    if total_term_day is None or np.isnan(total_term_day):
-        return "Renewals > 30 days"
-    if total_term_day > 30:
-        return "Renewals > 30 days"
-    if 0 <= total_term_day <= 30:
-        return "Renewals <= 30 days"
-    return "Renewals > 30 days"
-
-
-def _pass_fail(row: pd.Series) -> Tuple[str, str]:
+    NOTE on missing-value parity: SAS missing numeric (.) propagates through
+    comparisons as "unknown" (effectively false in IF conditions) and is LOW
+    in sort order. Pandas NaN comparisons (`>=`, `<=`) also evaluate False,
+    which matches SAS's IF-condition behavior here, so the Pass/Fail branches
+    correctly fall through to 'Potential Fail' when Total_days is NaN (just
+    as SAS would fail the IF test and hit the ELSE).
     """
-    Determine pass/fail based on NOTIF_NO_OF_DYS, NOTIF_DELVRY_PREF, and
-    the difference between maturity date and notification sent date.
+    df = rbis_noti_base.copy()
 
-    Updated thresholds (Jun 2025) include Electronic channel logic:
-        21-day / Mail  : Total_days in [32, 36] → Pass
-        21-day / Other : Total_days in [22, 26] → Pass
-         5-day / Mail  : Total_days in [16, 20] → Pass
-         5-day / Other : Total_days in [ 6, 10] → Pass
-    """
-    days    = row["Total_days"]
-    n_days  = row["NOTIF_NO_OF_DYS"]
-    is_mail = row["NOTIF_DELVRY_PREF"] == "P"
-
-    if n_days == 21:
-        lo, hi = (32, 36) if is_mail else (22, 26)
-    elif n_days == 5:
-        lo, hi = (16, 20) if is_mail else (6, 10)
-    else:
-        return "COM19", "Potential Fail        "
-
-    if lo <= days <= hi:
-        return "COM16", "Pass                  "
-    return "COM19", "Potential Fail        "
-
-
-def apply_business_rules(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply SLA pass/fail logic, derive segment columns, and return the enriched
-    DataFrame.  Mirrors the large DATA step before the four output datasets.
-    """
-    df = df.copy()
-
-    # Delivery preference label
-    df["deliverypreference"] = df["NOTIF_DELVRY_PREF"].apply(_delivery_preference_label)
-
-    # Keep only RENW_PROD_NOTIF_TYP = 2 and drop SEP_DISCLSR_IND = 'N'
-    df = df[df["RENW_PROD_NOTIF_TYP"] == 2].copy()
-    df = df[df["SEP_DISCLSR_IND"] != "N"].copy()
-
-    # Static annotation columns
-    df["RegulatoryName"] = "C86"
-    df["LOB"]            = "PSI"
-    df["ReportName"]     = "C86 Notification Renewals"
-    df["ProductType"]    = "GIC"
-
-    # Date arithmetic (mirrors: Total_days = MTRTY_DT - NOTIF_SENT_DT)
-    df["MTRTY_DT"]       = pd.to_datetime(df["MTRTY_DT"],       errors="coerce")
-    df["NOTIF_SENT_DT"]  = pd.to_datetime(df["NOTIF_SENT_DT"],  errors="coerce")
-    df["Total_days"]     = (df["MTRTY_DT"] - df["NOTIF_SENT_DT"]).dt.days
-
-    # Pass/fail codes
-    pf = df.apply(_pass_fail, axis=1, result_type="expand")
-    pf.columns = ["CommentCode", "Comments"]
-    df = pd.concat([df.reset_index(drop=True), pf.reset_index(drop=True)], axis=1)
-
-    # Total term day (mirrors: if SRVC_ID=14 … else if SRVC_ID=13)
-    df["TRM_YRS_14"]           = pd.to_numeric(df["TRM_YRS_14"],           errors="coerce")
-    df["TRM_DAYS_14"]          = pd.to_numeric(df["TRM_DAYS_14"],          errors="coerce")
-    df["DEP_TERM_IN_YRS_13"]   = pd.to_numeric(df["DEP_TERM_IN_YRS_13"],   errors="coerce")
-    df["DEP_TERM_IN_DAYS_13"]  = pd.to_numeric(df["DEP_TERM_IN_DAYS_13"],  errors="coerce")
-
-    cond14 = df["SRVC_ID"] == 14
-    cond13 = df["SRVC_ID"] == 13
-    df["total_term_day"] = np.where(
-        cond14,
-        df["TRM_YRS_14"] * 365 + df["TRM_DAYS_14"],
-        np.where(
-            cond13,
-            df["DEP_TERM_IN_YRS_13"] * 365 + df["DEP_TERM_IN_DAYS_13"],
-            np.nan,
-        ),
+    df["DELIVERYPREFERENCE"] = np.select(
+        [df["NOTIF_DELVRY_PREF"] == "E", df["NOTIF_DELVRY_PREF"] == "P"],
+        ["OLB Notification", "Mail"],
+        default="Other",
     )
 
-    df["thirty_day_ind"] = df["total_term_day"].apply(_thirty_day_ind)
+    # if RENW_PROD_NOTIF_TYP = 2; (subsetting IF -- redundant given upstream
+    # WHERE filter, but preserved verbatim for fidelity)
+    df = df[df["RENW_PROD_NOTIF_TYP"] == 2].copy()
+    # if SEP_DISCLSR_IND = 'N' then delete;
+    df = df[df["SEP_DISCLSR_IND"] != "N"].copy()
 
-    return df
+    df["REGULATORYNAME"] = "C86"
+    df["LOB"] = "PSI"
+    df["REPORTNAME"] = "C86 Notification Renewals"
+    df["PRODUCTTYPE"] = "GIC"
+
+    mtrty = pd.to_datetime(df["MTRTY_DT"], errors="coerce")
+    sent = pd.to_datetime(df["NOTIF_SENT_DT"], errors="coerce")
+    df["TOTAL_DAYS"] = (mtrty - sent).dt.days
+
+    comment_code = pd.Series(np.nan, index=df.index, dtype=object)
+    comments = pd.Series(np.nan, index=df.index, dtype=object)
+
+    is_mail = df["NOTIF_DELVRY_PREF"] == "P"
+    is_not_mail = df["NOTIF_DELVRY_PREF"] != "P"
+    days21 = df["NOTIF_NO_OF_DYS"] == 21
+    days5 = df["NOTIF_NO_OF_DYS"] == 5
+    td = df["TOTAL_DAYS"]
+
+    # 21-day, mail: pass if 32-36 days
+    m = days21 & is_mail
+    pass_21_mail = m & (td >= 32) & (td <= 36)
+    comment_code = comment_code.mask(m & pass_21_mail, "COM16")
+    comments = comments.mask(m & pass_21_mail, "Pass                  ")
+    comment_code = comment_code.mask(m & ~pass_21_mail, "COM19")
+    comments = comments.mask(m & ~pass_21_mail, "Potential Fail        ")
+
+    # 21-day, non-mail: pass if 22-26 days
+    m = days21 & is_not_mail
+    pass_21_nonmail = m & (td >= 22) & (td <= 26)
+    comment_code = comment_code.mask(m & pass_21_nonmail, "COM16")
+    comments = comments.mask(m & pass_21_nonmail, "Pass                  ")
+    comment_code = comment_code.mask(m & ~pass_21_nonmail, "COM19")
+    comments = comments.mask(m & ~pass_21_nonmail, "Potential Fail        ")
+
+    # 5-day, mail: pass if 16-20 days
+    m = days5 & is_mail
+    pass_5_mail = m & (td >= 16) & (td <= 20)
+    comment_code = comment_code.mask(m & pass_5_mail, "COM16")
+    comments = comments.mask(m & pass_5_mail, "Pass                  ")
+    comment_code = comment_code.mask(m & ~pass_5_mail, "COM19")
+    comments = comments.mask(m & ~pass_5_mail, "Potential Fail        ")
+
+    # 5-day, non-mail: pass if 6-10 days
+    m = days5 & is_not_mail
+    pass_5_nonmail = m & (td >= 6) & (td <= 10)
+    comment_code = comment_code.mask(m & pass_5_nonmail, "COM16")
+    comments = comments.mask(m & pass_5_nonmail, "Pass                  ")
+    comment_code = comment_code.mask(m & ~pass_5_nonmail, "COM19")
+    comments = comments.mask(m & ~pass_5_nonmail, "Potential Fail        ")
+
+    df["COMMENTCODE"] = comment_code
+    df["COMMENTS"] = comments
+
+    # total_term_day from SRVC_ID 14 or 13 term fields
+    # SAS: if SRVC_ID = 14 then total_term_day = TRM_YRS_14*365 + TRM_DAYS_14;
+    #      else if SRVC_ID = 13 then total_term_day = DEP_TERM_IN_YRS_13*365 + DEP_TERM_IN_DAYS_13;
+    # Strict IF / ELSE IF -- SRVC_ID values other than 13/14 leave total_term_day missing.
+    total_term_day = pd.Series(np.nan, index=df.index, dtype=float)
+    srvc14 = df["SRVC_ID"] == 14
+    srvc13_not14 = (df["SRVC_ID"] == 13) & ~srvc14
+    total_term_day = total_term_day.mask(
+        srvc14, df["TRM_YRS_14"].astype(float) * 365 + df["TRM_DAYS_14"].astype(float)
+    )
+    total_term_day = total_term_day.mask(
+        srvc13_not14,
+        df["DEP_TERM_IN_YRS_13"].astype(float) * 365 + df["DEP_TERM_IN_DAYS_13"].astype(float),
+    )
+    df["TOTAL_TERM_DAY"] = total_term_day
+
+    thirty_day_ind = pd.Series(np.nan, index=df.index, dtype=object)
+    thirty_day_ind = thirty_day_ind.mask(df["TOTAL_TERM_DAY"] > 30, "Renewals > 30 days")
+    thirty_day_ind = thirty_day_ind.mask(
+        (df["TOTAL_TERM_DAY"] <= 30) & (df["TOTAL_TERM_DAY"] >= 0), "Renewals <= 30 days"
+    )
+    thirty_day_ind = thirty_day_ind.mask(df["TOTAL_TERM_DAY"].isna(), "Renewals > 30 days")
+    df["THIRTY_DAY_IND"] = thirty_day_ind
+
+    # Output routing (4 buckets), preserved for traceability / parity checks
+    conditions = [
+        (df["RGSTR_NO_RGSTR_IND"] == "R") & (df["NOTIF_NO_OF_DYS"] == 5),
+        (df["RGSTR_NO_RGSTR_IND"] == "R") & (df["NOTIF_NO_OF_DYS"] == 21),
+        (df["RGSTR_NO_RGSTR_IND"] == "N") & (df["NOTIF_NO_OF_DYS"] == 5),
+        (df["RGSTR_NO_RGSTR_IND"] == "N") & (df["NOTIF_NO_OF_DYS"] == 21),
+    ]
+    choices = ["reg_05", "reg_21", "nonreg_05", "nonreg_21"]
+    df["_BUCKET"] = np.select(conditions, choices, default=None)
+
+    # rows not matching any of the 4 ELSE IF branches are NOT output in SAS
+    # (no final ELSE clause) -- drop them here to match.
+    rbis_noti_compare01 = df[df["_BUCKET"].notna()].copy()
+    logging.info(
+        "rbis_noti_compare01 (4 buckets unioned): %d rows", len(rbis_noti_compare01)
+    )
+    return rbis_noti_compare01
 
 
-def split_segments(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+
+# %find_fails macro -> find_fails()
+
+
+def _pull_mif14(
+    cfg: Config,
+    dates: Dict[str, object],
+    ar_id_list: List[str],
+    clnt_no_list: List[str],
+) -> pd.DataFrame:
+    """SAS: create table mif_14 as select * from connection to teradata (...)
+
+    SQL preserved verbatim from source; only the date literals and the two
+    IN-lists (&gic_notif_list14., &gic_notif_list_clnt14.) are parameterized.
     """
-    Split the enriched base table into four segment DataFrames.
-    Mirrors the four output statements in the SAS DATA step:
-        rbis_noti_compare_reg_05 / _21
-        rbis_noti_compare_nonreg_05 / _21
-    """
-    masks = {
-        "reg_05":    (df["RGSTR_NO_RGSTR_IND"] == "R") & (df["NOTIF_NO_OF_DYS"] == 5),
-        "reg_21":    (df["RGSTR_NO_RGSTR_IND"] == "R") & (df["NOTIF_NO_OF_DYS"] == 21),
-        "nonreg_05": (df["RGSTR_NO_RGSTR_IND"] == "N") & (df["NOTIF_NO_OF_DYS"] == 5),
-        "nonreg_21": (df["RGSTR_NO_RGSTR_IND"] == "N") & (df["NOTIF_NO_OF_DYS"] == 21),
-    }
-    segments: Dict[str, pd.DataFrame] = {key: df[mask].copy() for key, mask in masks.items()}
-    for key, seg in segments.items():
-        logging.info("Segment %s: %d rows.", key, len(seg))
-    return segments
+    ar_ids_sql = ",".join("'{}'".format(x) for x in ar_id_list)
+    clnt_nos_sql = ",".join(str(x) for x in clnt_no_list)
 
-
-
-# Step 3 — Find fails and enrich with MIF / plan preference data
-# (mirrors the %find_fails macro)
-
-
-SQL_MIF14 = """
-SELECT DISTINCT
+    sql = """
+select distinct
     AR_DLY.AR_ID,
     CLNT_AR_RELTN_DLY.CLNT_NO,
     AR_DLY.SNAP_DT,
-    AR_DLY.MTRTY_EXPRY_DT                  AS mtrty_dt,
-    AR_DLY.SRVC_ID,
+    AR_DLY.MTRTY_EXPRY_DT as mtrty_dt,
+    AR_DLY.SRVC_ID ,
     AR_DLY.DT_CLS,
     AR_DLY.DT_OPEN,
-    AR_DLY.OPEN_CLS_STS,
-    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_DAYS AS TRM_DAYS_14,
-    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_YRS  AS TRM_YRS_14,
+    AR_DLY.OPEN_CLS_STS ,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_DAYS    as TRM_DAYS_14,
+    TRM_INVSTMT_HLDNG_DLY.DEP_TERM_IN_YRS     as TRM_YRS_14,
     RB_CLNT_DLY.BSC,
     INVSTMT_HLDNG_DLY.PLN_NO,
-    CAST(INVSTMT_HLDNG_DLY.PLN_NO AS CHAR(9)) AS plan_number
-FROM
-    ddwv01.AR_DLY,
+    CAST(INVSTMT_HLDNG_DLY.PLN_NO as char(9)) as plan_number
+
+from
+    ddwv01.AR_DLY ,
     ddwv01.INVSTMT_HLDNG_DLY,
     ddwv01.CLNT_AR_RELTN_DLY
-    LEFT JOIN ddwv01.TRM_INVSTMT_HLDNG_DLY AS TRM_INVSTMT_HLDNG_DLY
-        ON  CLNT_AR_RELTN_DLY.AR_ID   = TRM_INVSTMT_HLDNG_DLY.AR_ID
-        AND TRM_INVSTMT_HLDNG_DLY.chg_dt  = '9999-12-31'
-        AND TRM_INVSTMT_HLDNG_DLY.SRVC_ID = 14
-    LEFT JOIN ddwv01.RB_CLNT_DLY AS RB_CLNT_DLY
-        ON  CLNT_AR_RELTN_DLY.CLNT_NO  = RB_CLNT_DLY.CLNT_NO
-        AND CLNT_AR_RELTN_DLY.SNAP_DT  = RB_CLNT_DLY.SNAP_DT
-WHERE
-    AR_DLY.SNAP_DT           = {wk_end}
-    AND CLNT_AR_RELTN_DLY.SNAP_DT = {wk_end}
-    AND INVSTMT_HLDNG_DLY.SNAP_DT = {wk_end}
-    AND AR_DLY.MTRTY_EXPRY_DT BETWEEN {wk_start} AND {mat_dt}
-    AND AR_DLY.AR_ID          IN ({ar_list})
-    AND CLNT_AR_RELTN_DLY.CLNT_NO IN ({clnt_list})
-    AND AR_DLY.OPEN_CLS_STS  <> 'C'
-    AND AR_DLY.AR_ID          = CLNT_AR_RELTN_DLY.AR_ID
-    AND AR_DLY.SRVC_ID        = CLNT_AR_RELTN_DLY.DW_SRVC_ID
-    AND AR_DLY.SNAP_DT        = CLNT_AR_RELTN_DLY.SNAP_DT
-    AND INVSTMT_HLDNG_DLY.AR_ID   = CLNT_AR_RELTN_DLY.AR_ID
-    AND INVSTMT_HLDNG_DLY.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
-ORDER BY 1, 2, 3, 4
-"""
+    left join ddwv01.TRM_INVSTMT_HLDNG_DLY as TRM_INVSTMT_HLDNG_DLY
+            on CLNT_AR_RELTN_DLY.AR_ID = TRM_INVSTMT_HLDNG_DLY.AR_ID
+            and TRM_INVSTMT_HLDNG_DLY.chg_dt = '9999-12-31'
+            and TRM_INVSTMT_HLDNG_DLY.SRVC_ID = 14
 
-SQL_MIF13 = """
-SELECT DISTINCT
+        left join ddwv01.RB_CLNT_DLY as RB_CLNT_DLY
+            on CLNT_AR_RELTN_DLY.CLNT_NO = RB_CLNT_DLY.CLNT_NO
+            and CLNT_AR_RELTN_DLY.SNAP_DT = RB_CLNT_DLY.SNAP_DT
+where
+    AR_DLY.SNAP_DT = {wk_end}
+    and CLNT_AR_RELTN_DLY.SNAP_DT = {wk_end}
+    and INVSTMT_HLDNG_DLY.SNAP_DT = {wk_end}
+    and AR_DLY.MTRTY_EXPRY_DT between {wk_start} and {mat_dt}
+    and AR_DLY.AR_ID in ({ar_ids})
+    and CLNT_AR_RELTN_DLY.CLNT_NO in ({clnt_nos})
+
+    and AR_DLY.OPEN_CLS_STS ne 'C'
+    and AR_DLY.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and AR_DLY.SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
+    and AR_DLY.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
+    and INVSTMT_HLDNG_DLY.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and INVSTMT_HLDNG_DLY.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
+order by
+    1,2,3,4
+""".format(
+        wk_end=dates["wk_end_sql"],
+        wk_start=dates["wk_start_sql"],
+        mat_dt=dates["mat_dt_sql"],
+        ar_ids=ar_ids_sql,
+        clnt_nos=clnt_nos_sql,
+    )
+
+    with get_teradata_connection(cfg.teradata_conn_json) as conn:
+        mif_14 = pd.read_sql(sql, conn)
+    mif_14.columns = [c.upper() for c in mif_14.columns]
+    logging.info("Loaded %d rows into mif_14.", len(mif_14))
+    return mif_14
+
+
+def _pull_arngmnt_option(
+    cfg: Config, plan_numbers: List[str], order_alias: str = "all_plans"
+) -> pd.DataFrame:
+    """SAS: create table all_plans14a / all_plans13a as select * from connection to teradata(...)
+
+    Both SAS blocks (14 and 13) use an identical query shape against
+    ARNGMNT_OPTION, differing only by the plan-number IN-list. Implemented
+    once here and reused for both srvc_id branches to avoid duplicating SQL
+    text; the logic is byte-identical to both SAS blocks.
+    """
+    plans_sql = ",".join("'{}'".format(x) for x in plan_numbers)
+
+    sql = """
+select distinct
+    ARNGMNT_OPTION.MIF_SRVC_ID,
+    ARNGMNT_OPTION.CHOICE_CD_VAL_ID,
+    ARNGMNT_OPTION.CHANGE_TMSTMP as PREF_CHANGE_TMSTMP,
+    ARNGMNT_OPTION.DW_SRVC_ID as pln_DW_SRVC_ID,
+    ARNGMNT_OPTION.PREF_ID ,
+    right(ARNGMNT_OPTION.AR_ID,9) as plan_number
+from
+    ddwv01.ARNGMNT_OPTION
+where right(ARNGMNT_OPTION.AR_ID,9) in ({plans})
+    and
+    ARNGMNT_OPTION.PREF_ID in (13001,13004)
+    and ARNGMNT_OPTION.DW_SRVC_ID in (10,99)
+order by
+    6
+""".format(plans=plans_sql)
+
+    with get_teradata_connection(cfg.teradata_conn_json) as conn:
+        all_plans_a = pd.read_sql(sql, conn)
+    all_plans_a.columns = [c.upper() for c in all_plans_a.columns]
+    logging.info("Loaded %d rows into %s.", len(all_plans_a), order_alias)
+    return all_plans_a
+
+
+def _clean_arngmnt_option(all_plans_a: pd.DataFrame) -> pd.DataFrame:
+    """SAS:
+        data all_plans14; set all_plans14a; if choice_cd_val_id in (17001,17002) then delete; run;
+        proc sort data=all_plans14; by plan_number descending PREF_CHANGE_TMSTMP; run;
+        proc sort data=all_plans14 nodupkey; by plan_number; run;   /* latest change only */
+    """
+    df = all_plans_a[~all_plans_a["CHOICE_CD_VAL_ID"].isin([17001, 17002])].copy()
+    df = df.sort_values(
+        by=["PLAN_NUMBER", "PREF_CHANGE_TMSTMP"], ascending=[True, False]
+    )
+    df = df.drop_duplicates(subset=["PLAN_NUMBER"], keep="first").reset_index(drop=True)
+    return df
+
+
+def _pull_mif13(
+    cfg: Config,
+    dates: Dict[str, object],
+    ar_id_list: List[str],
+    clnt_no_list: List[str],
+) -> pd.DataFrame:
+    """SAS: create table mif_13 as select * from connection to teradata (...)"""
+    ar_ids_sql = ",".join("'{}'".format(x) for x in ar_id_list)
+    clnt_nos_sql = ",".join(str(x) for x in clnt_no_list)
+
+    sql = """
+select distinct
+
     RBI_INVST_GIC_DLY_S.AR_ID,
     CLNT_AR_RELTN_DLY.CLNT_NO,
     RBI_INVST_GIC_DLY_S.SNAP_DT,
     RBI_INVST_GIC_DLY_S.SRVC_ID,
-    RBI_INVST_GIC_DLY_S.MTRTY_DT,
+    RBI_INVST_GIC_DLY_S.MTRTY_DT ,
     RBI_INVST_GIC_DLY_S.STS_CD,
-    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_YRS  AS DEP_TERM_IN_YRS_13,
-    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_DAYS AS DEP_TERM_IN_DAYS_13,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_YRS    as DEP_TERM_IN_YRS_13,
+    INVSTMT_HLDNG_DLY_DELTA.DEP_TERM_IN_DAYS   as DEP_TERM_IN_DAYS_13,
     RB_CLNT_DLY.BSC,
     FUND_HOLDING_TXN.PLN_NO,
-    CAST(FUND_HOLDING_TXN.PLN_NO AS CHAR(9))  AS plan_number
-FROM
-    ddwv01.RBI_INVST_GIC_DLY_S,
-    ddwv01.FUND_HOLDING_TXN,
+    CAST(FUND_HOLDING_TXN.PLN_NO as char(9))   as plan_number
+from
+    ddwv01.RBI_INVST_GIC_DLY_S ,
+    ddwv01.FUND_HOLDING_TXN ,
     ddwv01.CLNT_AR_RELTN_DLY
-    LEFT JOIN ddwv01.INVSTMT_HLDNG_DLY_DELTA AS INVSTMT_HLDNG_DLY_DELTA
-        ON  CLNT_AR_RELTN_DLY.AR_ID = INVSTMT_HLDNG_DLY_DELTA.AR_ID
-        AND INVSTMT_HLDNG_DLY_DELTA.chg_dt  = '9999-12-31'
-        AND INVSTMT_HLDNG_DLY_DELTA.SRVC_ID = 13
-    LEFT JOIN ddwv01.RB_CLNT_DLY AS RB_CLNT_DLY
-        ON  CLNT_AR_RELTN_DLY.CLNT_NO  = RB_CLNT_DLY.CLNT_NO
-        AND CLNT_AR_RELTN_DLY.SNAP_DT  = RB_CLNT_DLY.SNAP_DT
-WHERE
-    RBI_INVST_GIC_DLY_S.SNAP_DT     = {wk_end}
-    AND CLNT_AR_RELTN_DLY.SNAP_DT   = {wk_end}
-    AND RBI_INVST_GIC_DLY_S.MTRTY_DT BETWEEN {wk_start} AND {mat_dt}
-    AND RBI_INVST_GIC_DLY_S.STS_CD  <> 'T'
-    AND RBI_INVST_GIC_DLY_S.AR_ID   IN ({ar_list})
-    AND CLNT_AR_RELTN_DLY.CLNT_NO   IN ({clnt_list})
-    AND RBI_INVST_GIC_DLY_S.AR_ID   = CLNT_AR_RELTN_DLY.AR_ID
-    AND RBI_INVST_GIC_DLY_S.SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
-    AND RBI_INVST_GIC_DLY_S.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
-    AND FUND_HOLDING_TXN.AR_ID      = CLNT_AR_RELTN_DLY.AR_ID
-    AND FUND_HOLDING_TXN.DW_SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
-ORDER BY 1, 2, 3, 5
-"""
 
-SQL_ARNGMNT_OPTION = """
-SELECT DISTINCT
-    ARNGMNT_OPTION.MIF_SRVC_ID,
-    ARNGMNT_OPTION.CHOICE_CD_VAL_ID,
-    ARNGMNT_OPTION.CHANGE_TMSTMP             AS PREF_CHANGE_TMSTMP,
-    ARNGMNT_OPTION.DW_SRVC_ID               AS pln_DW_SRVC_ID,
-    ARNGMNT_OPTION.PREF_ID,
-    RIGHT(ARNGMNT_OPTION.AR_ID, 9)          AS plan_number
-FROM
-    ddwv01.ARNGMNT_OPTION
-WHERE
-    RIGHT(ARNGMNT_OPTION.AR_ID, 9) IN ({plan_list})
-    AND ARNGMNT_OPTION.PREF_ID    IN (13001, 13004)
-    AND ARNGMNT_OPTION.DW_SRVC_ID IN (10, 99)
-ORDER BY 6
-"""
+    left join ddwv01.INVSTMT_HLDNG_DLY_DELTA as INVSTMT_HLDNG_DLY_DELTA
+            on CLNT_AR_RELTN_DLY.AR_ID = INVSTMT_HLDNG_DLY_DELTA.AR_ID
+            and INVSTMT_HLDNG_DLY_DELTA.chg_dt = '9999-12-31'
+            and INVSTMT_HLDNG_DLY_DELTA.SRVC_ID = 13
+    left join ddwv01.RB_CLNT_DLY as RB_CLNT_DLY
+            on CLNT_AR_RELTN_DLY.CLNT_NO = RB_CLNT_DLY.CLNT_NO
+            and CLNT_AR_RELTN_DLY.SNAP_DT = RB_CLNT_DLY.SNAP_DT
+where
+    RBI_INVST_GIC_DLY_S.SNAP_DT = {wk_end}
+    and CLNT_AR_RELTN_DLY.SNAP_DT = {wk_end}
+    and RBI_INVST_GIC_DLY_S.MTRTY_DT between {wk_start} and {mat_dt}
+    and RBI_INVST_GIC_DLY_S.STS_CD ne 'T'
+    and RBI_INVST_GIC_DLY_S.AR_ID in ({ar_ids})
+    and CLNT_AR_RELTN_DLY.CLNT_NO in ({clnt_nos})
 
-SQL_BACKDATE = """
-SELECT DISTINCT
-    CLNT_AR_RELTN_DLY.AR_ID,
-    MIN(CLNT_AR_RELTN_DLY.SNAP_DT) AS backdate_check
-FROM
-    ddwv01.CLNT_AR_RELTN_DLY
-WHERE
-    AR_ID IN ({ar_list})
-    AND CLNT_AR_RELTN_DLY.SNAP_DT > {back_dt}
-GROUP BY 1
-ORDER BY 1
-"""
+    and RBI_INVST_GIC_DLY_S.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and RBI_INVST_GIC_DLY_S.SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
+    and RBI_INVST_GIC_DLY_S.SNAP_DT = CLNT_AR_RELTN_DLY.SNAP_DT
+    and FUND_HOLDING_TXN.AR_ID = CLNT_AR_RELTN_DLY.AR_ID
+    and FUND_HOLDING_TXN.DW_SRVC_ID = CLNT_AR_RELTN_DLY.DW_SRVC_ID
+order by
+    1,2,3,5
+""".format(
+        wk_end=dates["wk_end_sql"],
+        wk_start=dates["wk_start_sql"],
+        mat_dt=dates["mat_dt_sql"],
+        ar_ids=ar_ids_sql,
+        clnt_nos=clnt_nos_sql,
+    )
+
+    with get_teradata_connection(cfg.teradata_conn_json) as conn:
+        mif_13 = pd.read_sql(sql, conn)
+    mif_13.columns = [c.upper() for c in mif_13.columns]
+
+    # SAS: data mif_13; set mif_13;
+    #      if length(plan_number) = 8 then plan_number = "0" || plan_number;
+    # (left-pad plan_number to 9 chars when it came back as 8)
+    def _pad(x: object) -> object:
+        if pd.isna(x):
+            return x
+        s = str(x)
+        if len(s) == 8:
+            return "0" + s
+        return s
+
+    mif_13["PLAN_NUMBER"] = mif_13["PLAN_NUMBER"].apply(_pad)
+    logging.info("Loaded %d rows into mif_13.", len(mif_13))
+    return mif_13
 
 
-def _quoted_list(values: pd.Series, quote: bool = True) -> str:
-    """Build a SQL IN-list string from a Series."""
-    unique = values.dropna().unique()
-    if quote:
-        return ", ".join(f"'{v}'" for v in unique)
-    return ", ".join(str(v) for v in unique)
-
-
-def _fetch_plan_preferences(
-    conn: teradatasql.TeradataConnection,
-    plan_list_sql: str,
+def _pull_backdated(
+    cfg: Config, dates: Dict[str, object], ar_id_list: List[str]
 ) -> pd.DataFrame:
-    """
-    Query ARNGMNT_OPTION for delivery preferences and return the latest
-    preference per plan_number.
-    Mirrors the repeated all_plans14 / all_plans13 pattern.
-    """
-    sql  = SQL_ARNGMNT_OPTION.format(plan_list=plan_list_sql)
-    df   = pd.read_sql(sql, conn)
+    """SAS: create table backdated as select * from connection to teradata(...)
 
-    # Drop choice_cd_val_id in (17001, 17002)  →  exclude certain preference codes
-    df = df[~df["CHOICE_CD_VAL_ID"].isin([17001, 17002])].copy()
+    Finds, per AR_ID, the earliest CLNT_AR_RELTN_DLY snapshot date AFTER
+    back_date_limit -- used to detect backdated arrangement IDs.
+    """
+    ar_ids_sql = ",".join("'{}'".format(x) for x in ar_id_list)
+    sql = """
+select distinct
 
-    # Keep only latest preference per plan (mirrors PROC SORT nodupkey)
-    df["PREF_CHANGE_TMSTMP"] = pd.to_datetime(df["PREF_CHANGE_TMSTMP"], errors="coerce")
-    df = (
-        df.sort_values(["plan_number", "PREF_CHANGE_TMSTMP"], ascending=[True, False])
-          .drop_duplicates(subset=["plan_number"])
-          .reset_index(drop=True)
+    CLNT_AR_RELTN_DLY.AR_ID,
+    min(CLNT_AR_RELTN_DLY.SNAP_DT) as backdate_check
+
+from
+
+    ddwv01.CLNT_AR_RELTN_DLY
+where
+    AR_ID in ({ar_ids})
+    and CLNT_AR_RELTN_DLY.SNAP_DT > {back_dt}
+group by 1
+order by 1
+""".format(ar_ids=ar_ids_sql, back_dt=dates["back_dt_sql"])
+
+    with get_teradata_connection(cfg.teradata_conn_json) as conn:
+        backdated = pd.read_sql(sql, conn)
+    backdated.columns = [c.upper() for c in backdated.columns]
+    logging.info("Loaded %d rows into backdated.", len(backdated))
+    return backdated
+
+
+def find_fails(
+    cfg: Config,
+    dates: Dict[str, object],
+    rbis_noti_compare01: pd.DataFrame,
+) -> pd.DataFrame:
+    """Replicates the %find_fails SAS macro end-to-end.
+
+    Produces rbis_noti_compare_fails_final, the detail frame with `fail_reason`
+    populated for genuine SLA-timeliness failures (after excluding rows whose
+    "Potential Fail" was actually explainable by term-length, a late
+    preference change, or a backdated arrangement).
+
+    *** PARITY RISK -- FLAGGED, NOT SILENTLY RESOLVED ***
+    The SAS source uses `MERGE ... BY ar_id clnt_no;` to join
+    rbis_noti_compare_fails against mif_14_pref / mif_13_pref. SAS's
+    match-merge for a BY-group containing duplicate keys on the "lookup"
+    side does a sequential 1st-with-1st, 2nd-with-2nd pairing -- it is NOT
+    a cartesian fan-out the way `pd.merge(how="left")` is. mif_14 / mif_13
+    are pulled via `select distinct` over many columns without aggregating
+    down to one row per (ar_id, clnt_no), so duplicate (ar_id, clnt_no)
+    pairs in mif_14_pref / mif_13_pref are plausible (e.g. an AR_ID tied to
+    multiple INVSTMT_HLDNG_DLY/PLN_NO rows). If that occurs in practice,
+    `pd.merge` here WILL fan out rows where SAS's positional MERGE would
+    not, breaking row-count parity.
+    Action required before sign-off: confirm with the SAS author / via a
+    parallel run whether (ar_id, clnt_no) is unique in mif_14/mif_13 for the
+    real data. If duplicates are confirmed possible, this needs a
+    positional-pairing reimplementation (e.g. groupby + cumcount-aligned
+    merge) rather than a plain pandas merge. Implemented as a left-merge
+    for now since that is the closest direct analogue and matches SAS
+    exactly when keys are unique on the lookup side -- but this is an
+    explicit fidelity gap, not a verified-safe shortcut.
+    """
+    rbis_noti_compare_fails = rbis_noti_compare01[
+        rbis_noti_compare01["COMMENTCODE"] == "COM19"
+    ].copy()
+    logging.info("rbis_noti_compare_fails: %d rows", len(rbis_noti_compare_fails))
+
+    fails_13 = rbis_noti_compare_fails[rbis_noti_compare_fails["SRVC_ID"] == 13]
+    fails_14 = rbis_noti_compare_fails[rbis_noti_compare_fails["SRVC_ID"] == 14]
+
+    size13 = fails_13["AR_ID"].count()
+    size14 = fails_14["AR_ID"].count()
+    logging.info("size13=%s size14=%s", size13, size14)
+
+    # ---- SRVC_ID = 14 branch ----
+    # *** FIDELITY FIX ***
+    # SAS runs the `create table mif_14 as select * from connection to
+    # teradata(...)` pull UNCONDITIONALLY -- only the downstream
+    # ARNGMNT_OPTION pull (all_plans14a) is gated behind `%if &mif14.>0`.
+    # An earlier draft of this conversion incorrectly gated the mif_14 pull
+    # itself behind `size14 > 0`, which is a silent behavioral deviation
+    # from the source and was not disclosed. Restored to unconditional here.
+    #
+    # NOTE: when size14 == 0, &gic_notif_list14. / &gic_notif_list_clnt14.
+    # are never populated in the SAS source (the %if block that builds them
+    # is skipped), so the generated SQL would contain literal empty
+    # `IN ()` clauses -- this is a latent bug/edge case in the SAS script
+    # itself (behavior would depend on how Teradata's SQL parser handles
+    # `IN ()`; some dialects raise a syntax error, others treat it as
+    # always-false). Rather than silently "fixing" this by skipping the
+    # pull (the prior behavior) or guessing at Teradata's actual response,
+    # we replicate the unconditional call but guard the Python-side IN-list
+    # construction explicitly and log a loud warning so this edge case is
+    # visible to whoever reviews a real run where size14 == 0, instead of
+    # being silently papered over in either direction.
+    ar_list14 = fails_14["AR_ID"].tolist()
+    clnt_list14 = fails_14["CLNT_NO"].tolist()
+    if size14 == 0:
+        logging.warning(
+            "size14=0: SAS source runs the mif_14 Teradata pull unconditionally "
+            "with EMPTY &gic_notif_list14./&gic_notif_list_clnt14. macro "
+            "variables in this case (a latent edge case in the SAS script, "
+            "not something this script invented). Calling _pull_mif14 with "
+            "empty ID lists to match; verify Teradata's behavior on IN () "
+            "matches expectations, or confirm with the SAS author whether "
+            "this path has ever actually been exercised in production."
+        )
+    mif_14 = _pull_mif14(cfg, dates, ar_list14, clnt_list14)
+    mif14_count = mif_14["PLAN_NUMBER"].count()
+    logging.info("mif14=%s", mif14_count)
+
+    if mif14_count > 0:
+        plan_list14 = mif_14["PLAN_NUMBER"].dropna().tolist()
+        all_plans14a = _pull_arngmnt_option(cfg, plan_list14, "all_plans14a")
+        all_plans14 = _clean_arngmnt_option(all_plans14a)
+
+        mif_14_sorted = mif_14.sort_values(by=["PLAN_NUMBER"])
+        mif_14_pref = pd.merge(
+            all_plans14, mif_14_sorted, on="PLAN_NUMBER", how="outer"
+        )
+        mif_14_pref = mif_14_pref.sort_values(by=["AR_ID", "CLNT_NO"])
+
+        fails_sorted = rbis_noti_compare_fails.sort_values(by=["AR_ID", "CLNT_NO"])
+        rbis_noti_compare_fails14 = pd.merge(
+            fails_sorted, mif_14_pref, on=["AR_ID", "CLNT_NO"], how="left",
+            suffixes=("", "_mif14"),
+        )
+    else:
+        rbis_noti_compare_fails14 = rbis_noti_compare_fails.copy()
+
+    # ---- SRVC_ID = 13 branch ----
+    # Same fidelity fix as above: SAS runs the mif_13 pull unconditionally.
+    ar_list13 = fails_13["AR_ID"].tolist()
+    clnt_list13 = fails_13["CLNT_NO"].tolist()
+    if size13 == 0:
+        logging.warning(
+            "size13=0: SAS source runs the mif_13 Teradata pull unconditionally "
+            "with EMPTY &gic_notif_list13./&gic_notif_list_clnt13. macro "
+            "variables in this case. See size14==0 warning above for the "
+            "same caveat applied to SRVC_ID=13."
+        )
+    mif_13 = _pull_mif13(cfg, dates, ar_list13, clnt_list13)
+    mif13_count = mif_13["PLAN_NUMBER"].count()
+    logging.info("mif13=%s", mif13_count)
+
+    # ARNGMNT_OPTION pull (all_plans13a) remains correctly gated on mif13_count,
+    # matching the SAS `%if &mif13. > 0` guard exactly.
+    if mif13_count > 0:
+        plan_list13 = mif_13["PLAN_NUMBER"].dropna().tolist()
+        all_plans13a = _pull_arngmnt_option(cfg, plan_list13, "all_plans13a")
+        all_plans13 = _clean_arngmnt_option(all_plans13a)
+
+        mif_13_sorted = mif_13.sort_values(by=["PLAN_NUMBER"])
+        mif_13_pref = pd.merge(
+            all_plans13, mif_13_sorted, on="PLAN_NUMBER", how="outer"
+        )
+        mif_13_pref = mif_13_pref.sort_values(by=["AR_ID", "CLNT_NO"])
+
+        fails14_sorted = rbis_noti_compare_fails14.sort_values(by=["AR_ID", "CLNT_NO"])
+        rbis_noti_compare_fails_all = pd.merge(
+            fails14_sorted, mif_13_pref, on=["AR_ID", "CLNT_NO"], how="left",
+            suffixes=("", "_mif13"),
+        )
+
+        # backfill total_term_day from DT_OPEN where still missing
+        mtrty = pd.to_datetime(rbis_noti_compare_fails_all["MTRTY_DT"], errors="coerce")
+        ttd_missing = rbis_noti_compare_fails_all["TOTAL_TERM_DAY"].isna()
+        srvc14_mask = rbis_noti_compare_fails_all["SRVC_ID"] == 14
+        srvc13_mask = rbis_noti_compare_fails_all["SRVC_ID"] == 13
+
+        if "DT_OPEN_MIF14" in rbis_noti_compare_fails_all.columns:
+            dt_open14 = pd.to_datetime(
+                rbis_noti_compare_fails_all["DT_OPEN_MIF14"], errors="coerce"
+            )
+            fill14 = ttd_missing & srvc14_mask
+            rbis_noti_compare_fails_all.loc[fill14, "TOTAL_TERM_DAY"] = (
+                mtrty[fill14] - dt_open14[fill14]
+            ).dt.days
+
+        if "DT_OPEN_MIF13" in rbis_noti_compare_fails_all.columns:
+            dt_open13 = pd.to_datetime(
+                rbis_noti_compare_fails_all["DT_OPEN_MIF13"], errors="coerce"
+            )
+            fill13 = ttd_missing & srvc13_mask
+            rbis_noti_compare_fails_all.loc[fill13, "TOTAL_TERM_DAY"] = (
+                mtrty[fill13] - dt_open13[fill13]
+            ).dt.days
+
+        pref_ts = pd.to_datetime(
+            rbis_noti_compare_fails_all.get("PREF_CHANGE_TMSTMP"), errors="coerce"
+        )
+        rbis_noti_compare_fails_all["PREF_DATE"] = pref_ts.dt.date
+
+        rbis_noti_compare_fails_all = _assign_fail_reason(
+            rbis_noti_compare_fails_all
+        )
+    else:
+        rbis_noti_compare_fails_all = _assign_fail_reason_no_pref(
+            rbis_noti_compare_fails14
+        )
+
+    # rbis_noti_compare_fails_all2: rows still without a fail_reason after
+    # the term-length / preference-change checks
+    rbis_noti_compare_fails_all2 = rbis_noti_compare_fails_all[
+        rbis_noti_compare_fails_all["FAIL_REASON"].isna()
+        | (rbis_noti_compare_fails_all["FAIL_REASON"] == "")
+    ].copy()
+    backdtck = rbis_noti_compare_fails_all2["AR_ID"].count()
+    logging.info("backdtck=%s", backdtck)
+
+    if backdtck > 0:
+        ar_list_bd = rbis_noti_compare_fails_all2["AR_ID"].tolist()
+        backdated = _pull_backdated(cfg, dates, ar_list_bd)
+
+        rbis_noti_compare_fails_final = pd.merge(
+            rbis_noti_compare_fails_all, backdated, on="AR_ID", how="left"
+        )
+
+        sent = pd.to_datetime(
+            rbis_noti_compare_fails_final["NOTIF_SENT_DT"], errors="coerce"
+        )
+        backdate_check = pd.to_datetime(
+            rbis_noti_compare_fails_final["BACKDATE_CHECK"], errors="coerce"
+        )
+        day_diff = (backdate_check - sent).dt.days.abs()
+
+        needs_reason = (
+            rbis_noti_compare_fails_final["FAIL_REASON"].isna()
+            | (rbis_noti_compare_fails_final["FAIL_REASON"] == "")
+        )
+        backdated_fail = needs_reason & backdate_check.notna() & (day_diff < 9)
+        rbis_noti_compare_fails_final.loc[backdated_fail, "FAIL_REASON"] = (
+            "Failed due to introduction of backdated arrangement id              "
+        )
+    else:
+        rbis_noti_compare_fails_final = rbis_noti_compare_fails_all.copy()
+
+    logging.info(
+        "rbis_noti_compare_fails_final: %d rows", len(rbis_noti_compare_fails_final)
+    )
+    return rbis_noti_compare_fails_final
+
+
+def _assign_fail_reason(df: pd.DataFrame) -> pd.DataFrame:
+    """SAS fail_reason assignment block (mif13 > 0 branch):
+
+        if NOTIF_NO_OF_DYS = 21 and NOTIF_DELVRY_PREF = 'P' then do;
+            if total_term_day < 32 then fail_reason = 'Failed due to term length...';
+        end;
+        if NOTIF_NO_OF_DYS = 5 and NOTIF_DELVRY_PREF = 'P' then do;
+            if total_term_day < 16 then fail_reason = 'Failed due to term length...';
+        end;
+        if fail_reason = '' and pref_date ne . and
+            abs(intck('day', pref_date, NOTIF_SENT_DT)) < 9 then
+            fail_reason = 'Failed due to introduction of Paper Pref after regulatory SLA minimum range';
+    """
+    df = df.copy()
+    df["FAIL_REASON"] = pd.Series([np.nan] * len(df), index=df.index, dtype=object)
+
+    cond21 = (df["NOTIF_NO_OF_DYS"] == 21) & (df["NOTIF_DELVRY_PREF"] == "P")
+    df.loc[cond21 & (df["TOTAL_TERM_DAY"] < 32), "FAIL_REASON"] = (
+        "Failed due to term length being under regulatory SLA minimum range            "
+    )
+
+    cond5 = (df["NOTIF_NO_OF_DYS"] == 5) & (df["NOTIF_DELVRY_PREF"] == "P")
+    df.loc[cond5 & (df["TOTAL_TERM_DAY"] < 16), "FAIL_REASON"] = (
+        "Failed due to term length being under regulatory SLA minimum range            "
+    )
+
+    no_reason_yet = df["FAIL_REASON"].isna() | (df["FAIL_REASON"] == "")
+    pref_date = pd.to_datetime(df["PREF_DATE"], errors="coerce")
+    sent = pd.to_datetime(df["NOTIF_SENT_DT"], errors="coerce")
+    day_diff = (pref_date - sent).dt.days.abs()
+    pref_cond = no_reason_yet & pref_date.notna() & (day_diff < 9)
+    df.loc[pref_cond, "FAIL_REASON"] = (
+        "Failed due to introduction of Paper Pref after regulatory SLA minimum range"
     )
     return df
 
 
-def find_fails(
-    conn: teradatasql.TeradataConnection,
-    fails: pd.DataFrame,
-    dates: Dict[str, str],
-) -> pd.DataFrame:
+def _assign_fail_reason_no_pref(df: pd.DataFrame) -> pd.DataFrame:
+    """SAS fail_reason assignment block (mif13 <= 0 branch -- no PREF_DATE
+    join available, so only the term-length checks apply):
+
+        if NOTIF_NO_OF_DYS = 21 and NOTIF_DELVRY_PREF = 'P' then do;
+            if total_term_day < 32 then fail_reason = 'Failed due to term length...';
+        end;
+        if NOTIF_NO_OF_DYS = 5 and NOTIF_DELVRY_PREF = 'P' then do;
+            if total_term_day < 16 then fail_reason = 'Failed due to term length...';
+        end;
     """
-    Replicate the SAS %find_fails macro.
-
-    For each failing arrangement:
-      1. Pull MIF14 / MIF13 data from Teradata
-      2. Fetch plan delivery preferences (ARNGMNT_OPTION)
-      3. Assign fail_reason where possible
-      4. Check backdated arrangements for remaining unexplained fails
-    """
-    # -----------------------------------------------------------------------
-    # SRVC_ID = 14 branch
-    # -----------------------------------------------------------------------
-    fails14 = fails[fails["SRVC_ID"] == 14].copy()
-    logging.info("Fails for SRVC_ID=14: %d rows.", len(fails14))
-
-    if not fails14.empty:
-        ar_list14   = _quoted_list(fails14["AR_ID"],   quote=True)
-        clnt_list14 = _quoted_list(fails14["CLNT_NO"], quote=False)
-
-        logging.info("Pulling MIF14 data from Teradata...")
-        mif14 = pd.read_sql(
-            SQL_MIF14.format(
-                wk_end=dates["wk_end"], wk_start=dates["wk_start"],
-                mat_dt=dates["mat_dt"], ar_list=ar_list14, clnt_list=clnt_list14,
-            ),
-            conn,
-        )
-        logging.info("MIF14: %d rows.", len(mif14))
-
-        if not mif14.empty:
-            plan_list14 = _quoted_list(mif14["plan_number"], quote=True)
-            pref14      = _fetch_plan_preferences(conn, plan_list14)
-
-            # Join pref to mif
-            mif14 = mif14.sort_values("plan_number")
-            pref14 = pref14.sort_values("plan_number")
-            mif14_pref = pd.merge(pref14, mif14, on="plan_number", how="right")
-
-            # Join back to fails14
-            mif14_pref = mif14_pref.sort_values(["AR_ID", "CLNT_NO"])
-            fails14    = fails14.sort_values(["AR_ID", "CLNT_NO"])
-            fails14 = pd.merge(
-                fails14, mif14_pref,
-                on=["AR_ID", "CLNT_NO"], how="left", suffixes=("", "_mif14"),
-            )
-        else:
-            logging.warning("MIF14 returned 0 rows — skipping plan preference join for SRVC_ID=14.")
-    else:
-        logging.info("No fails for SRVC_ID=14.")
-
-    # -----------------------------------------------------------------------
-    # SRVC_ID = 13 branch
-    # -----------------------------------------------------------------------
-    fails13 = fails[fails["SRVC_ID"] == 13].copy()
-    logging.info("Fails for SRVC_ID=13: %d rows.", len(fails13))
-
-    mif13_pref = pd.DataFrame()
-    if not fails13.empty:
-        ar_list13   = _quoted_list(fails13["AR_ID"],   quote=True)
-        clnt_list13 = _quoted_list(fails13["CLNT_NO"], quote=False)
-
-        logging.info("Pulling MIF13 data from Teradata...")
-        mif13 = pd.read_sql(
-            SQL_MIF13.format(
-                wk_end=dates["wk_end"], wk_start=dates["wk_start"],
-                mat_dt=dates["mat_dt"], ar_list=ar_list13, clnt_list=clnt_list13,
-            ),
-            conn,
-        )
-        logging.info("MIF13: %d rows.", len(mif13))
-
-        # Pad plan_number to 9 chars (mirrors: if length(plan_number)=8 …)
-        mif13["plan_number"] = mif13["plan_number"].astype(str).str.zfill(9)
-
-        if not mif13.empty:
-            plan_list13 = _quoted_list(mif13["plan_number"], quote=True)
-            pref13      = _fetch_plan_preferences(conn, plan_list13)
-
-            mif13 = mif13.sort_values("plan_number")
-            pref13 = pref13.sort_values("plan_number")
-            mif13_pref = pd.merge(pref13, mif13, on="plan_number", how="right")
-        else:
-            logging.warning("MIF13 returned 0 rows.")
-    else:
-        logging.info("No fails for SRVC_ID=13.")
-
-    # -----------------------------------------------------------------------
-    # Combine fails14 and merge MIF13 preferences
-    # Mirrors: data rbis_noti_compare_fails_all (merge fails14 + mif13_pref)
-    # -----------------------------------------------------------------------
-    fails_all = fails14.copy() if not fails14.empty else fails.copy()
-
-    if not mif13_pref.empty:
-        fails_all = fails_all.sort_values(["AR_ID", "CLNT_NO"])
-        mif13_pref = mif13_pref.sort_values(["AR_ID", "CLNT_NO"])
-        fails_all = pd.merge(
-            fails_all, mif13_pref,
-            on=["AR_ID", "CLNT_NO"], how="left", suffixes=("", "_mif13"),
-        )
-
-    # Backfill total_term_day where missing
-    # mirrors: if total_term_day = . then …
-    mask_missing = fails_all["total_term_day"].isna()
-    cond14_mask  = mask_missing & (fails_all["SRVC_ID"] == 14)
-    cond13_mask  = mask_missing & (fails_all["SRVC_ID"] == 13)
-
-    fails_all.loc[cond14_mask, "total_term_day"] = (
-        fails_all.loc[cond14_mask, "MTRTY_DT"] - fails_all.loc[cond14_mask, "DT_OPEN_mif14"]
-    ).dt.days
-    fails_all.loc[cond13_mask, "total_term_day"] = (
-        fails_all.loc[cond13_mask, "MTRTY_DT"] - fails_all.loc[cond13_mask, "DT_OPEN_mif13"]
-    ).dt.days
-
-    # pref_date column
-    if "PREF_CHANGE_TMSTMP" in fails_all.columns:
-        fails_all["pref_date"] = pd.to_datetime(
-            fails_all["PREF_CHANGE_TMSTMP"], errors="coerce"
-        ).dt.date
-    else:
-        fails_all["pref_date"] = pd.NaT
-
-    # fail_reason — term-length based
-    fails_all["fail_reason"] = ""
-
-    mask_21_mail = (fails_all["NOTIF_NO_OF_DYS"] == 21) & (fails_all["NOTIF_DELVRY_PREF"] == "P")
-    mask_5_mail  = (fails_all["NOTIF_NO_OF_DYS"] == 5)  & (fails_all["NOTIF_DELVRY_PREF"] == "P")
-
-    fails_all.loc[mask_21_mail & (fails_all["total_term_day"] < 32), "fail_reason"] = (
-        "Failed due to term length being under regulatory SLA minimum range            "
-    )
-    fails_all.loc[mask_5_mail  & (fails_all["total_term_day"] < 16), "fail_reason"] = (
-        "Failed due to term length being under regulatory SLA minimum range            "
-    )
-
-    # fail_reason — paper preference introduced near notification date
-    pref_date_series = pd.to_datetime(fails_all["pref_date"], errors="coerce")
-    notif_sent       = pd.to_datetime(fails_all["NOTIF_SENT_DT"], errors="coerce")
-    days_diff        = (notif_sent - pref_date_series).dt.days.abs()
-
-    mask_pref_fail = (
-        (fails_all["fail_reason"] == "")
-        & pref_date_series.notna()
-        & (days_diff < 9)
-    )
-    fails_all.loc[mask_pref_fail, "fail_reason"] = (
-        "Failed due to introduction of Paper Pref after regulatory SLA minimum range"
-    )
-
-    # -----------------------------------------------------------------------
-    # Backdate check for remaining unexplained fails
-    # (mirrors: data rbis_noti_compare_fails_all2 + backdated query)
-    # -----------------------------------------------------------------------
-    still_unexplained = fails_all[fails_all["fail_reason"] == ""].copy()
-    logging.info("Unexplained fails before backdate check: %d rows.", len(still_unexplained))
-
-    if not still_unexplained.empty:
-        bd_ar_list = _quoted_list(still_unexplained["AR_ID"], quote=True)
-        logging.info("Pulling backdate data from Teradata...")
-        backdated = pd.read_sql(
-            SQL_BACKDATE.format(ar_list=bd_ar_list, back_dt=dates["back_dt"]),
-            conn,
-        )
-        logging.info("Backdated: %d rows.", len(backdated))
-
-        fails_all = pd.merge(fails_all, backdated, on="AR_ID", how="left")
-
-        bd_check_series = pd.to_datetime(fails_all["backdate_check"], errors="coerce")
-        bd_days_diff    = (notif_sent - bd_check_series).dt.days.abs()
-
-        mask_bd = (
-            (fails_all["fail_reason"] == "")
-            & bd_check_series.notna()
-            & (bd_days_diff < 9)
-        )
-        fails_all.loc[mask_bd, "fail_reason"] = (
-            "Failed due to introduction of backdated arrangement id              "
-        )
-    else:
-        fails_all["backdate_check"] = pd.NaT
-
-    logging.info("Fails final: %d rows.", len(fails_all))
-    return fails_all
-
-
-
-# Step 4 — Build autocomplete tables
-# (mirrors four PROC SQL create table ac_time_rbis_noti_* statements)
-
-
-# RDE codes per segment
-_RDE_MAP = {
-    ("R",  5):  "Notif014_Timeliness_SLA",
-    ("R",  21): "Notif013_Timeliness_SLA",
-    ("N",  5):  "Notif016_Timeliness_SLA",
-    ("N",  21): "Notif015_Timeliness_SLA",
-}
-
-_SEGMENT3_MAP = {
-    "R": "Registered GIC",
-    "N": "Non-Registered GIC",
-}
-
-
-def _build_ac_table(
-    df: pd.DataFrame,
-    reg_ind: str,
-    n_days: int,
-    today2: str,
-) -> pd.DataFrame:
-    """
-    Aggregate one segment into an autocomplete-style summary table.
-    Mirrors a single PROC SQL create table ac_time_rbis_noti_* block.
-    """
-    rde      = _RDE_MAP[(reg_ind, n_days)]
-    segment3 = _SEGMENT3_MAP[reg_ind]
-    segment2 = f"{n_days} days"
-
     df = df.copy()
-    df["SNAP_DT"] = pd.to_datetime(df["SNAP_DT"], errors="coerce")
+    df["FAIL_REASON"] = pd.Series([np.nan] * len(df), index=df.index, dtype=object)
 
-    # SnapDate = next Monday after NOTIF_SENT_DT
-    # mirrors: intnx('week.7', NOTIF_SENT_DT, 1, 'B')
-    sent = pd.to_datetime(df["NOTIF_SENT_DT"], errors="coerce")
-    days_to_monday = (7 - sent.dt.weekday) % 7
-    days_to_monday = days_to_monday.where(days_to_monday > 0, 7)
-    snap_date = (sent + pd.to_timedelta(days_to_monday, unit="d")).dt.date
-
-    df["SnapDate"]       = snap_date
-    df["DateCompleted"]  = pd.to_datetime(today2, format="%Y-%m-%d").date()
-    df["segment10"]      = df["SNAP_DT"].dt.strftime("%Y%m")
-    df["Segment9"]       = df["Total_days"].astype(str)
-
-    group_cols = [
-        "RegulatoryName", "LOB", "ReportName", "ProductType",
-        "CommentCode", "Comments",
-        "thirty_day_ind", "deliverypreference",
-        "Segment9", "segment10",
-        "SnapDate", "DateCompleted",
-    ]
-
-    agg = (
-        df.groupby(group_cols, dropna=False)
-          .size()
-          .reset_index(name="Volume")
+    cond21 = (df["NOTIF_NO_OF_DYS"] == 21) & (df["NOTIF_DELVRY_PREF"] == "P")
+    df.loc[cond21 & (df["TOTAL_TERM_DAY"] < 32), "FAIL_REASON"] = (
+        "Failed due to term length being under regulatory SLA minimum range            "
     )
 
-    agg["ControlRisk"] = "Timeliness"
-    agg["TestType"]    = "Anomaly"
-    agg["TestPeriod"]  = "Portfolio"
-    agg["RDE"]         = rde
-    agg["SubDE"]       = ""
-    agg["Segment"]     = "Renewals"
-    agg["Segment2"]    = segment2
-    agg["Segment3"]    = segment3
-    agg["Segment4"]    = agg["thirty_day_ind"]
-    agg["Segment5"]    = agg["deliverypreference"]
-    agg["Segment6"]    = ""
-    agg["Segment7"]    = ""
-    agg["Segment8"]    = ""
-    agg["HoldoutFlag"] = "N"
-    agg["Bal"]         = np.nan
-    agg["Amount"]      = np.nan
+    cond5 = (df["NOTIF_NO_OF_DYS"] == 5) & (df["NOTIF_DELVRY_PREF"] == "P")
+    df.loc[cond5 & (df["TOTAL_TERM_DAY"] < 16), "FAIL_REASON"] = (
+        "Failed due to term length being under regulatory SLA minimum range            "
+    )
+    return df
 
-    agg["DateCompleted"] = pd.to_datetime(agg["DateCompleted"], errors="coerce")
-    agg["SnapDate"]      = pd.to_datetime(agg["SnapDate"],      errors="coerce")
 
-    return agg.sort_values(["RegulatoryName", "LOB", "SnapDate"])
+
+# Autocomplete aggregation -> ac_time_rbis_noti_{reg,nonreg}_{05,21}
+# (4x SAS `proc sql; create table ... group by ...` blocks)
+
+
+_AC_BLOCK_SPECS = [
+    # (bucket_name, RDE literal, Segment3 literal)
+    ("reg_05", "Notif014_Timeliness_SLA", "Registered GIC"),
+    ("reg_21", "Notif013_Timeliness_SLA", "Registered GIC"),
+    ("nonreg_05", "Notif016_Timeliness_SLA", "Non-Registered GIC"),
+    ("nonreg_21", "Notif015_Timeliness_SLA", "Non-Registered GIC"),
+]
+_AC_SEGMENT2 = {"05": "5 days", "21": "21 days"}
+
+
+def _build_ac_block(
+    bucket_df: pd.DataFrame, rde: str, segment3: str, segment2: str, dates: Dict[str, object]
+) -> pd.DataFrame:
+    """Replicates one of the 4 `ac_time_rbis_noti_*` SAS proc sql aggregations.
+
+    SAS source (per block, e.g. reg_05):
+        select
+            RegulatoryName, LOB, ReportName,
+            'Timeliness' as ControlRisk, 'Anomaly' as TestType,
+            'Portfolio' as TestPeriod, ProductType,
+            'Notif014_Timeliness_SLA' as RDE, '' as SubDE,
+            'Renewals' as Segment, '5 days' as Segment2,
+            'Registered GIC' as Segment3,
+            thirty_day_ind as Segment4, deliverypreference as Segment5,
+            '' as Segment6, '' as Segment7, '' as Segment8,
+            put(Total_days, 8.-L) as Segment9,
+            put(SNAP_DT, yymmn6.) as segment10,
+            'N' as HoldoutFlag, CommentCode, Comments,
+            count(*) as Volume, . as Bal, . as Amount,
+            input(&today2., yymmdd10.) as DateCompleted,
+            intnx('week.7', NOTIF_SENT_DT, 1, 'B') as SnapDate
+        from rbis_noti_compare_reg_05
+        group by 1..22,26,27   -- i.e. all selected columns except Volume/Bal/Amount,
+                                -- but including DateCompleted and SnapDate
+        order by 1,2,27
+    """
+    df = bucket_df.copy()
+    if df.empty:
+        cols = [
+            "RegulatoryName", "LOB", "ReportName", "ControlRisk", "TestType",
+            "TestPeriod", "ProductType", "RDE", "SubDE", "Segment", "Segment2",
+            "Segment3", "Segment4", "Segment5", "Segment6", "Segment7",
+            "Segment8", "Segment9", "Segment10", "HoldoutFlag", "CommentCode",
+            "Comments", "Volume", "Bal", "Amount", "DateCompleted", "SnapDate",
+        ]
+        return pd.DataFrame(columns=cols)
+
+    notif_sent = pd.to_datetime(df["NOTIF_SENT_DT"], errors="coerce")
+    snap_dt_src = pd.to_datetime(df["SNAP_DT"], errors="coerce")
+
+    out = pd.DataFrame(
+        {
+            "RegulatoryName": df["REGULATORYNAME"],
+            "LOB": df["LOB"],
+            "ReportName": df["REPORTNAME"],
+            "ControlRisk": "Timeliness",
+            "TestType": "Anomaly",
+            "TestPeriod": "Portfolio",
+            "ProductType": df["PRODUCTTYPE"],
+            "RDE": rde,
+            "SubDE": "",
+            "Segment": "Renewals",
+            "Segment2": segment2,
+            "Segment3": segment3,
+            "Segment4": df["THIRTY_DAY_IND"],
+            "Segment5": df["DELIVERYPREFERENCE"],
+            "Segment6": "",
+            "Segment7": "",
+            "Segment8": "",
+            # put(Total_days, 8.-L) -> left-justified numeric-as-string
+            "Segment9": df["TOTAL_DAYS"].apply(
+                lambda x: "" if pd.isna(x) else str(int(x))
+            ),
+            "Segment10": snap_dt_src.dt.strftime("%Y%m"),
+            "HoldoutFlag": "N",
+            "CommentCode": df["COMMENTCODE"],
+            "Comments": df["COMMENTS"],
+            "DateCompleted": pd.to_datetime(dates["today2"]),
+            "SnapDate": notif_sent.apply(
+                lambda d: pd.NaT if pd.isna(d) else _week7_anchor(d.date(), n=1, align="b")
+            ),
+        }
+    )
+    out["SnapDate"] = pd.to_datetime(out["SnapDate"])
+
+    group_cols = [c for c in out.columns]
+    grouped = (
+        out.groupby(group_cols, dropna=False).size().reset_index(name="Volume")
+    )
+    grouped["Bal"] = np.nan
+    grouped["Amount"] = np.nan
+    grouped = grouped.sort_values(by=["RegulatoryName", "LOB", "SnapDate"]).reset_index(
+        drop=True
+    )
+    return grouped
 
 
 def build_autocomplete_tables(
-    segments: Dict[str, pd.DataFrame],
-    dates: Dict[str, str],
+    rbis_noti_compare01: pd.DataFrame, dates: Dict[str, object]
 ) -> pd.DataFrame:
+    """Builds and unions the 4 ac_time_rbis_noti_* blocks into renew_gic_ac_curr.
+
+    SAS source:
+        data notidata.renew_gic_ac_&rundt. renew_gic_ac_curr;
+            format segment $150. segment2 $150. segment3 $150. ;
+            set ac_time_rbis_noti_nonreg_05 ac_time_rbis_noti_nonreg_21
+                ac_time_rbis_noti_reg_05    ac_time_rbis_noti_reg_21;
+        run;
+    NOTE: SAS unions in the order nonreg_05, nonreg_21, reg_05, reg_21 --
+    preserved here for row-order fidelity even though it's a UNION.
     """
-    Build and stack the four autocomplete segment tables.
-    Mirrors data notidata.renew_gic_ac_&rundt. / renew_gic_ac_curr.
-    """
-    today2 = dates["today2"]
+    blocks = {}
+    for bucket, rde, segment3 in _AC_BLOCK_SPECS:
+        days_key = bucket.split("_")[-1]
+        segment2 = _AC_SEGMENT2[days_key]
+        bucket_df = rbis_noti_compare01[rbis_noti_compare01["_BUCKET"] == bucket]
+        blocks[bucket] = _build_ac_block(bucket_df, rde, segment3, segment2, dates)
 
-    ac_parts = [
-        _build_ac_table(segments["nonreg_05"], "N",  5, today2),
-        _build_ac_table(segments["nonreg_21"], "N", 21, today2),
-        _build_ac_table(segments["reg_05"],    "R",  5, today2),
-        _build_ac_table(segments["reg_21"],    "R", 21, today2),
-    ]
-    combined = pd.concat(ac_parts, ignore_index=True)
-    logging.info("Combined autocomplete table: %d rows.", len(combined))
-    return combined
-
+    renew_gic_ac_curr = pd.concat(
+        [blocks["nonreg_05"], blocks["nonreg_21"], blocks["reg_05"], blocks["reg_21"]],
+        ignore_index=True,
+    )
+    logging.info("renew_gic_ac_curr: %d rows", len(renew_gic_ac_curr))
+    return renew_gic_ac_curr
 
 
-# Step 5 — Persist autocomplete (mirrors %Timeliness macro + proc export)
+
+# %Timeliness macro -> apply_timeliness_append()
 
 
-def persist_autocomplete(
-    spark: SparkSession,
-    curr: pd.DataFrame,
-    dates: Dict[str, str],
+def apply_timeliness_append(
     cfg: Config,
+    ini_run: str,
+    renew_gic_ac_curr: pd.DataFrame,
+    dates: Dict[str, object],
 ) -> pd.DataFrame:
-    """
-    Append current week's autocomplete rows to the persistent store.
-    Mirrors the SAS %Timeliness macro (ini_run branch) and proc export.
-    """
-    local_ac = cfg.outpath / cfg.persistent_ac_file
-    s3_ac    = s3_path("output", cfg.persistent_ac_file)
-    ini_run  = dates.get("ini_run", "N")
-    sasdt2   = dates["sasdt2"]   # week_end date string for dedup filter
+    """Replicates the %Timeliness SAS macro.
 
-    if ini_run == "Y" or not local_ac.exists():
-        logging.info("Initial run — writing autocomplete from scratch.")
-        combined = curr
+    SAS source:
+        %macro Timeliness;
+        %if &ini_run = 'Y' %then %do;
+            data notidata.renew_gic_ac notif_m.cnac_renew_gic_ac;
+            set renew_gic_ac_curr;
+            run;
+        %end;
+        %else %do;
+            data notidata.renew_gic_ac notif_m.cnac_renew_gic_ac;
+            set notidata.renew_gic_ac (where=(SnapDate ne &sasdt2.))
+                renew_gic_ac_curr;
+            run;
+        %end;
+        %mend;
+
+    `notif_m.cnac_renew_gic_ac` is a separate downstream library write (the
+    "MAIN_NOTIF" libname) -- both targets receive an identical frame in SAS.
+    This function returns a single DataFrame representing the content for
+    both write targets; `export_autocomplete()` is responsible for actually
+    persisting it to both `cfg.outpath` (notidata.renew_gic_ac) and
+    `cfg.notif_m_outpath` (notif_m.cnac_renew_gic_ac) -- confirmed done in
+    that function, not merely assumed.
+    """
+    persistent_file = cfg.outpath / cfg.persistent_ac_file
+
+    if ini_run.upper() == "Y":
+        notidata_renew_gic_ac = renew_gic_ac_curr.copy()
     else:
-        logging.info("Incremental run — appending to existing autocomplete.")
-        existing = pd.read_parquet(local_ac)
+        existing = pd.read_parquet(persistent_file)
         existing["SnapDate"] = pd.to_datetime(existing["SnapDate"], errors="coerce")
-        # Remove current week's rows before appending (mirrors WHERE SnapDate ne &sasdt2)
-        existing = existing[
-            existing["SnapDate"].dt.strftime("%Y-%m-%d") != sasdt2
-        ].copy()
-        combined = pd.concat([existing, curr], ignore_index=True)
+        wk_end_as_snapdate = pd.to_datetime(dates["wk_end"])
+        existing_filtered = existing[existing["SnapDate"] != wk_end_as_snapdate].copy()
+        notidata_renew_gic_ac = pd.concat(
+            [existing_filtered, renew_gic_ac_curr], ignore_index=True
+        )
 
-    logging.info("Persisting autocomplete: %d total rows.", len(combined))
-
-    # Local save
-    cfg.outpath.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(local_ac, index=False)
-    logging.info("Saved local parquet: %s", local_ac)
-
-    # S3 save
-    write_parquet_to_s3(spark, combined, s3_ac)
-
-    # Excel export (mirrors proc export … dbms=xlsx)
-    excel_path = cfg.outpath / cfg.excel_autocomplete_file
-    with pd.ExcelWriter(excel_path, engine="openpyxl", date_format="YYYY-MM-DD") as writer:
-        combined.to_excel(writer, sheet_name="renew_gic_autocomplete", index=False)
-    logging.info("Exported autocomplete Excel: %s", excel_path)
-    upload_file_to_s3(spark, str(excel_path), s3_path("output", cfg.excel_autocomplete_file))
-
-    return combined
+    logging.info("notidata.renew_gic_ac (post-Timeliness): %d rows", len(notidata_renew_gic_ac))
+    return notidata_renew_gic_ac
 
 
 
-# Step 6 — Export fail detail file
-# (mirrors data notidata.rbis_noti_time_fail_wk_&ymd. + proc export)
+# Fail detail export -> rbis_noti_time_fail_wk_&ymd.
 
 
-def export_fail_detail(
-    spark: SparkSession,
-    fails_final: pd.DataFrame,
-    dates: Dict[str, str],
-    cfg: Config,
-) -> None:
+def build_fail_detail(
+    rbis_noti_compare_fails_final: pd.DataFrame, dates: Dict[str, object]
+) -> pd.DataFrame:
+    """Replicates the SAS `data notidata.rbis_noti_time_fail_wk_&ymd.` step.
+
+    SAS source (keep= list controls output column set):
+        keep= event_month event_week_ending lob product Type_of_Notification
+              NOTIF_NO_OF_DYS AR_id Notification_Delivery_Type clientid_mask
+              Account_number Certificate_number Renewal_Date NOTIF_SENT_DT
+              renewal_rule date_completed Total_days fail_reason
+              DT_OPEN_mif14 DT_OPEN_mif13 pref_date backdate_check
+        if Comments = 'Potential Fail        '; (subsetting IF)
+        event_month = put(NOTIF_SENT_DT, yymmn6.);
+        ... (see field assignments below)
+        clientid_mask = substr(CLNT_NO,7,3);
+        date_completed = input(&today2., yymmdd10.);
+        event_week_ending = intnx('week.7',NOTIF_SENT_DT,0,'e');
+        if RGSTR_NO_RGSTR_IND='N' then product='Non-Registered GIC';
+        else if RGSTR_NO_RGSTR_IND='R' then product='Registered GIC ';
+
+    DELIBERATELY OMITTED (confirmed dead-on-arrival in the SAS source, not
+    silently dropped): the SAS DATA step also assigns
+        Campaign_id = "N/A"; Credit_card_account = "N/A"; promo_rule = "N/A";
+        Transit = ACCT_TR_NO; Segment_number = seg_no;
+    None of these five appear in the `keep=` list above, so SAS computes
+    them and then discards them before the dataset is materialized -- they
+    have zero effect on notidata.rbis_noti_time_fail_wk_&ymd. or its Excel
+    export. Omitted here for the same reason (output-column parity with
+    the keep= list), not because they were overlooked.
     """
-    Build and export the timeliness fail detail file.
-    Mirrors the final DATA step that creates rbis_noti_time_fail_wk_&ymd.
-    """
-    df = fails_final[fails_final["Comments"].str.strip() == "Potential Fail"].copy()
+    df = rbis_noti_compare_fails_final.copy()
+    df = df[df["COMMENTS"] == "Potential Fail        "].copy()
 
-    df["event_month"]               = df["NOTIF_SENT_DT"].dt.strftime("%Y%m")
-    df["Notification_Delivery_Type"] = df["deliverypreference"]
-    df["Certificate_number"]         = df["CERT_NO"]
-    df["Type_of_Notification"]       = df["thirty_day_ind"]
-    df["Account_number"]             = df["ACCT_NO"]
-    df["Renewal_Date"]               = df["MTRTY_DT"]
-    df["renewal_rule"]               = df["NOTIF_NO_OF_DYS"].map({21: "21 days", 5: "5 days "})
-    df["clientid_mask"]              = df["CLNT_NO"].astype(str).str[6:9]
-    df["date_completed"]             = pd.to_datetime(dates["today2"], format="%Y-%m-%d")
-    df["event_week_ending"]          = (
-        pd.to_datetime(df["NOTIF_SENT_DT"]) +
-        pd.to_timedelta((6 - df["NOTIF_SENT_DT"].dt.weekday) % 7, unit="d")
-    )
-    df["product"] = np.where(
-        df["RGSTR_NO_RGSTR_IND"] == "N", "Non-Registered GIC",
-        np.where(df["RGSTR_NO_RGSTR_IND"] == "R", "Registered GIC ", np.nan),
-    )
+    notif_sent = pd.to_datetime(df["NOTIF_SENT_DT"], errors="coerce")
 
-    keep_cols = [
-        "event_month", "event_week_ending", "LOB", "product",
-        "Type_of_Notification", "NOTIF_NO_OF_DYS", "AR_ID",
+    out = pd.DataFrame()
+    out["event_month"] = notif_sent.dt.strftime("%Y%m")
+    out["event_week_ending"] = notif_sent.apply(
+        lambda d: pd.NaT if pd.isna(d) else _week7_anchor(d.date(), n=0, align="e")
+    )
+    out["lob"] = df.get("LOB")
+    out["product"] = np.select(
+        [df["RGSTR_NO_RGSTR_IND"] == "N", df["RGSTR_NO_RGSTR_IND"] == "R"],
+        ["Non-Registered GIC", "Registered GIC "],
+        default=None,
+    )
+    out["Type_of_Notification"] = df["THIRTY_DAY_IND"]
+    out["NOTIF_NO_OF_DYS"] = df["NOTIF_NO_OF_DYS"]
+    out["AR_id"] = df["AR_ID"]
+    out["Notification_Delivery_Type"] = df["DELIVERYPREFERENCE"]
+    out["clientid_mask"] = df["CLNT_NO"].astype(str).str.slice(6, 9)
+    out["Account_number"] = df["ACCT_NO"]
+    out["Certificate_number"] = df["CERT_NO"]
+    out["Renewal_Date"] = pd.to_datetime(df["MTRTY_DT"], errors="coerce")
+    out["NOTIF_SENT_DT"] = notif_sent
+    out["renewal_rule"] = np.select(
+        [df["NOTIF_NO_OF_DYS"] == 21, df["NOTIF_NO_OF_DYS"] == 5],
+        ["21 days", "5 days "],
+        default=None,
+    )
+    out["date_completed"] = pd.to_datetime(dates["today2"])
+    out["Total_days"] = df["TOTAL_DAYS"]
+    out["fail_reason"] = df.get("FAIL_REASON")
+    out["DT_OPEN_mif14"] = pd.to_datetime(df.get("DT_OPEN_MIF14"), errors="coerce")
+    out["DT_OPEN_mif13"] = pd.to_datetime(df.get("DT_OPEN_MIF13"), errors="coerce")
+    out["pref_date"] = pd.to_datetime(df.get("PREF_DATE"), errors="coerce")
+    out["backdate_check"] = pd.to_datetime(df.get("BACKDATE_CHECK"), errors="coerce")
+
+    # Exact keep= column order from SAS
+    keep_order = [
+        "event_month", "event_week_ending", "lob", "product",
+        "Type_of_Notification", "NOTIF_NO_OF_DYS", "AR_id",
         "Notification_Delivery_Type", "clientid_mask", "Account_number",
-        "Certificate_number", "Renewal_Date", "NOTIF_SENT_DT",
-        "renewal_rule", "date_completed", "Total_days",
-        "fail_reason", "DT_OPEN_mif14", "DT_OPEN_mif13",
-        "pref_date", "backdate_check",
+        "Certificate_number", "Renewal_Date", "NOTIF_SENT_DT", "renewal_rule",
+        "date_completed", "Total_days", "fail_reason", "DT_OPEN_mif14",
+        "DT_OPEN_mif13", "pref_date", "backdate_check",
     ]
-    existing_cols = [c for c in keep_cols if c in df.columns]
-    df = df[existing_cols]
-
-    rundt      = dates["rundt"]
-    local_path = cfg.outpath / f"{cfg.excel_fail_detail_prefix}_{rundt}.xlsx"
-
-    with pd.ExcelWriter(local_path, engine="openpyxl", date_format="YYYY-MM-DD") as writer:
-        df.to_excel(writer, sheet_name="Notif_RBIS_Renew_Time", index=False)
-    logging.info("Exported fail detail Excel: %s", local_path)
-
-    upload_file_to_s3(
-        spark, str(local_path),
-        s3_path("output", f"{cfg.excel_fail_detail_prefix}_{rundt}.xlsx"),
-    )
-
-    # Parquet copy to S3
-    write_parquet_to_s3(
-        spark, df,
-        s3_path("output", f"rbis_noti_time_fail_wk_{rundt}.parquet"),
-    )
+    out = out[keep_order]
+    logging.info("rbis_noti_time_fail (detail): %d rows", len(out))
+    return out
 
 
 
-# Step 7 — Log fail_reason frequency (mirrors proc freq data=…)
+# Export helpers (proc export ... dbms=xlsx replace; / persistent parquet)
 
 
-def log_fail_reason_freq(fails_final: pd.DataFrame) -> None:
-    """Print a frequency table of fail_reason values (mirrors PROC FREQ)."""
-    freq = fails_final["fail_reason"].value_counts(dropna=False)
-    logging.info("=== PROC FREQ: fail_reason ===\n%s", freq.to_string())
+def export_autocomplete(
+    cfg: Config, notidata_renew_gic_ac: pd.DataFrame
+) -> Path:
+    """SAS:
+        data notidata.renew_gic_ac notif_m.cnac_renew_gic_ac;
+            ...
+        run;  (the %Timeliness macro -- see apply_timeliness_append)
 
+        proc export data=notidata.renew_gic_ac
+            outfile="&outpath/renew_gic_autocomplete"
+            dbms=xlsx replace;
+            sheet="renew_gio_autocomplete";
+        run;
 
+    Persists the SAS DATA step's TWO write targets:
+      1. notidata.renew_gic_ac  -> cfg.outpath / cfg.persistent_ac_file
+      2. notif_m.cnac_renew_gic_ac -> cfg.notif_m_outpath / cfg.cnac_persistent_file
+    Both receive byte-identical content in the SAS source (a single `set`
+    statement feeding two output datasets in one DATA step), so the same
+    DataFrame is written to both locations here. An earlier draft of this
+    conversion only wrote target #1 and silently dropped target #2 --
+    fixed.
 
-# Main entry point  (Tyr/Helios framework signature)
+    Also exports the Excel rendition of notidata.renew_gic_ac (proc export).
 
-
-def main(ss: SparkSession, job_conf: Dict) -> None:
+    TODO: add S3 upload of the parquet(s) and the Excel file via
+    upload_file_to_s3()/write_parquet_to_s3() once S3 wiring is enabled
+    (see C86_pa_client360.py reference: s3_path("output", ...)).
     """
-    Main entry point for Tyr/Helios framework.
+    cfg.outpath.mkdir(parents=True, exist_ok=True)
+    cfg.notif_m_outpath.mkdir(parents=True, exist_ok=True)
+
+    # Target 1: notidata.renew_gic_ac
+    persistent_file = cfg.outpath / cfg.persistent_ac_file
+    notidata_renew_gic_ac.to_parquet(persistent_file, index=False)
+    logging.info("Saved persistent autocomplete file: %s", persistent_file)
+
+    # Target 2: notif_m.cnac_renew_gic_ac (same content, separate library/path)
+    cnac_file = cfg.notif_m_outpath / cfg.cnac_persistent_file
+    notidata_renew_gic_ac.to_parquet(cnac_file, index=False)
+    logging.info("Saved notif_m.cnac_renew_gic_ac equivalent: %s", cnac_file)
+
+    excel_path = cfg.outpath / cfg.excel_autocomplete_file
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        notidata_renew_gic_ac.to_excel(
+            writer, sheet_name="renew_gio_autocomplete", index=False
+        )
+    logging.info("Exported autocomplete Excel: %s", excel_path)
+    return excel_path
+
+
+def export_fail_detail(cfg: Config, fail_detail: pd.DataFrame, ymd: str) -> Path:
+    """SAS:
+        data notidata.rbis_noti_time_fail_wk_&ymd.(keep= ...);
+        set rbis_noti_compare_fails_final;
+        ...
+        run;
+
+        proc export data=notidata.rbis_noti_time_fail_wk_&ymd.
+            outfile="&outpath/Notif_RBIS_Renew_Timeliness_Detail"
+            dbms=xlsx replace;
+            sheet="Notif_RBIS_Renew_Time";
+        run;
+
+    `notidata.rbis_noti_time_fail_wk_&ymd.` is a PERMANENT dated SAS dataset
+    (the `notidata` libname points at a real on-disk path, not WORK) -- it
+    is not just exported to Excel, it is also persisted in its own right.
+    An earlier draft of this conversion only wrote the Excel rendition and
+    silently dropped the persistent dated dataset; fixed here by also
+    writing a dated parquet file, mirroring the same persistence pattern
+    already used for notidata.renew_gic_ac.
+
+    TODO: add S3 upload of both files once S3 wiring is enabled.
+    """
+    cfg.outpath.mkdir(parents=True, exist_ok=True)
+
+    # Persist the dated dataset itself (notidata.rbis_noti_time_fail_wk_&ymd.)
+    dated_parquet_path = cfg.outpath / "{}{}.parquet".format(
+        cfg.fail_detail_parquet_prefix, ymd
+    )
+    fail_detail.to_parquet(dated_parquet_path, index=False)
+    logging.info(
+        "Saved notidata.rbis_noti_time_fail_wk_%s equivalent: %s",
+        ymd, dated_parquet_path,
+    )
+
+    excel_path = cfg.outpath / "Notif_RBIS_Renew_Timeliness_Detail.xlsx"
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        fail_detail.to_excel(writer, sheet_name="Notif_RBIS_Renew_Time", index=False)
+    logging.info("Exported fail detail Excel: %s", excel_path)
+
+    # Mirror: proc freq data = rbis_noti_compare_fails_final; tables fail_reason; run;
+    if "fail_reason" in fail_detail.columns:
+        freq = fail_detail["fail_reason"].value_counts(dropna=False)
+        logging.info("PROC FREQ fail_reason:\n%s", freq)
+
+    return excel_path
+
+
+
+# %skip macro -> run_skip_block()  (dev/QA scaffolding, opt-in only)
+
+
+def run_skip_block(
+    rbis_noti_base: pd.DataFrame,
+    rbis_noti_compare01: pd.DataFrame,
+    renew_gic_ac_curr: pd.DataFrame,
+    notidata_renew_gic_ac: pd.DataFrame,
+    out_dir: Path,
+) -> None:
+    """Replicates the SAS `%macro skip; ... %mend skip;` block.
+
+    This macro is DEFINED but never INVOKED (`%skip;`) in the source SAS
+    script -- it is dev/UAT scaffolding (ad-hoc PROC FREQs, a 25-row
+    survey sample export, and a hardcoded test-date row delete against
+    '02SEP2022'd). Ported here as an explicit opt-in debug/QA routine so it
+    is not silently dropped, but it is NOT called by `main()` by default --
+    mirroring the SAS behaviour where the macro exists in the source but
+    is dormant unless someone adds a `%skip;` call.
+
+    Several sub-pieces of the original SAS %skip block reference datasets/
+    libnames not defined anywhere else in this script (`rmtwork.*`), which
+    confirms this is leftover/inactive scaffolding rather than load-bearing
+    logic -- those `%commexp` calls are reproduced as best-effort exports of
+    the closest equivalent in-scope frames, clearly labeled, rather than
+    invented from nothing.
+
+    Call this manually for ad-hoc QA, e.g.:
+        run_skip_block(rbis_noti_base, rbis_noti_compare01,
+                        renew_gic_ac_curr, notidata_renew_gic_ac,
+                        Path("./qa_output"))
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logging.info("Running %%skip QA block (opt-in debug routine)...")
+
+    # proc surveyselect ... method=srs sampsize=25;
+    sample_n = min(25, len(rbis_noti_compare01))
+    rbis_noti_samp = rbis_noti_compare01.sample(
+        n=sample_n, random_state=None
+    ) if sample_n > 0 else rbis_noti_compare01.copy()
+
+    # %commexp(...) -> ad-hoc xlsx exports of the closest in-scope equivalents
+    # NOTE: SAS referenced rmtwork.rbis_noti_base / rmtwork.rbis_noti_compare /
+    # rmtwork.rbis_noti_samp / rmtwork.renew_gic_ac_curr /
+    # rmtwork.RBIS_NOTI_COMPARE_check -- `rmtwork` is not a libname defined
+    # anywhere in this script, so these exports were already broken/inactive
+    # in the SAS source. Reproduced here against the analogous in-memory
+    # frames that *are* in scope, for QA convenience only.
+    rbis_noti_base.to_excel(out_dir / "rbis_noti_base.xlsx", index=False)
+    rbis_noti_compare01.to_excel(out_dir / "rbis_noti_compare.xlsx", index=False)
+    rbis_noti_samp.to_excel(out_dir / "rbis_noti_samp.xlsx", index=False)
+    renew_gic_ac_curr.to_excel(out_dir / "renew_gic_ac.xlsx", index=False)
+
+    # proc freq data = rbis_noti_compare01; tables RENW_PROD_NOTIF_TYP; run;
+    if "RENW_PROD_NOTIF_TYP" in rbis_noti_compare01.columns:
+        logging.info(
+            "PROC FREQ RENW_PROD_NOTIF_TYP:\n%s",
+            rbis_noti_compare01["RENW_PROD_NOTIF_TYP"].value_counts(dropna=False),
+        )
+
+    # proc freq data = rbis_noti_compare01; tables SRVC_ID; run;
+    if "SRVC_ID" in rbis_noti_compare01.columns:
+        logging.info(
+            "PROC FREQ SRVC_ID:\n%s",
+            rbis_noti_compare01["SRVC_ID"].value_counts(dropna=False),
+        )
+
+    # proc sql; create table thirty_day_test as
+    #   select case when total_term_day between 0 and 30 then '...'
+    #               when total_term_day > 30 or total_term_day = . then '...'
+    #               else 'other' end as term_date_calc,
+    #          thirty_day_ind, SRVC_ID, count(ar_id)
+    #   from rbis_noti_compare01 group by 1,2,3 order by 1,2,3;
+    ttd = rbis_noti_compare01["TOTAL_TERM_DAY"]
+    term_date_calc = np.select(
+        [(ttd >= 0) & (ttd <= 30), (ttd > 30) | ttd.isna()],
+        ["total term day <=30", "total term day > 30"],
+        default="other",
+    )
+    thirty_day_test = (
+        rbis_noti_compare01.assign(term_date_calc=term_date_calc)
+        .groupby(["term_date_calc", "THIRTY_DAY_IND", "SRVC_ID"], dropna=False)["AR_ID"]
+        .count()
+        .reset_index(name="count_ar_id")
+        .sort_values(by=["term_date_calc", "THIRTY_DAY_IND", "SRVC_ID"])
+    )
+    logging.info("thirty_day_test:\n%s", thirty_day_test)
+
+    # proc freq data = rbis_noti_compare01; tables SEP_DISCLSR_IND; run;
+    if "SEP_DISCLSR_IND" in rbis_noti_compare01.columns:
+        logging.info(
+            "PROC FREQ SEP_DISCLSR_IND:\n%s",
+            rbis_noti_compare01["SEP_DISCLSR_IND"].value_counts(dropna=False),
+        )
+
+    # proc sql; create table Sep_dis_by_owner_type as
+    #   select SEP_DISCLSR_IND, CLNT_AR_OWN_TYP, count(ar_id)
+    #   from rbis_noti_base group by 1,2 order by 1,2;
+    sep_dis_by_owner_type = (
+        rbis_noti_base.groupby(["SEP_DISCLSR_IND", "CLNT_AR_OWN_TYP"], dropna=False)["AR_ID"]
+        .count()
+        .reset_index(name="count_ar_id")
+        .sort_values(by=["SEP_DISCLSR_IND", "CLNT_AR_OWN_TYP"])
+    )
+    logging.info("Sep_dis_by_owner_type:\n%s", sep_dis_by_owner_type)
+
+    # proc freq data = rbis_noti_base; tables snap_dt; run;
+    if "SNAP_DT" in rbis_noti_base.columns:
+        logging.info(
+            "PROC FREQ snap_dt:\n%s", rbis_noti_base["SNAP_DT"].value_counts(dropna=False)
+        )
+
+    # proc sql; create table Notification_info as
+    #   select NOTIF_NO_OF_DYS, NOTIF_DELVRY_PREF, MTRTY_DT, NOTIF_SENT_DT,
+    #          Total_days, Comments, count(ar_id)
+    #   from rbis_noti_compare01 group by 1,2,3,4,5,6 order by 1,2,3,4,5,6;
+    notification_info = (
+        rbis_noti_compare01.groupby(
+            ["NOTIF_NO_OF_DYS", "NOTIF_DELVRY_PREF", "MTRTY_DT", "NOTIF_SENT_DT",
+             "TOTAL_DAYS", "COMMENTS"],
+            dropna=False,
+        )["AR_ID"]
+        .count()
+        .reset_index(name="count_ar_id")
+    )
+    logging.info("Notification_info: %d rows", len(notification_info))
+
+    # data RBIS_NOTI_COMPARE_NONREG_21_junk; set RBIS_NOTI_COMPARE_NONREG_21;
+    #   if cert_no = 17 then do; CommentCode='COM19'; Comments='Potential Fail'; end;
+    # run;
+    # (Fabricated test-fail injection for QA -- reproduced for completeness,
+    # not used downstream.)
+    nonreg_21 = rbis_noti_compare01[rbis_noti_compare01["_BUCKET"] == "nonreg_21"].copy()
+    if "CERT_NO" in nonreg_21.columns:
+        junk_mask = nonreg_21["CERT_NO"] == 17
+        nonreg_21.loc[junk_mask, "COMMENTCODE"] = "COM19"
+        nonreg_21.loc[junk_mask, "COMMENTS"] = "Potential Fail        "
+    rbis_noti_compare_check = nonreg_21[
+        (nonreg_21["NOTIF_NO_OF_DYS"] == 5) & (nonreg_21["TOTAL_DAYS"] > 27)
+    ] if not nonreg_21.empty else nonreg_21
+    if not rbis_noti_compare_check.empty:
+        rbis_noti_compare_check.to_excel(
+            out_dir / "RBIS_NOTI_COMPARE_check.xlsx", index=False
+        )
+        logging.info(
+            "PROC FREQ total_days/NOTIF_SENT_DT (RBIS_NOTI_COMPARE_check):\n%s",
+            rbis_noti_compare_check.groupby(
+                ["TOTAL_DAYS", "NOTIF_SENT_DT"], dropna=False
+            ).size(),
+        )
+
+    logging.info("%%skip QA block complete. Outputs in: %s", out_dir)
+
+
+def fix_permissions_and_scan_log(cfg: Config, log_file: Path) -> None:
+    """Replicates the end-of-run housekeeping in the SAS source:
+
+        x "find &regpath. -user $USER -mmin -720 -exec chmod 777 {} \\;";
+        proc printto; run;
+        %ScanLog(&logfile);
+
+    These three statements were OMITTED from an earlier draft of this
+    conversion entirely (not even stubbed). Restored here, with the
+    following caveats made explicit rather than silently guessed at:
+
+    - The `find ... chmod 777` shell call makes every file the running
+      user touched in the last 720 minutes (12 hours) under &regpath.
+      world-writable. This is reproduced via Python's os.chmod walk, but
+      note 777 permissions are a broad/risky default -- confirm this is
+      actually desired (vs. e.g. group-writable 770) before enabling in a
+      shared environment. Left as an explicit, separately-callable function
+      (not auto-applied) so a reviewer consciously opts in.
+    - `%ScanLog(&logfile)` is a site-specific macro (not visible in this
+      script's source) that most likely scans the SAS log for ERROR:/
+      WARNING: lines and raises an alert or sets a return code. There is no
+      way to faithfully port a macro whose body was never shown. A
+      best-effort equivalent is implemented here: scan the Python log file
+      for "ERROR" / "WARNING" level lines and log a summary. If %ScanLog
+      does something more specific (e.g. emails a distro list, writes to a
+      monitoring table), this needs to be confirmed with the SAS author and
+      extended accordingly -- flagging rather than guessing further.
+    """
+    # find ... -mmin -720 -exec chmod 777 {} \;  (files modified in last 12h)
+    cutoff = datetime.now() - timedelta(minutes=720)
+    chmod_count = 0
+    if cfg.regpath.exists():
+        for root, dirs, files in os.walk(cfg.regpath):
+            for name in files:
+                fpath = Path(root) / name
+                try:
+                    mtime = datetime.fromtimestamp(fpath.stat().st_mtime)
+                    if mtime >= cutoff:
+                        os.chmod(fpath, 0o777)
+                        chmod_count += 1
+                except OSError as e:
+                    logging.warning("Could not chmod %s: %s", fpath, e)
+    logging.info(
+        "Permission fixup: chmod 777 applied to %d files modified in the "
+        "last 720 minutes under %s.", chmod_count, cfg.regpath,
+    )
+
+    # %ScanLog(&logfile) -- best-effort log scan (see caveat in docstring)
+    error_lines: List[str] = []
+    warning_lines: List[str] = []
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "ERROR" in line:
+                    error_lines.append(line.strip())
+                elif "WARNING" in line:
+                    warning_lines.append(line.strip())
+    except OSError as e:
+        logging.warning("Could not scan log file %s: %s", log_file, e)
+        return
+
+    logging.info(
+        "ScanLog summary: %d ERROR line(s), %d WARNING line(s) found in %s.",
+        len(error_lines), len(warning_lines), log_file,
+    )
+    if error_lines:
+        logging.warning("ScanLog detected ERROR-level lines:\n%s", "\n".join(error_lines))
+
+
+
+# Main script (Tyr/Helios entry point)
+
+
+def main(ss, job_conf) -> None:
+    """Main entry point for Tyr/Helios framework.
 
     Args:
-        ss       : SparkSession provided by the framework.
-        job_conf : Job configuration dictionary from Airflow/Tyr.
+        ss: SparkSession provided by the framework (unused for compute in
+            this conversion -- all transforms are pandas, matching the
+            reference C86_pa_client360.py architecture where Spark is used
+            only for S3 I/O. Kept in the signature for framework conformance
+            and for future S3 wiring.)
+        job_conf: Job configuration dictionary from Airflow/Tyr.
     """
     cfg = Config()
 
-    # ── Logging ─────────────────────────────────────────────────────────────
-    ymd           = datetime.now().strftime("%Y%m%d")
-    log_file_name = f"C86_notification_rbis_{ymd}.log"
+    ymd = datetime.now().strftime("%Y%m%d")
+    log_file_name = "C86_notification_rbis_{}.log".format(ymd)
     setup_logging(cfg.logpath, log_file_name)
 
-    logging.info("=" * 70)
-    logging.info("C86 RBIS Renewal Notification — Python Migration Starting")
-    logging.info("User    : %s", os.environ.get("USER", "unknown"))
-    logging.info("Host    : %s", os.environ.get("HOSTNAME", "unknown"))
-    logging.info("Started : %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    logging.info("=" * 70)
+    logging.info("=" * 50)
+    logging.info(">>>>>>>>>> Name of This Program - C86_notif_rbis_renewal.py <<<<<<<<<<")
+    logging.info(">>>>>>>>>> Starting Running Time - %s <<<<<<<<<<", datetime.now())
+    logging.info(">>>>>>>>>> User ID - %s <<<<<<<<<<", os.environ.get("USER", "Unknown"))
+    logging.info(">>>>>>>>>> Platform - %s <<<<<<<<<<", os.environ.get("HOSTNAME", "Unknown"))
+    logging.info("SAS to Python Migration: C86_notif_rbis_renewal Starting...")
 
-    # ── S3 / Spark ──────────────────────────────────────────────────────────
-    configure_s3a(ss)
     cfg.outpath.mkdir(parents=True, exist_ok=True)
-    cfg.main_notif_path.mkdir(parents=True, exist_ok=True)
+    cfg.logpath.mkdir(parents=True, exist_ok=True)
+    logging.info("Ensured output/log directories exist.")
 
-    # ── Ini-check + dates ───────────────────────────────────────────────────
-    logging.info("--- Step 0: Ini-check and date setup ---")
-    ini_run, day_buff = check_ini_run(ss, cfg.outpath, cfg.persistent_ac_file)
-    dates = setup_dates(ini_run, day_buff)
-    dates["ini_run"] = ini_run   # carry through for persist step
+    try:
+        # --- %ini_check ---
+        ini_run, day_buff = check_ini_run(cfg.outpath, cfg.persistent_ac_file)
 
-    # ── Teradata: pull base data ─────────────────────────────────────────────
-    logging.info("--- Step 1: Pull base notification data ---")
-    with get_teradata_connection(cfg.teradata_conn_json) as conn:
-        base_df = pull_base_notifications(conn, dates)
+        # --- data _null_ date setup ---
+        dates = setup_dates(cfg, ini_run, day_buff)
 
-    # ── Business rules + segment split ──────────────────────────────────────
-    logging.info("--- Step 2: Apply pass/fail business rules ---")
-    enriched   = apply_business_rules(base_df)
-    segments   = split_segments(enriched)
+        # --- main Teradata pull + BSC filter ---
+        rbis_noti_base_init = pull_rbis_noti_base(cfg, dates)
+        rbis_noti_base = apply_bsc_filter(rbis_noti_base_init)
 
-    # Stack all segments for combined view
-    compare_all = pd.concat(list(segments.values()), ignore_index=True)
-    fails_df    = compare_all[compare_all["CommentCode"] == "COM19"].copy()
-    logging.info("Total potential fails (COM19): %d rows.", len(fails_df))
+        # --- pass/fail classification ---
+        rbis_noti_compare01 = classify_pass_fail(rbis_noti_base)
 
-    # ── Find-fails enrichment ────────────────────────────────────────────────
-    logging.info("--- Step 3: Find fails — MIF / plan preference / backdate ---")
-    if not fails_df.empty:
-        with get_teradata_connection(cfg.teradata_conn_json) as conn:
-            fails_final = find_fails(conn, fails_df, dates)
-    else:
-        logging.info("No fails found — skipping MIF enrichment.")
-        fails_final = fails_df.copy()
-        fails_final["fail_reason"]    = ""
-        fails_final["backdate_check"] = pd.NaT
-        fails_final["pref_date"]      = pd.NaT
+        # --- %find_fails ---
+        rbis_noti_compare_fails_final = find_fails(cfg, dates, rbis_noti_compare01)
 
-    # ── Build autocomplete tables ────────────────────────────────────────────
-    logging.info("--- Step 4: Build autocomplete summary tables ---")
-    curr_ac = build_autocomplete_tables(segments, dates)
+        # --- autocomplete aggregation (4 ac_time_rbis_noti_* blocks unioned) ---
+        renew_gic_ac_curr = build_autocomplete_tables(rbis_noti_compare01, dates)
 
-    # ── Persist autocomplete ─────────────────────────────────────────────────
-    logging.info("--- Step 5: Persist autocomplete (local + S3 + Excel) ---")
-    persist_autocomplete(ss, curr_ac, dates, cfg)
+        # Also persist the per-run snapshot table:
+        #   notidata.renew_gic_ac_&rundt.  (SAS writes this alongside renew_gic_ac_curr)
+        rundt_snapshot_path = cfg.outpath / "renew_gic_ac_{}.parquet".format(dates["rundt"])
+        renew_gic_ac_curr.to_parquet(rundt_snapshot_path, index=False)
+        logging.info("Saved per-run snapshot: %s", rundt_snapshot_path)
 
-    # ── Export fail detail ────────────────────────────────────────────────────
-    logging.info("--- Step 6: Export fail detail ---")
-    if not fails_final.empty:
-        export_fail_detail(ss, fails_final, dates, cfg)
-    else:
-        logging.info("No fails to export.")
+        # --- %Timeliness append macro ---
+        notidata_renew_gic_ac = apply_timeliness_append(
+            cfg, ini_run, renew_gic_ac_curr, dates
+        )
 
-    # ── Freq table ────────────────────────────────────────────────────────────
-    logging.info("--- Step 7: Log fail_reason frequency ---")
-    if not fails_final.empty:
-        log_fail_reason_freq(fails_final)
+        # --- export autocomplete (parquet persistent state + Excel) ---
+        export_autocomplete(cfg, notidata_renew_gic_ac)
 
-    # ── Permissions / cleanup ─────────────────────────────────────────────────
-    # SAS: x "find &regpath. -user $USER -mmin -720 -exec chmod 777 {} \;"
-    # In Python/S3 context this is handled by IAM policies; no action needed.
+        # --- fail detail build + export ---
+        fail_detail = build_fail_detail(rbis_noti_compare_fails_final, dates)
+        export_fail_detail(cfg, fail_detail, ymd)
 
-    logging.info("=" * 70)
-    logging.info("C86 RBIS Renewal Notification — Completed Successfully")
-    logging.info("Finished: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    logging.info("=" * 70)
+        # --- end-of-run housekeeping (previously omitted; see docstring for
+        #     caveats on the chmod 777 and %ScanLog best-effort equivalents) ---
+        fix_permissions_and_scan_log(cfg, cfg.logpath / log_file_name)
 
+        logging.info("=" * 50)
+        logging.info("Python script execution completed successfully.")
+        logging.info("=" * 50)
 
+        # %skip block is opt-in only (never auto-invoked, matching SAS source
+        # where %skip is defined but not called). Uncomment to run QA block:
+        #
+        # run_skip_block(
+        #     rbis_noti_base, rbis_noti_compare01, renew_gic_ac_curr,
+        #     notidata_renew_gic_ac, cfg.outpath / "qa_output",
+        # )
 
-# Standalone entry point (for local/dev testing)
+    except Exception as e:
+        logging.error("=" * 50)
+        logging.error("SCRIPT FAILED: %s", e, exc_info=True)
+        logging.error("=" * 50)
+        raise
 
 
 if __name__ == "__main__":
-    import shutil as _shutil
-    import sys as _sys
-
-    python_path = _sys.executable or _shutil.which("python3") or "/usr/bin/python3"
-    os.environ.setdefault("PYSPARK_PYTHON",        python_path)
-    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", python_path)
-
-    _spark = (
-        SparkSession.builder
-        .master("local")
-        .appName("C86_RBIS_Renewal_Standalone")
-        .config("spark.pyspark.python",        python_path)
-        .config("spark.pyspark.driver.python", python_path)
-        .getOrCreate()
-    )
-
-    _job_conf = {
-        "job_name":             "C86_notif_rbis_renewal",
-        "teradata_conn_json":   "TeradataConnection_T.json",
-        "output":               "sas/RSD/REG_DEV/C86/output/notification/rbis",
-        "logpath":              "sas/RSD/REG_DEV/C86/log/notification/rbis",
-    }
-
     try:
-        main(_spark, _job_conf)
-    except Exception as _exc:
-        logging.error("SCRIPT FAILED: %s", _exc, exc_info=True)
+        job_conf = {
+            "output": str(Config().outpath),
+            "logpath": str(Config().logpath),
+            "teradata_conn_json": str(Config().teradata_conn_json),
+        }
+        main(None, job_conf)
+    except Exception:
+        print("Script failed -- see log file for details.", file=sys.stderr)
         raise
-    finally:
-        _spark.stop()
-        logging.info("Spark session stopped.")
